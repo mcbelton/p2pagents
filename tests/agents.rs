@@ -201,8 +201,18 @@ async fn simultaneous_dials_converge_on_one_connection() {
     rb.unwrap();
     wait_for_peers(&a, 1).await;
     wait_for_peers(&b, 1).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Longer than the disconnect grace period, so a spurious leave would show up.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
 
+    let mut joins = 0;
+    while let Ok(event) = b_events.try_recv() {
+        assert!(
+            !matches!(event, Event::PeerDisconnected { .. }),
+            "dial race reported a disconnect"
+        );
+        joins += matches!(event, Event::PeerConnected { .. }) as usize;
+    }
+    assert_eq!(joins, 1, "dial race reported more than one join");
     assert_eq!(a.peers().len(), 1);
     assert_eq!(b.peers().len(), 1);
     assert_eq!(a.broadcast("ping"), 1);

@@ -1,0 +1,604 @@
+// p2pagents web UI. Plain JS, no build step. All peer-provided text is rendered
+// with textContent (never innerHTML), so chat and task output can't inject markup.
+"use strict";
+
+const $ = (sel) => document.querySelector(sel);
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value === true ? "" : value);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function icon(paths) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  for (const d of paths) {
+    const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    p.setAttribute("d", d);
+    svg.append(p);
+  }
+  return svg;
+}
+const ICONS = {
+  trash: ["M4 7h16", "M10 11v6M14 11v6", "M6 7l1 13h10l1-13", "M9 7V4h6v3"],
+  copy: ["M9 9h11v11H9z", "M5 15V5a2 2 0 0 1 2-2h10"],
+  peers: ["M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M16 11a3 3 0 1 0 0-6", "M2 20a6 6 0 0 1 12 0", "M15 14a6 6 0 0 1 7 6"],
+};
+
+// ---------- theme ----------
+const THEME_KEY = "p2pagents-theme";
+const media = window.matchMedia("(prefers-color-scheme: dark)");
+function themeChoice() {
+  const saved = localStorage.getItem(THEME_KEY);
+  return ["light", "dark", "system"].includes(saved) ? saved : "system";
+}
+function applyTheme() {
+  const choice = themeChoice();
+  const effective = choice === "system" ? (media.matches ? "dark" : "light") : choice;
+  document.documentElement.dataset.theme = effective;
+  for (const btn of document.querySelectorAll("[data-theme-choice]")) {
+    const on = btn.dataset.themeChoice === choice;
+    btn.setAttribute("aria-checked", String(on));
+    btn.tabIndex = on ? 0 : -1;
+  }
+}
+media.addEventListener("change", applyTheme);
+
+// Radio groups: click and arrow keys (WAI-ARIA radiogroup pattern).
+function radioGroup(container, onSelect) {
+  const buttons = () => [...container.querySelectorAll('[role="radio"]')];
+  container.addEventListener("click", (e) => {
+    const btn = e.target.closest('[role="radio"]');
+    if (btn) onSelect(btn, false);
+  });
+  container.addEventListener("keydown", (e) => {
+    const keys = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+    if (!(e.key in keys)) return;
+    e.preventDefault();
+    const list = buttons();
+    const i = list.indexOf(document.activeElement);
+    const next = list[(i + keys[e.key] + list.length) % list.length];
+    next.focus();
+    onSelect(next, true);
+  });
+}
+
+// Minimal, safe Markdown for task results: builds DOM nodes with textContent only.
+function inlineMd(text) {
+  const nodes = [];
+  const re = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) nodes.push(text.slice(last, m.index));
+    const t = m[0];
+    nodes.push(t.startsWith("`") ? el("code", { text: t.slice(1, -1) }) : el("strong", { text: t.slice(2, -2) }));
+    last = m.index + t.length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+
+function renderMarkdown(text) {
+  const root = el("div", { class: "md" });
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  let list = null;
+  let listType = null;
+  let para = [];
+  const flushPara = () => {
+    if (para.length) root.append(el("p", {}, inlineMd(para.join(" "))));
+    para = [];
+  };
+  const endList = () => { list = null; listType = null; };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      flushPara(); endList();
+      const code = [];
+      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+      root.append(el("pre", {}, el("code", { text: code.join("\n") })));
+      continue;
+    }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      flushPara(); endList();
+      root.append(el(`h${Math.min(6, heading[1].length + 2)}`, {}, inlineMd(heading[2])));
+      continue;
+    }
+    const item = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)$/);
+    if (item) {
+      flushPara();
+      const type = /\d/.test(item[1]) ? "ol" : "ul";
+      if (!list || listType !== type) {
+        list = el(type);
+        listType = type;
+        root.append(list);
+      }
+      list.append(el("li", {}, inlineMd(item[2])));
+      continue;
+    }
+    if (!line.trim()) { flushPara(); endList(); continue; }
+    if (list && /^\s{2,}/.test(line)) { list.lastChild.append(" ", ...inlineMd(line.trim())); continue; }
+    endList();
+    para.push(line.trim());
+  }
+  flushPara();
+  return root;
+}
+
+// ---------- API ----------
+const hashToken = new URLSearchParams(location.hash.slice(1)).get("t");
+if (hashToken) {
+  sessionStorage.setItem("p2pagents-token", hashToken);
+  history.replaceState(null, "", location.pathname);
+}
+const token = sessionStorage.getItem("p2pagents-token") || "";
+// Opening a new link (#t=…) in an existing tab only changes the hash: adopt it.
+window.addEventListener("hashchange", () => {
+  const t = new URLSearchParams(location.hash.slice(1)).get("t");
+  if (t) {
+    sessionStorage.setItem("p2pagents-token", t);
+    location.replace(location.pathname);
+  }
+});
+
+let authLost = false;
+function showAuthError() {
+  if (authLost) return;
+  authLost = true;
+  events?.close();
+  const pill = $("#net-status");
+  pill.dataset.state = "offline";
+  pill.querySelector(".label").textContent = "Session ended";
+  $("#feed").replaceChildren(el("div", { class: "feed-empty" },
+    el("h2", { text: "This page's session has ended" }),
+    el("p", { text: "The agent was restarted, so its access link changed. Open the new link p2pagents printed (it ends with #t=…)." })));
+  for (const c of document.querySelectorAll("#composer textarea, #composer button, #add-peer-btn")) c.disabled = true;
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...(options.headers || {}) },
+  });
+  if (res.status === 401) {
+    showAuthError();
+    throw new Error("Session ended: open the new link printed by p2pagents");
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`);
+  return body;
+}
+
+// ---------- state ----------
+const state = { me: null, peers: [], trusted: [], feed: [], tasks: [], mode: "chat" };
+
+function hue(text) {
+  let h = 0;
+  for (const ch of text) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return h;
+}
+function avatar(name, online) {
+  const node = el("span", { class: "avatar", "aria-hidden": "true" },
+    (name[0] || "?").toUpperCase(),
+    online === undefined ? null : el("span", { class: `presence${online ? " on" : ""}` }));
+  // CSSOM, not a style attribute: the page's CSP forbids inline style attributes.
+  node.style.setProperty("--hue", String(hue(name)));
+  return node;
+}
+function providerLabel(p) {
+  return { copilot: "Copilot", claude: "Claude", codex: "Codex" }[p] || p;
+}
+function clock(ms) {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function duration(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function toast(text, kind = "") {
+  const node = el("div", { class: `toast ${kind}`, role: kind === "error" ? "alert" : "status", text });
+  $("#toasts").append(node);
+  setTimeout(() => node.remove(), kind === "error" ? 6000 : 2600);
+}
+async function copy(text, what) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`${what} copied`);
+  } catch {
+    toast(`Could not copy ${what.toLowerCase()}`, "error");
+  }
+}
+
+// ---------- rendering ----------
+function renderMe() {
+  const me = state.me;
+  if (!me) return;
+  document.title = `${me.name} · p2pagents`;
+  $("#me-name").textContent = me.name;
+  const idChip = $("#me-id");
+  idChip.textContent = me.short;
+  idChip.title = `Endpoint id ${me.id} (click to copy)`;
+  $("#ticket").textContent = me.ticket;
+
+  const pill = $("#net-status");
+  const online = me.network === "local" || !!me.relay;
+  pill.dataset.state = online ? "online" : "offline";
+  pill.querySelector(".label").textContent =
+    me.network === "local" ? "Local network" : me.relay ? "Online" : "Offline";
+  pill.title = me.relay ? `Home relay: ${me.relay}` : me.network === "local" ? "Direct IP connections only" : "No relay reachable";
+
+  const facts = $("#facts");
+  facts.replaceChildren();
+  const fact = (k, v) => facts.append(el("dt", { text: k }), el("dd", {}, v));
+  fact("Profile", me.profile);
+  fact("Network", me.network === "local" ? "Local (direct IPs)" : "Internet");
+  if (me.providers.length) {
+    fact("Providers", me.providers.map(providerLabel).join(", "));
+    for (const a of me.accounts) fact(providerLabel(a.provider), a.account);
+    fact("Serves peers", me.serving ? "Yes" : "No");
+    fact("Access", me.access === "workspace-write" ? "Read and write" : "Read only");
+    fact("Workspace", el("span", { class: "mono", text: me.workspace }));
+  } else {
+    fact("Providers", "None (delegates only)");
+  }
+}
+
+function renderPeers() {
+  const list = $("#peer-list");
+  list.replaceChildren();
+  $("#peer-count").textContent = state.peers.length;
+  $("#peer-count").setAttribute("aria-label", `${state.peers.length} connected`);
+  if (!state.peers.length) {
+    list.append(el("li", { class: "empty" },
+      state.trusted.length
+        ? "Waiting for allowlisted peers to come online…"
+        : el("span", {}, "No peers yet. ", el("strong", { text: "Add a peer" }), " to the allowlist and share your ticket.")));
+  }
+  for (const p of state.peers) {
+    list.append(el("li", {},
+      avatar(p.name, true),
+      el("div", { class: "who" },
+        el("span", { class: "name", text: p.name }),
+        el("span", { class: "sub" },
+          el("span", { class: "mono", text: p.short }),
+          p.capabilities.length
+            ? p.capabilities.map((c) => el("span", { class: "badge", text: providerLabel(c) }))
+            : el("span", { class: "badge neutral", text: "no providers" })))));
+  }
+
+  const trust = $("#trust-list");
+  trust.replaceChildren();
+  if (!state.trusted.length) {
+    trust.append(el("li", { class: "empty", text: "Only allowlisted peers can connect to this agent." }));
+  }
+  for (const t of state.trusted) {
+    trust.append(el("li", {},
+      avatar(t.name, t.connected),
+      el("div", { class: "who" },
+        el("span", { class: "name", text: t.name }),
+        el("span", { class: "sub" },
+          el("span", { text: t.connected ? "Connected" : "Offline" }),
+          t.can_delegate
+            ? el("span", { class: "badge ok", text: `Can run tasks · ${t.tasks_per_hour}/h` })
+            : el("span", { class: "badge neutral", text: "Chat only" }))),
+      el("button", {
+        type: "button", class: "icon-btn", title: `Remove ${t.name}`, "aria-label": `Remove ${t.name} from the allowlist`,
+        onclick: () => removePeer(t),
+      }, icon(ICONS.trash))));
+  }
+  renderTaskOptions();
+}
+
+function feedNode(item) {
+  if (item.kind === "chat") {
+    return el("div", { class: `msg${item.self ? " self" : ""}` },
+      item.self ? null : avatar(item.from),
+      el("div", {},
+        el("div", { class: "meta" }, item.self ? "You" : item.from, " · ", el("time", { text: clock(item.ts) })),
+        el("div", { class: "bubble", text: item.text })));
+  }
+  return el("div", { class: "sys", "data-level": item.level },
+    el("span", { text: item.text }), el("time", { text: clock(item.ts) }));
+}
+
+function renderFeed() {
+  const feed = $("#feed");
+  feed.replaceChildren();
+  const meaningful = state.feed.some((i) => i.kind === "chat" || i.level !== "info");
+  if (!meaningful) {
+    feed.append(el("div", { class: "feed-empty" },
+      icon(ICONS.peers),
+      el("h2", { text: "No activity yet" }),
+      el("p", { text: "Messages, peers joining and leaving, and tasks from peers show up here." })));
+  }
+  for (const item of state.feed) feed.append(feedNode(item));
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function appendFeed(item) {
+  state.feed.push(item);
+  const feed = $("#feed");
+  const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+  if (feed.querySelector(".feed-empty") && (item.kind === "chat" || item.level !== "info")) {
+    renderFeed();
+    return;
+  }
+  feed.append(feedNode(item));
+  if (nearBottom || item.self) feed.scrollTop = feed.scrollHeight;
+}
+
+const openResults = new Map();
+
+function taskNode(t) {
+  const statusText = { running: "Running", done: "Done", failed: "Failed" }[t.status];
+  const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
+  const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
+    el("div", { class: "task-top" },
+      el("span", { class: "task-title", text: `#${t.id} · ${providerLabel(t.provider)} → ${t.target}` }),
+      el("span", { class: `status ${t.status}` },
+        t.status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, statusText)),
+    el("p", { class: "task-prompt", text: t.prompt }),
+    el("div", { class: "task-meta" }, `Started ${clock(t.started_ms)} · `,
+      el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
+        t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`)));
+  if (t.output !== null && t.output !== undefined) {
+    const open = openResults.has(t.id) ? openResults.get(t.id) : true;
+    const details = el("details", { open: open || undefined },
+      el("summary", { text: t.status === "failed" ? "Error" : "Result" }),
+      t.status === "failed"
+        ? el("pre", { text: t.output, tabindex: "0" })
+        : el("div", { class: "result", tabindex: "0" }, renderMarkdown(t.output)),
+      el("button", { type: "button", class: "btn small", onclick: () => copy(t.output, "Result") }, icon(ICONS.copy), "Copy"));
+    details.addEventListener("toggle", () => openResults.set(t.id, details.open));
+    node.append(details);
+  }
+  return node;
+}
+
+function renderTasks() {
+  const list = $("#task-list");
+  list.replaceChildren();
+  $("#task-count").textContent = state.tasks.length;
+  if (!state.tasks.length) {
+    list.append(el("li", { class: "empty" }, "No tasks yet. Choose ", el("strong", { text: "Run task" }),
+      " below to run a prompt on this agent or a peer."));
+  }
+  for (const t of [...state.tasks].reverse()) list.append(taskNode(t));
+}
+
+function upsertTask(task) {
+  const i = state.tasks.findIndex((t) => t.id === task.id);
+  const isNew = i < 0;
+  if (isNew) state.tasks.push(task);
+  else state.tasks[i] = task;
+  renderTasks();
+  if (!isNew && task.status !== "running") {
+    toast(`Task #${task.id} ${task.status === "done" ? "finished" : "failed"}`, task.status === "failed" ? "error" : "");
+  }
+}
+
+// ---------- composer ----------
+function availableProviders() {
+  const set = new Set(state.me?.providers || []);
+  for (const p of state.peers) for (const c of p.capabilities) set.add(c);
+  return [...set];
+}
+
+function renderTaskOptions() {
+  const providerSel = $("#provider");
+  const targetSel = $("#target");
+  const prevProvider = providerSel.value;
+  const prevTarget = targetSel.value;
+  const providers = availableProviders();
+  providerSel.replaceChildren(...providers.map((p) => el("option", { value: p, text: providerLabel(p) })));
+  if (providers.includes(prevProvider)) providerSel.value = prevProvider;
+
+  const provider = providerSel.value;
+  const targets = [];
+  if (provider && state.me?.providers.includes(provider)) targets.push(["local", "This agent"]);
+  const serving = state.peers.filter((p) => p.capabilities.includes(provider));
+  if (serving.length > 1) targets.push(["auto", "Any peer"]);
+  for (const p of serving) targets.push([p.id, p.name]);
+  targetSel.replaceChildren(...targets.map(([v, label]) => el("option", { value: v, text: label })));
+  if (targets.some(([v]) => v === prevTarget)) targetSel.value = prevTarget;
+  updateComposer();
+}
+
+function updateComposer() {
+  const task = state.mode === "task";
+  const input = $("#composer-input");
+  const noProviders = task && !availableProviders().length;
+  $("#task-opts").hidden = !task;
+  input.placeholder = task
+    ? noProviders
+      ? "No provider available: enable one with --providers, or connect a peer that serves one"
+      : "Describe the task, e.g. “Add unit tests for the parser module”"
+    : "Message all connected peers…";
+  $("#composer-label").textContent = task ? "Task prompt" : "Message";
+  $("#send-btn").querySelector("span").textContent = task ? "Run" : "Send";
+  $("#send-btn").disabled = noProviders || (task && !$("#target").value);
+  $("#composer-hint").textContent = "Enter to send · Shift+Enter for a new line";
+}
+
+async function submitComposer(e) {
+  e?.preventDefault();
+  const input = $("#composer-input");
+  const text = input.value.trim();
+  if (!text || $("#send-btn").disabled) return;
+  $("#send-btn").disabled = true;
+  try {
+    if (state.mode === "chat") {
+      const res = await api("/api/chat", { method: "POST", body: JSON.stringify({ text }) });
+      if (res.sent === 0) toast("No peers connected; nobody received the message");
+    } else {
+      const task = await api("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify({ provider: $("#provider").value, target: $("#target").value, prompt: text }),
+      });
+      upsertTask(task);
+      toast(`Task #${task.id} started on ${task.target}`);
+    }
+    input.value = "";
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    updateComposer();
+    input.focus();
+  }
+}
+
+// ---------- allowlist ----------
+function openAddDialog() {
+  $("#add-form").reset();
+  $("#rate-field").hidden = true;
+  $("#add-error").textContent = "";
+  $("#add-dialog").showModal();
+  $("#add-ticket").focus();
+}
+
+async function submitAdd(e) {
+  e.preventDefault();
+  const ticket = $("#add-ticket").value.trim();
+  const errorBox = $("#add-error");
+  if (!ticket) {
+    errorBox.textContent = "Paste the peer's ticket or endpoint id.";
+    $("#add-ticket").focus();
+    return;
+  }
+  const delegate = $("#add-delegate").checked;
+  try {
+    const res = await api("/api/trust", {
+      method: "POST",
+      body: JSON.stringify({
+        ticket,
+        name: $("#add-name").value.trim() || null,
+        delegate,
+        tasks_per_hour: delegate ? Number($("#add-rate").value) || 20 : null,
+      }),
+    });
+    $("#add-dialog").close();
+    toast(`${res.name} added to the allowlist`);
+  } catch (err) {
+    errorBox.textContent = err.message;
+  }
+}
+
+async function removePeer(t) {
+  if (!confirm(`Remove ${t.name} from the allowlist? It will be disconnected and can no longer connect.`)) return;
+  try {
+    await api(`/api/trust/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+    toast(`${t.name} removed`);
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+// ---------- live updates ----------
+async function loadState() {
+  const s = await api("/api/state");
+  Object.assign(state, { me: s.me, peers: s.peers, trusted: s.trusted, feed: s.feed, tasks: s.tasks });
+  renderMe();
+  renderPeers();
+  renderFeed();
+  renderTasks();
+}
+
+let events = null;
+function connectEvents() {
+  const source = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+  events = source;
+  source.onopen = () => loadState().catch((err) => toast(err.message, "error"));
+  source.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "feed") appendFeed(msg.item);
+    else if (msg.type === "task") upsertTask(msg.task);
+    else if (msg.type === "peers") {
+      state.peers = msg.peers;
+      state.trusted = msg.trusted;
+      renderPeers();
+    }
+  };
+  source.onerror = () => {
+    if (authLost) return;
+    const pill = $("#net-status");
+    pill.dataset.state = "offline";
+    pill.querySelector(".label").textContent = "Reconnecting…";
+    // EventSource can't see status codes; probe once to tell "agent down" from "token rejected".
+    fetch("/api/state", { headers: { Authorization: `Bearer ${token}` } })
+      .then((res) => { if (res.status === 401) showAuthError(); })
+      .catch(() => {});
+  };
+}
+
+// ---------- wiring ----------
+function init() {
+  applyTheme();
+  radioGroup($(".theme-switch"), (btn) => {
+    localStorage.setItem(THEME_KEY, btn.dataset.themeChoice);
+    applyTheme();
+  });
+  radioGroup($(".segmented"), (btn, viaKeyboard) => {
+    state.mode = btn.dataset.mode;
+    for (const b of document.querySelectorAll("[data-mode]")) {
+      b.setAttribute("aria-checked", String(b === btn));
+      b.tabIndex = b === btn ? 0 : -1;
+    }
+    renderTaskOptions();
+    // Keyboard users stay in the switch (arrow keys); mouse users go straight to typing.
+    if (!viaKeyboard) $("#composer-input").focus();
+  });
+  for (const b of document.querySelectorAll("[data-mode]")) b.tabIndex = b.dataset.mode === state.mode ? 0 : -1;
+
+  $("#composer").addEventListener("submit", submitComposer);
+  $("#composer-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) submitComposer(e);
+  });
+  $("#provider").addEventListener("change", renderTaskOptions);
+  $("#target").addEventListener("change", updateComposer);
+  $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
+  $("#copy-ticket").addEventListener("click", () => state.me && copy(state.me.ticket, "Ticket"));
+  $("#add-peer-btn").addEventListener("click", openAddDialog);
+  $("#add-cancel").addEventListener("click", () => $("#add-dialog").close());
+  // Not every browser closes a modal <dialog> on Escape; also close on a backdrop click.
+  $("#add-dialog").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      $("#add-dialog").close();
+    }
+  });
+  $("#add-dialog").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) $("#add-dialog").close();
+  });
+  $("#add-dialog").addEventListener("close", () => $("#add-peer-btn").focus());
+  $("#add-form").addEventListener("submit", submitAdd);
+  $("#add-delegate").addEventListener("change", (e) => { $("#rate-field").hidden = !e.target.checked; });
+  setInterval(() => {
+    for (const span of document.querySelectorAll(".elapsed[data-start]")) {
+      span.textContent = `running ${duration(Date.now() - Number(span.dataset.start))}`;
+    }
+  }, 1000);
+
+  if (!token) {
+    $("#feed").replaceChildren(el("div", { class: "feed-empty" },
+      el("h2", { text: "Access token missing" }),
+      el("p", { text: "Open the full link that p2pagents printed when it started (it ends with #t=…)." })));
+    return;
+  }
+  loadState().then(connectEvents).catch((err) => toast(err.message, "error"));
+}
+
+init();

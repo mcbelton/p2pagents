@@ -11,6 +11,7 @@ pub mod profile;
 pub mod protocol;
 pub mod setup;
 pub mod trust;
+pub mod ui;
 
 pub use agent::{Agent, AgentConfig, Event, Network, PeerInfo};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};

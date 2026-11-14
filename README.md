@@ -70,9 +70,10 @@ p2pagents auth login copilot --profile me --gh-user <github-login>
 p2pagents peers id --profile me                          # send your ticket to your peers
 p2pagents peers allow <their-ticket> --profile me [--delegate]
 p2pagents --name me --providers copilot --serve
+p2pagents --name me --providers copilot --serve --ui     # same, in a browser UI (light/dark)
 ```
 
-See [Internet P2P](#internet-p2p) for how peers find each other and
+See [Internet P2P](#internet-p2p) for how peers find each other, [Web UI](#web-ui) for the browser app, and
 [Accounts and profiles](#accounts-and-profiles) for sign-in options. Building from source
 is described in the rest of this README.
 
@@ -432,10 +433,46 @@ Results print when they arrive, so you can keep typing while tasks run.
 | `--workspace <DIR>` | `.` | Directory the LLM agents work in |
 | `--access <MODE>` | `read-only` | `read-only` or `workspace-write` (see below) |
 | `--bridge <PATH>` | `bridge/index.mjs` in this repo (env `P2PAGENTS_BRIDGE`) | Node bridge script |
+| `--ui` | off | Open the [web UI](#web-ui) instead of the terminal prompt |
+| `--ui-port <PORT>` | random | Port for the web UI on 127.0.0.1 (needs `--ui`) |
+| `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
 `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder (and uses a separate
 credential store namespace).
+
+## Web UI
+
+Add `--ui` to any agent to drive it from a browser instead of the terminal prompt:
+
+```powershell
+p2pagents --name me --providers copilot --serve --ui
+# web UI: http://127.0.0.1:53817/#t=3f9c…   (opens in your default browser)
+```
+
+- **Connected peers** with the providers they serve, live.
+- **Allowlist**: add a peer by pasting their ticket (optionally letting them delegate, with an
+  hourly limit) or remove one; changes are saved to the profile's `peers.json` and take
+  effect at once (removed peers are disconnected).
+- **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
+  access level and workspace.
+- **Activity feed**: chat with all connected peers, joins and leaves, refused connections,
+  tasks peers delegate to you.
+- **Run task**: pick a provider and where to run it (*This agent*, a named peer, or *Any peer*
+  when several serve it).
+  The **Tasks** panel shows status and elapsed time, renders results as Markdown, and can copy
+  results and errors.
+- **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
+  accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
+  windows, honours reduced motion.
+
+Security: the UI listens on `127.0.0.1` only. Each run creates a new random access token,
+passed in the link's `#t=` fragment (never sent in requests or logged; the page moves it to
+session storage and removes it from the address bar). API calls without it get `401`.
+Requests whose `Host` isn't `127.0.0.1`/`localhost` are refused (DNS-rebinding defense).
+Pages are served with a strict Content-Security-Policy and all peer text is rendered as
+text, never HTML. Restarting the agent invalidates old links; use the new link it prints.
+Press Ctrl+C in the terminal to stop the agent.
 
 ## Security model
 
@@ -509,6 +546,8 @@ endpoints on localhost in local mode, so they need no internet.
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
+- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events
+- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests

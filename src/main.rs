@@ -217,8 +217,34 @@ struct RunArgs {
     /// What LLM agents may do in the workspace.
     #[arg(long, value_enum, default_value_t = Access::ReadOnly)]
     access: Access,
+    /// Open the web UI (served on 127.0.0.1 only) instead of the terminal prompt.
+    #[arg(long)]
+    ui: bool,
+    /// Port for the web UI (default: any free port).
+    #[arg(long, default_value_t = 0, requires = "ui")]
+    ui_port: u16,
+    /// Don't open the web UI in the browser automatically; just print its link.
+    #[arg(long, requires = "ui")]
+    no_open: bool,
     #[command(flatten)]
     bridge: BridgeArg,
+}
+
+/// Opens `url` in the default browser.
+fn open_browser(url: &str) {
+    let result = if cfg!(windows) {
+        // `start` treats the first quoted argument as a window title.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if result.is_err() {
+        eprintln!("could not open a browser; open the link above manually");
+    }
 }
 
 #[tokio::main]
@@ -490,6 +516,32 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         }
     }
     agent.keep_connected(Duration::from_secs(30));
+
+    if args.ui {
+        let info = p2pagents::ui::UiInfo {
+            profile: profile.clone(),
+            network: args.network,
+            serving: args.serve,
+            access: args.access,
+            workspace: std::path::absolute(&args.workspace).unwrap_or(args.workspace.clone()),
+            providers: executor.as_ref().map(|e| e.providers()).unwrap_or_default(),
+            accounts: executor
+                .as_ref()
+                .map(|e| e.accounts().to_vec())
+                .unwrap_or_default(),
+        };
+        let local = executor.clone().map(|e| e as Arc<dyn Executor>);
+        let bind = SocketAddr::from(([127, 0, 0, 1], args.ui_port));
+        let server = p2pagents::ui::start(agent.clone(), events, info, local, bind).await?;
+        println!("web UI: {}", server.url);
+        println!("(the link includes a private access token; press Ctrl+C to stop the agent)");
+        if !args.no_open {
+            open_browser(&server.url);
+        }
+        tokio::signal::ctrl_c().await?;
+        agent.shutdown().await;
+        return Ok(());
+    }
 
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {

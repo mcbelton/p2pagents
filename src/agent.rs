@@ -18,6 +18,8 @@ use crate::trust::{TrustStore, TrustedPeer};
 /// Maximum number of peer-delegated tasks an agent runs at once; more are queued.
 pub const MAX_CONCURRENT_TASKS: usize = 2;
 const HOUR: Duration = Duration::from_secs(3600);
+/// How long a dropped peer may take to reconnect before `PeerDisconnected` is reported.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
 
 /// How the agent reaches peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -125,6 +127,8 @@ struct Inner {
     task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
+    /// Peers reported via `PeerConnected` and not yet via `PeerDisconnected`.
+    announced: Mutex<HashSet<EndpointId>>,
     next_task_id: AtomicU64,
 }
 
@@ -166,6 +170,7 @@ impl Agent {
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            announced: Mutex::new(HashSet::new()),
             next_task_id: AtomicU64::new(1),
         });
         tokio::spawn(accept_loop(inner.clone()));
@@ -248,6 +253,45 @@ impl Agent {
         self.peers()
             .into_iter()
             .find(|p| p.capabilities.contains(&provider))
+    }
+
+    /// The current allowlist.
+    pub fn trusted(&self) -> TrustStore {
+        self.inner.trust.lock().unwrap().clone()
+    }
+
+    /// Adds or updates an allowlisted peer and dials it. Persisting the allowlist
+    /// is up to the caller.
+    pub fn allow(&self, peer: TrustedPeer) {
+        let addr = peer.addr();
+        self.inner.trust.lock().unwrap().allow(peer);
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let _ = dial(inner, addr).await;
+        });
+    }
+
+    /// Removes a peer (by name or id) from the allowlist and disconnects it.
+    /// Returns whether it was on the allowlist.
+    pub fn remove_trusted(&self, name_or_id: &str) -> bool {
+        let ids: Vec<EndpointId> = {
+            let mut trust = self.inner.trust.lock().unwrap();
+            let ids = trust
+                .peers
+                .iter()
+                .filter(|p| p.name == name_or_id || p.id.to_string() == name_or_id)
+                .map(|p| p.id)
+                .collect();
+            trust.remove(name_or_id);
+            ids
+        };
+        let peers = self.inner.peers.lock().unwrap();
+        for id in &ids {
+            if let Some(peer) = peers.get(id) {
+                peer.close.notify_one();
+            }
+        }
+        !ids.is_empty()
     }
 
     /// Sends a chat message to every connected peer; returns how many it was sent to.
@@ -572,10 +616,14 @@ async fn run_connection(
         Registration::Rejected => return Ok(()),
         Registration::Replaced => {}
         Registration::New => {
-            let _ = inner.events.send(Event::PeerConnected {
-                name: name.clone(),
-                id: peer_id,
-            });
+            // A peer that reconnects within the disconnect grace period was never
+            // reported as gone, so it isn't reported as joining again either.
+            if inner.announced.lock().unwrap().insert(peer_id) {
+                let _ = inner.events.send(Event::PeerConnected {
+                    name: name.clone(),
+                    id: peer_id,
+                });
+            }
         }
     }
     // A shutdown that raced with this handshake missed our close handle.
@@ -649,9 +697,18 @@ async fn run_connection(
     conn.close(0u32.into(), b"bye");
     inner.fail_pending(conn_id);
     if inner.unregister(peer_id, conn_id) {
-        let _ = inner
-            .events
-            .send(Event::PeerDisconnected { name, id: peer_id });
+        // Report the disconnect only if the peer doesn't come back quickly, e.g.
+        // when a connection loses the simultaneous-dial tie-break.
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DISCONNECT_GRACE).await;
+            let gone = !inner.peers.lock().unwrap().contains_key(&peer_id);
+            if gone && inner.announced.lock().unwrap().remove(&peer_id) {
+                let _ = inner
+                    .events
+                    .send(Event::PeerDisconnected { name, id: peer_id });
+            }
+        });
     }
     result
 }
