@@ -7,8 +7,8 @@
   .\scripts\p2p.ps1 doctor      # check every prerequisite and print the fix for anything missing
   .\scripts\p2p.ps1 build       # cargo build
   .\scripts\p2p.ps1 test        # cargo test (no LLM credentials needed)
-  .\scripts\p2p.ps1 demo        # open a worker window (serves Copilot) and a boss window
-  .\scripts\p2p.ps1 live-test   # 3 agents, 2 profiles/accounts, real Copilot delegation
+  .\scripts\p2p.ps1 demo        # worker + boss windows, allowlisted to each other, over the internet
+  .\scripts\p2p.ps1 live-test   # 4 agents over the internet, 2 accounts, allowlist + real Copilot delegation
   .\scripts\p2p.ps1 agent --name me --providers copilot   # run one agent in this terminal
   .\scripts\p2p.ps1 agent auth status                     # any p2pagents command, e.g. auth
 #>
@@ -91,8 +91,13 @@ switch ($Command) {
             if ($LASTEXITCODE) { throw 'sign-in failed' }
         }
         $shell = (Get-Process -Id $PID).Path
-        $worker = "`$Host.UI.RawUI.WindowTitle='p2pagents worker'; & '$Exe' --name worker --listen 127.0.0.1:7000 --providers copilot --serve --workspace '$Workspace'"
-        $boss = "`$Host.UI.RawUI.WindowTitle='p2pagents boss'; Write-Host 'Try:  /peers   then   /delegate copilot Summarize README.md in 3 bullets' -ForegroundColor Cyan; & '$Exe' --name boss --peer 127.0.0.1:7000"
+        $workerId = ((& $Exe peers id --profile worker) | Select-String 'endpoint id: (\w+)').Matches[0].Groups[1].Value
+        $bossId = ((& $Exe peers id --profile boss) | Select-String 'endpoint id: (\w+)').Matches[0].Groups[1].Value
+        & $Exe peers allow $bossId --profile worker --name boss --delegate | Out-Null
+        & $Exe peers allow $workerId --profile boss --name worker | Out-Null
+        Write-Host "Allowlisted: worker <-> boss (boss may delegate to worker). Agents find each other by key over the internet."
+        $worker = "`$Host.UI.RawUI.WindowTitle='p2pagents worker'; & '$Exe' --name worker --providers copilot --serve --workspace '$Workspace'"
+        $boss = "`$Host.UI.RawUI.WindowTitle='p2pagents boss'; Write-Host 'Wait for + worker, then try:  /peers   and   /delegate copilot Summarize README.md in 3 bullets' -ForegroundColor Cyan; & '$Exe' --name boss"
         Start-Process $shell -ArgumentList '-NoExit', '-Command', $worker -WorkingDirectory $Repo
         Start-Sleep 2
         Start-Process $shell -ArgumentList '-NoExit', '-Command', $boss -WorkingDirectory $Repo

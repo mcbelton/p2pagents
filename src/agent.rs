@@ -1,30 +1,76 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::llm::{Executor, LlmTask, Provider};
-use crate::protocol::{Message, write_message};
+use crate::protocol::{ALPN, Message, write_message};
+use crate::trust::{TrustStore, TrustedPeer};
 
 /// Maximum number of peer-delegated tasks an agent runs at once; more are queued.
 pub const MAX_CONCURRENT_TASKS: usize = 2;
+const HOUR: Duration = Duration::from_secs(3600);
+
+/// How the agent reaches peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Network {
+    /// Over the internet: NAT hole punching, public relays as fallback, and
+    /// lookup of peers by endpoint id (n0 relay and DNS services).
+    #[default]
+    Internet,
+    /// Direct IP connections only (LAN, VPN, tests). No relays or lookup services.
+    Local,
+}
+
+pub struct AgentConfig {
+    /// Name this agent announces to peers.
+    pub name: String,
+    /// Identity; the public half is the agent's endpoint id.
+    pub secret_key: SecretKey,
+    pub network: Network,
+    /// UDP socket to bind (default: any port on all interfaces).
+    pub bind: Option<SocketAddr>,
+    /// Peers this agent accepts connections from and dials.
+    pub trust: TrustStore,
+    /// Runs LLM tasks that allowlisted peers delegate (none: serve nothing).
+    pub executor: Option<Arc<dyn Executor>>,
+}
+
+impl AgentConfig {
+    pub fn new(name: impl Into<String>, secret_key: SecretKey) -> Self {
+        Self {
+            name: name.into(),
+            secret_key,
+            network: Network::Internet,
+            bind: None,
+            trust: TrustStore::default(),
+            executor: None,
+        }
+    }
+}
 
 /// Notifications surfaced to the application embedding an [`Agent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     PeerConnected {
         name: String,
-        addr: SocketAddr,
+        id: EndpointId,
     },
     PeerDisconnected {
         name: String,
-        addr: SocketAddr,
+        id: EndpointId,
+    },
+    /// A connection from (or to) a key that is not on the allowlist was refused.
+    PeerRejected {
+        id: EndpointId,
     },
     Chat {
         from: String,
@@ -46,14 +92,16 @@ pub enum Event {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
+    /// Local alias from the allowlist.
     pub name: String,
-    pub addr: SocketAddr,
+    pub id: EndpointId,
     pub capabilities: Vec<Provider>,
 }
 
 struct PeerHandle {
     conn_id: u64,
     name: String,
+    addr: EndpointAddr,
     capabilities: Vec<Provider>,
     tx: mpsc::UnboundedSender<Message>,
     close: Arc<Notify>,
@@ -66,19 +114,22 @@ struct PendingTask {
 
 struct Inner {
     name: String,
-    listen_addr: SocketAddr,
-    peers: Mutex<HashMap<SocketAddr, PeerHandle>>,
-    dialing: Mutex<HashSet<SocketAddr>>,
+    endpoint: Endpoint,
+    trust: Mutex<TrustStore>,
+    peers: Mutex<HashMap<EndpointId, PeerHandle>>,
+    dialing: Mutex<HashSet<EndpointId>>,
     events: mpsc::UnboundedSender<Event>,
     next_conn_id: AtomicU64,
     shutdown: watch::Sender<bool>,
     executor: Option<Arc<dyn Executor>>,
     task_slots: Semaphore,
+    task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
     next_task_id: AtomicU64,
 }
 
-/// A peer-to-peer agent. Cheap to clone; all clones share the same node.
+/// A peer-to-peer agent on an iroh QUIC endpoint. Cheap to clone; all clones
+/// share the same node.
 #[derive(Clone)]
 pub struct Agent {
     inner: Arc<Inner>,
@@ -87,43 +138,37 @@ pub struct Agent {
 type Bound = (Agent, mpsc::UnboundedReceiver<Event>);
 
 impl Agent {
-    /// Binds a listener and starts accepting peers. Bind to a concrete IP
-    /// (not 0.0.0.0) because the bound address is what gets advertised to peers.
-    pub async fn bind(name: impl Into<String>, addr: impl ToSocketAddrs) -> Result<Bound> {
-        Self::bind_inner(name.into(), addr, None).await
-    }
-
-    /// Like [`Agent::bind`], but also runs LLM tasks delegated by peers with
-    /// `executor`, and advertises its providers to them.
-    pub async fn bind_with_executor(
-        name: impl Into<String>,
-        addr: impl ToSocketAddrs,
-        executor: Arc<dyn Executor>,
-    ) -> Result<Bound> {
-        Self::bind_inner(name.into(), addr, Some(executor)).await
-    }
-
-    async fn bind_inner(
-        name: String,
-        addr: impl ToSocketAddrs,
-        executor: Option<Arc<dyn Executor>>,
-    ) -> Result<Bound> {
-        let listener = TcpListener::bind(addr).await.context("binding listener")?;
+    pub async fn bind(config: AgentConfig) -> Result<Bound> {
+        let builder = match config.network {
+            Network::Internet => Endpoint::builder(presets::N0),
+            Network::Local => Endpoint::builder(presets::Minimal),
+        };
+        let mut builder = builder
+            .secret_key(config.secret_key)
+            .alpns(vec![ALPN.to_vec()]);
+        if let Some(addr) = config.bind {
+            builder = builder
+                .bind_addr(addr)
+                .map_err(|e| anyhow!("invalid bind address {addr}: {e}"))?;
+        }
+        let endpoint = builder.bind().await.context("starting the iroh endpoint")?;
         let (events, rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
-            name,
-            listen_addr: listener.local_addr()?,
+            name: config.name,
+            endpoint,
+            trust: Mutex::new(config.trust),
             peers: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
             events,
             next_conn_id: AtomicU64::new(0),
             shutdown: watch::Sender::new(false),
-            executor,
+            executor: config.executor,
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
+            task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             next_task_id: AtomicU64::new(1),
         });
-        tokio::spawn(accept_loop(inner.clone(), listener));
+        tokio::spawn(accept_loop(inner.clone()));
         Ok((Self { inner }, rx))
     }
 
@@ -131,8 +176,21 @@ impl Agent {
         &self.inner.name
     }
 
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.inner.listen_addr
+    /// This agent's public key; how peers identify and allowlist it.
+    pub fn id(&self) -> EndpointId {
+        self.inner.endpoint.id()
+    }
+
+    /// Current addresses (relay URL and/or IPs) other agents can dial.
+    pub fn addr(&self) -> EndpointAddr {
+        self.inner.endpoint.addr()
+    }
+
+    /// Waits until the endpoint is reachable through a relay (internet mode).
+    pub async fn online(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.inner.endpoint.online())
+            .await
+            .is_ok()
     }
 
     /// Providers this agent serves to peers (empty without an executor).
@@ -140,10 +198,32 @@ impl Agent {
         self.inner.capabilities()
     }
 
-    /// Dials a peer. Returns once the TCP connection is established; the
-    /// handshake completes asynchronously and is reported via [`Event::PeerConnected`].
-    pub async fn connect(&self, addr: SocketAddr) -> Result<()> {
-        dial(self.inner.clone(), addr).await
+    /// Dials an allowlisted peer. Returns once the connection is established;
+    /// the handshake completes asynchronously and is reported via [`Event::PeerConnected`].
+    pub async fn connect(&self, addr: impl Into<EndpointAddr>) -> Result<()> {
+        dial(self.inner.clone(), addr.into()).await
+    }
+
+    /// Dials every allowlisted peer that isn't connected, now and then every
+    /// `interval`, so the mesh heals after restarts and network changes.
+    pub fn keep_connected(&self, interval: Duration) {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let mut shutdown = inner.shutdown.subscribe();
+            loop {
+                let trusted: Vec<TrustedPeer> = inner.trust.lock().unwrap().peers.clone();
+                for peer in trusted {
+                    let inner = inner.clone();
+                    tokio::spawn(async move {
+                        let _ = dial(inner, peer.addr()).await;
+                    });
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown.wait_for(|stopped| *stopped) => return,
+                }
+            }
+        });
     }
 
     pub fn peers(&self) -> Vec<PeerInfo> {
@@ -153,17 +233,17 @@ impl Agent {
             .lock()
             .unwrap()
             .iter()
-            .map(|(addr, p)| PeerInfo {
+            .map(|(id, p)| PeerInfo {
                 name: p.name.clone(),
-                addr: *addr,
+                id: *id,
                 capabilities: p.capabilities.clone(),
             })
             .collect();
-        peers.sort_by_key(|p| p.addr);
+        peers.sort_by(|a, b| a.name.cmp(&b.name));
         peers
     }
 
-    /// First connected peer (by address) that serves `provider`.
+    /// First connected peer (by name) that serves `provider`.
     pub fn find_peer(&self, provider: Provider) -> Option<PeerInfo> {
         self.peers()
             .into_iter()
@@ -185,18 +265,18 @@ impl Agent {
             .count()
     }
 
-    /// Delegates an LLM task to the peer at `peer` and waits for its result.
-    /// Fails if the peer doesn't serve the provider, rejects the task, or disconnects.
-    pub async fn delegate(&self, peer: SocketAddr, task: LlmTask) -> Result<String> {
+    /// Delegates an LLM task to a connected peer and waits for its result.
+    /// Fails if the peer doesn't serve the provider, refuses the task, or disconnects.
+    pub async fn delegate(&self, peer: EndpointId, task: LlmTask) -> Result<String> {
         let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         {
             let peers = self.inner.peers.lock().unwrap();
             let handle = peers
                 .get(&peer)
-                .ok_or_else(|| anyhow!("not connected to {peer}"))?;
+                .ok_or_else(|| anyhow!("not connected to {}", peer.fmt_short()))?;
             if !handle.capabilities.contains(&task.provider) {
-                bail!("{} ({peer}) does not serve {}", handle.name, task.provider);
+                bail!("{} does not serve {}", handle.name, task.provider);
             }
             self.inner.pending.lock().unwrap().insert(
                 task_id,
@@ -211,7 +291,7 @@ impl Agent {
                 .is_err()
             {
                 self.inner.pending.lock().unwrap().remove(&task_id);
-                bail!("connection to {peer} closed");
+                bail!("connection to {} closed", handle.name);
             }
         }
         match rx.await {
@@ -221,51 +301,70 @@ impl Agent {
         }
     }
 
-    /// Stops accepting peers and closes every connection. Peers observe a disconnect.
-    pub fn shutdown(&self) {
+    /// Stops accepting peers, closes every connection and the endpoint.
+    pub async fn shutdown(&self) {
         self.inner.shutdown.send_replace(true);
         for peer in self.inner.peers.lock().unwrap().values() {
             peer.close.notify_one();
         }
+        self.inner.endpoint.close().await;
     }
 }
 
-async fn accept_loop(inner: Arc<Inner>, listener: TcpListener) {
+async fn accept_loop(inner: Arc<Inner>) {
     let mut shutdown = inner.shutdown.subscribe();
     loop {
-        let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
+        let incoming = tokio::select! {
+            incoming = inner.endpoint.accept() => incoming,
             _ = shutdown.wait_for(|stopped| *stopped) => return,
         };
-        match accepted {
-            Ok((stream, _)) => {
-                let inner = inner.clone();
-                tokio::spawn(async move {
-                    let _ = run_connection(inner, stream, false).await;
-                });
+        let Some(incoming) = incoming else { return };
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            let Ok(conn) = incoming.await else { return };
+            let id = conn.remote_id();
+            if !inner.is_trusted(&id) {
+                let _ = inner.events.send(Event::PeerRejected { id });
+                conn.close(1u32.into(), b"not on allowlist");
+                return;
             }
-            Err(e) => eprintln!("accept failed: {e}"),
-        }
+            let Ok((send, recv)) = conn.accept_bi().await else {
+                return;
+            };
+            let _ = run_connection(inner, conn, send, recv, false).await;
+        });
     }
 }
 
 // Boxed because dial -> run_connection -> (gossip) dial is recursive.
-fn dial(inner: Arc<Inner>, addr: SocketAddr) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+fn dial(inner: Arc<Inner>, addr: EndpointAddr) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
         if *inner.shutdown.borrow() {
             bail!("agent is shut down");
         }
-        if addr == inner.listen_addr || inner.peers.lock().unwrap().contains_key(&addr) {
+        let id = addr.id;
+        if id == inner.endpoint.id() || inner.peers.lock().unwrap().contains_key(&id) {
             return Ok(());
         }
-        if !inner.dialing.lock().unwrap().insert(addr) {
+        if !inner.is_trusted(&id) {
+            bail!(
+                "{id} is not on the allowlist; add it with: p2pagents peers allow <ticket-or-id>"
+            );
+        }
+        if !inner.dialing.lock().unwrap().insert(id) {
             return Ok(());
         }
-        let result = TcpStream::connect(addr).await;
-        inner.dialing.lock().unwrap().remove(&addr);
-        let stream = result.with_context(|| format!("connecting to {addr}"))?;
+        let result = async {
+            let conn = inner.endpoint.connect(addr, ALPN).await?;
+            let (send, recv) = conn.open_bi().await?;
+            anyhow::Ok((conn, send, recv))
+        }
+        .await;
+        inner.dialing.lock().unwrap().remove(&id);
+        let (conn, send, recv) =
+            result.with_context(|| format!("connecting to {}", id.fmt_short()))?;
         tokio::spawn(async move {
-            let _ = run_connection(inner, stream, true).await;
+            let _ = run_connection(inner, conn, send, recv, true).await;
         });
         Ok(())
     })
@@ -285,34 +384,43 @@ impl Inner {
             .unwrap_or_default()
     }
 
-    fn known_addrs(&self) -> Vec<SocketAddr> {
-        self.peers.lock().unwrap().keys().copied().collect()
+    fn is_trusted(&self, id: &EndpointId) -> bool {
+        self.trust.lock().unwrap().get(id).is_some()
     }
 
-    /// Registers a handshaken connection. If a connection to the same peer
-    /// already exists (both sides dialed each other), both nodes keep the one
-    /// initiated by the lower listen address so they converge on the same link.
-    fn register(&self, addr: SocketAddr, handle: PeerHandle, outbound: bool) -> Registration {
+    fn known_addrs(&self) -> Vec<EndpointAddr> {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.addr.clone())
+            .collect()
+    }
+
+    /// Registers a handshaken connection. If both sides dialed each other, both
+    /// keep the connection initiated by the lower endpoint id.
+    fn register(&self, id: EndpointId, handle: PeerHandle, outbound: bool) -> Registration {
+        let me = self.endpoint.id();
         let mut peers = self.peers.lock().unwrap();
-        let outcome = match peers.get(&addr) {
+        let outcome = match peers.get(&id) {
             None => Registration::New,
             Some(old) => {
-                let initiator = if outbound { self.listen_addr } else { addr };
-                if initiator != self.listen_addr.min(addr) {
+                let initiator = if outbound { me } else { id };
+                if initiator != me.min(id) {
                     return Registration::Rejected;
                 }
                 old.close.notify_one();
                 Registration::Replaced
             }
         };
-        peers.insert(addr, handle);
+        peers.insert(id, handle);
         outcome
     }
 
-    fn unregister(&self, addr: SocketAddr, conn_id: u64) -> bool {
+    fn unregister(&self, id: EndpointId, conn_id: u64) -> bool {
         let mut peers = self.peers.lock().unwrap();
-        if peers.get(&addr).is_some_and(|p| p.conn_id == conn_id) {
-            peers.remove(&addr);
+        if peers.get(&id).is_some_and(|p| p.conn_id == conn_id) {
+            peers.remove(&id);
             return true;
         }
         false
@@ -345,7 +453,47 @@ impl Inner {
         }
     }
 
-    async fn serve_task(&self, from: &str, task_id: u64, task: LlmTask) -> Result<String> {
+    /// Checks the allowlist permission and hourly quota for a task from `id`.
+    fn admit_task(&self, id: &EndpointId) -> Result<()> {
+        let (name, can_delegate, per_hour) = {
+            let trust = self.trust.lock().unwrap();
+            let peer = trust
+                .get(id)
+                .ok_or_else(|| anyhow!("not on the allowlist"))?;
+            (peer.name.clone(), peer.can_delegate, peer.tasks_per_hour)
+        };
+        if !can_delegate {
+            bail!(
+                "{} does not accept tasks from {name} (not allowed to delegate)",
+                self.name
+            );
+        }
+        let now = Instant::now();
+        let mut log = self.task_log.lock().unwrap();
+        let recent = log.entry(*id).or_default();
+        while recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > HOUR)
+        {
+            recent.pop_front();
+        }
+        if recent.len() >= per_hour as usize {
+            bail!(
+                "{} refused the task: {name} reached its limit of {per_hour} tasks per hour",
+                self.name
+            );
+        }
+        recent.push_back(now);
+        Ok(())
+    }
+
+    async fn serve_task(
+        &self,
+        id: &EndpointId,
+        from: &str,
+        task_id: u64,
+        task: LlmTask,
+    ) -> Result<String> {
         let executor = self
             .executor
             .as_ref()
@@ -353,6 +501,7 @@ impl Inner {
         if !executor.providers().contains(&task.provider) {
             bail!("{} does not serve {}", self.name, task.provider);
         }
+        self.admit_task(id)?;
         let _ = self.events.send(Event::TaskReceived {
             from: from.to_owned(),
             task_id,
@@ -369,50 +518,63 @@ impl Inner {
     }
 }
 
-async fn run_connection(inner: Arc<Inner>, stream: TcpStream, outbound: bool) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+async fn run_connection(
+    inner: Arc<Inner>,
+    conn: Connection,
+    mut send: SendStream,
+    recv: RecvStream,
+    outbound: bool,
+) -> Result<()> {
+    let peer_id = conn.remote_id();
+    let mut lines = BufReader::new(recv).lines();
 
     let hello = Message::Hello {
         name: inner.name.clone(),
-        listen_addr: inner.listen_addr,
+        addr: inner.endpoint.addr(),
         capabilities: inner.capabilities(),
     };
-    write_message(&mut writer, &hello).await?;
+    write_message(&mut send, &hello).await?;
     let first = lines
         .next_line()
         .await?
         .context("peer closed before hello")?;
     let Message::Hello {
-        name: peer_name,
-        listen_addr: peer_addr,
+        name: announced,
+        addr,
         capabilities,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
     };
-    if peer_addr == inner.listen_addr {
-        return Ok(());
-    }
+    // Gossiped addresses must belong to the authenticated peer.
+    let addr = EndpointAddr::from_parts(peer_id, addr.addrs);
+    let name = inner
+        .trust
+        .lock()
+        .unwrap()
+        .get(&peer_id)
+        .map(|p| p.name.clone())
+        .unwrap_or(announced);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let close = Arc::new(Notify::new());
     let conn_id = inner.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let handle = PeerHandle {
         conn_id,
-        name: peer_name.clone(),
+        name: name.clone(),
+        addr,
         capabilities,
         tx: tx.clone(),
         close: close.clone(),
     };
     let known = inner.known_addrs();
-    match inner.register(peer_addr, handle, outbound) {
+    match inner.register(peer_id, handle, outbound) {
         Registration::Rejected => return Ok(()),
         Registration::Replaced => {}
         Registration::New => {
             let _ = inner.events.send(Event::PeerConnected {
-                name: peer_name.clone(),
-                addr: peer_addr,
+                name: name.clone(),
+                id: peer_id,
             });
         }
     }
@@ -423,7 +585,7 @@ async fn run_connection(inner: Arc<Inner>, stream: TcpStream, outbound: bool) ->
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if write_message(&mut writer, &msg).await.is_err() {
+            if write_message(&mut send, &msg).await.is_err() {
                 break;
             }
         }
@@ -442,7 +604,8 @@ async fn run_connection(inner: Arc<Inner>, stream: TcpStream, outbound: bool) ->
                     let _ = inner.events.send(Event::Chat { from, text });
                 }
                 Message::Peers { addrs } => {
-                    for addr in addrs {
+                    // Only allowlisted peers are dialed; dial() enforces it.
+                    for addr in addrs.into_iter().filter(|a| inner.is_trusted(&a.id)) {
                         let inner = inner.clone();
                         tokio::spawn(async move {
                             let _ = dial(inner, addr).await;
@@ -450,12 +613,13 @@ async fn run_connection(inner: Arc<Inner>, stream: TcpStream, outbound: bool) ->
                     }
                 }
                 Message::TaskRequest { task_id, task } => {
-                    let (inner, tx, from) = (inner.clone(), tx.clone(), peer_name.clone());
+                    let (inner, tx, from) = (inner.clone(), tx.clone(), name.clone());
                     tokio::spawn(async move {
-                        let (ok, output) = match inner.serve_task(&from, task_id, task).await {
-                            Ok(output) => (true, output),
-                            Err(e) => (false, format!("{e:#}")),
-                        };
+                        let (ok, output) =
+                            match inner.serve_task(&peer_id, &from, task_id, task).await {
+                                Ok(output) => (true, output),
+                                Err(e) => (false, format!("{e:#}")),
+                            };
                         let _ = tx.send(Message::TaskResult {
                             task_id,
                             ok,
@@ -482,12 +646,12 @@ async fn run_connection(inner: Arc<Inner>, stream: TcpStream, outbound: bool) ->
     .await;
 
     writer_task.abort();
+    conn.close(0u32.into(), b"bye");
     inner.fail_pending(conn_id);
-    if inner.unregister(peer_addr, conn_id) {
-        let _ = inner.events.send(Event::PeerDisconnected {
-            name: peer_name,
-            addr: peer_addr,
-        });
+    if inner.unregister(peer_id, conn_id) {
+        let _ = inner
+            .events
+            .send(Event::PeerDisconnected { name, id: peer_id });
     }
     result
 }

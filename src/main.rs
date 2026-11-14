@@ -1,13 +1,16 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use p2pagents::auth::{LoginMethod, ProviderTools};
 use p2pagents::profile::DEFAULT_GITHUB_HOST;
+use p2pagents::trust::DEFAULT_TASKS_PER_HOUR;
 use p2pagents::{
-    Access, Agent, Event, Executor, ExecutorConfig, LlmTask, Profile, Provider, SdkExecutor,
+    Access, Agent, AgentConfig, Event, Executor, ExecutorConfig, LlmTask, Network, Profile,
+    Provider, SdkExecutor, Ticket, TrustedPeer,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -16,12 +19,14 @@ commands:
   <text>                                broadcast a chat message
   /ask <provider> <prompt>              run a task locally (provider: copilot|claude|codex)
   /delegate <provider>[@peer] <prompt>  run a task on a peer that serves <provider>
-  /peers                                list peers and the providers they serve
+  /peers                                list connected peers and the providers they serve
+  /ticket                               print this agent's ticket (give it to peers)
   /help                                 show this help
   /quit                                 exit
 
-Each agent uses its own Copilot/Claude/Codex instances and accounts from its profile
-(--profile, default: --name). Sign a profile in first:  p2pagents auth --help";
+Each agent has its own identity (key) and Copilot/Claude/Codex accounts from its profile
+(--profile, default: --name). Peers must allowlist each other's keys:  p2pagents peers --help
+Sign a profile in to providers:  p2pagents auth --help";
 
 const BRIDGE_DEFAULT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bridge/index.mjs");
 
@@ -40,6 +45,64 @@ enum Command {
     /// Sign agent profiles in/out of Copilot, Claude and Codex (each profile has its own accounts).
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Manage which peers (public keys) a profile's agents talk to and accept tasks from.
+    #[command(subcommand)]
+    Peers(PeersCommand),
+    /// Manage profiles.
+    #[command(subcommand)]
+    Profile(ProfileCommand),
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// Delete a profile: its identity key, stored credentials, allowlist and provider sign-ins.
+    Delete {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeersCommand {
+    /// Print this profile's endpoint id and a ticket to give to peers.
+    Id {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Allowlist a peer by its ticket or endpoint id.
+    #[command(after_help = "\
+examples:
+  p2pagents peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate
+  p2pagents peers allow 5f2c...e9 --profile alice --name bob --tasks-per-hour 5
+Both sides must allowlist each other. Only peers allowed with --delegate can make this
+agent run LLM tasks (on this profile's accounts).")]
+    Allow {
+        /// Peer's ticket (`p2pa1...`, from `peers id` or `/ticket`) or endpoint id.
+        target: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Local name for the peer (default: the name in the ticket).
+        #[arg(long)]
+        name: Option<String>,
+        /// Allow this peer to delegate LLM tasks to this profile's agents.
+        #[arg(long)]
+        delegate: bool,
+        /// Maximum tasks this peer may delegate per hour.
+        #[arg(long, default_value_t = DEFAULT_TASKS_PER_HOUR)]
+        tasks_per_hour: u32,
+    },
+    /// List allowlisted peers.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Remove a peer from the allowlist.
+    Remove {
+        /// Peer name or endpoint id.
+        peer: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,7 +160,7 @@ Secrets are read from a hidden prompt, or from stdin when piped.")]
 #[derive(ClapArgs)]
 struct ProfileArg {
     /// Agent profile (identity) to sign in.
-    #[arg(long = "profile")]
+    #[arg(long = "profile", id = "profile")]
     name: String,
 }
 
@@ -116,12 +179,16 @@ struct RunArgs {
     /// Profile whose provider instances and accounts this agent uses (default: --name).
     #[arg(long)]
     profile: Option<String>,
-    /// Address to listen on (use a concrete IP; it is advertised to peers).
-    #[arg(long, default_value = "127.0.0.1:0")]
-    listen: SocketAddr,
-    /// Peer address to connect to on startup (repeatable).
+    /// How to reach peers: over the internet (relays, NAT traversal) or direct IPs only.
+    #[arg(long, value_enum, default_value_t = Network::Internet)]
+    network: Network,
+    /// UDP address to bind (default: any port). Required with --network local.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Allowlisted peer to connect to on startup, as a ticket or endpoint id (repeatable).
+    /// All allowlisted peers are also dialed automatically.
     #[arg(long = "peer")]
-    peers: Vec<SocketAddr>,
+    peers: Vec<String>,
     /// LLM providers to enable on this agent (comma-separated).
     #[arg(long, value_enum, value_delimiter = ',')]
     providers: Vec<Provider>,
@@ -143,8 +210,100 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Auth(command)) => run_auth(command).await,
+        Some(Command::Peers(command)) => run_peers(command),
+        Some(Command::Profile(ProfileCommand::Delete { profile })) => {
+            let profile = Profile::open(&profile.name)?;
+            let name = profile.name.clone();
+            profile.delete()?;
+            println!("profile '{name}' deleted");
+            Ok(())
+        }
         None => run_agent(cli.run).await,
     }
+}
+
+fn run_peers(command: PeersCommand) -> Result<()> {
+    match command {
+        PeersCommand::Id { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let key = profile.identity()?;
+            let ticket = Ticket {
+                name: profile.name.clone(),
+                addr: key.public().into(),
+            };
+            println!(
+                "profile '{}'\n  endpoint id: {}",
+                profile.name,
+                key.public()
+            );
+            println!("  ticket:      {}", ticket.encode());
+            println!(
+                "Give the ticket to peers (they run: p2pagents peers allow <ticket>). A running"
+            );
+            println!("agent prints a fuller ticket with its current addresses (/ticket).");
+        }
+        PeersCommand::Allow {
+            target,
+            profile,
+            name,
+            delegate,
+            tasks_per_hour,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let ticket = Ticket::parse(&target)?;
+            let name = name
+                .or_else(|| Some(ticket.name.clone()).filter(|n| !n.is_empty()))
+                .context("a bare endpoint id has no name; pass --name")?;
+            p2pagents::profile::validate_name(&name).context("invalid peer name")?;
+            if ticket.addr.id == profile.identity()?.public() {
+                bail!("that is this profile's own id");
+            }
+            let mut trust = profile.trust()?;
+            trust.allow(TrustedPeer {
+                name: name.clone(),
+                id: ticket.addr.id,
+                addrs: ticket.addr.addrs,
+                can_delegate: delegate,
+                tasks_per_hour,
+            });
+            trust.save(&profile.trust_path())?;
+            let rights = if delegate {
+                format!("may delegate up to {tasks_per_hour} tasks/hour")
+            } else {
+                "chat only, may not delegate".into()
+            };
+            println!(
+                "profile '{}': allowed {name} ({}), {rights}",
+                profile.name,
+                ticket.addr.id.fmt_short()
+            );
+        }
+        PeersCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let trust = profile.trust()?;
+            if trust.peers.is_empty() {
+                println!("profile '{}' has no allowlisted peers", profile.name);
+            }
+            for p in trust.peers {
+                let rights = if p.can_delegate {
+                    format!("delegate <= {}/h", p.tasks_per_hour)
+                } else {
+                    "no delegation".into()
+                };
+                println!("  {:<16} {}  {rights}", p.name, p.id);
+            }
+        }
+        PeersCommand::Remove { peer, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut trust = profile.trust()?;
+            if !trust.remove(&peer) {
+                bail!("no allowlisted peer {peer} in profile '{}'", profile.name);
+            }
+            trust.save(&profile.trust_path())?;
+            println!("profile '{}': removed {peer}", profile.name);
+        }
+    }
+    Ok(())
 }
 
 async fn run_auth(command: AuthCommand) -> Result<()> {
@@ -239,14 +398,45 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         )
     };
 
-    let (agent, mut events) = match (&executor, args.serve) {
-        (Some(executor), true) => {
-            Agent::bind_with_executor(name, args.listen, executor.clone()).await?
+    let (agent, mut events) = {
+        if args.serve && executor.is_none() {
+            bail!("--serve requires --providers");
         }
-        (None, true) => bail!("--serve requires --providers"),
-        _ => Agent::bind(name, args.listen).await?,
+        if args.network == Network::Local && args.listen.is_none() {
+            bail!("--network local needs --listen <IP:PORT> (a concrete IP peers can reach)");
+        }
+        let mut config = AgentConfig::new(name, profile.identity()?);
+        config.network = args.network;
+        config.bind = args.listen;
+        config.trust = profile.trust()?;
+        if args.serve {
+            config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
+        }
+        Agent::bind(config).await?
     };
-    println!("{} listening on {}", agent.name(), agent.listen_addr());
+    println!(
+        "{} [profile '{}'] endpoint id {}",
+        agent.name(),
+        profile.name,
+        agent.id()
+    );
+    if args.network == Network::Internet && !agent.online(Duration::from_secs(15)).await {
+        eprintln!("warning: no relay reachable yet; peers behind NAT may not reach this agent");
+    }
+    let ticket = Ticket {
+        name: profile.name.clone(),
+        addr: agent.addr(),
+    };
+    println!("ticket: {}", ticket.encode());
+    let allowed = profile.trust()?.peers.len();
+    if allowed == 0 {
+        println!(
+            "no allowlisted peers yet: p2pagents peers allow <their-ticket> --profile {}",
+            profile.name
+        );
+    } else {
+        println!("{allowed} allowlisted peer(s); connecting automatically");
+    }
     if let Some(executor) = &executor {
         let served = if args.serve { ", served to peers" } else { "" };
         println!(
@@ -260,17 +450,25 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         }
     }
 
-    for addr in args.peers {
-        if let Err(e) = agent.connect(addr).await {
+    for peer in &args.peers {
+        let result = match Ticket::parse(peer) {
+            Ok(ticket) => agent.connect(ticket.addr).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
             eprintln!("{e:#}");
         }
     }
+    agent.keep_connected(Duration::from_secs(30));
 
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
-                Event::PeerConnected { name, addr } => println!("+ {name} ({addr})"),
-                Event::PeerDisconnected { name, addr } => println!("- {name} ({addr})"),
+                Event::PeerConnected { name, id } => println!("+ {name} ({})", id.fmt_short()),
+                Event::PeerDisconnected { name, id } => println!("- {name} ({})", id.fmt_short()),
+                Event::PeerRejected { id } => {
+                    println!("! refused connection from {id} (not on the allowlist)")
+                }
                 Event::Chat { from, text } => println!("<{from}> {text}"),
                 Event::TaskReceived {
                     from,
@@ -297,11 +495,23 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             "" => {}
             "/quit" => break,
             "/help" => println!("{COMMANDS}"),
+            "/ticket" => {
+                println!(
+                    "{}",
+                    Ticket {
+                        name: profile.name.clone(),
+                        addr: agent.addr()
+                    }
+                    .encode()
+                )
+            }
             "/peers" => {
                 for peer in agent.peers() {
                     println!(
                         "  {} ({}) serves {:?}",
-                        peer.name, peer.addr, peer.capabilities
+                        peer.name,
+                        peer.id.fmt_short(),
+                        peer.capabilities
                     );
                 }
             }
@@ -321,10 +531,10 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     Err(e) => eprintln!("{e:#}"),
                     Ok((task, peer)) => {
                         let agent = agent.clone();
-                        println!("delegating to {} ({})", peer.name, peer.addr);
+                        println!("delegating to {} ({})", peer.name, peer.id.fmt_short());
                         tokio::spawn(async move {
                             let label = format!("{} on {}", task.provider, peer.name);
-                            print_result(&label, agent.delegate(peer.addr, task).await);
+                            print_result(&label, agent.delegate(peer.id, task).await);
                         });
                     }
                 }
@@ -335,7 +545,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             }
         }
     }
-    agent.shutdown();
+    agent.shutdown().await;
     Ok(())
 }
 
@@ -375,5 +585,16 @@ fn print_result(label: &str, result: Result<String>) {
     match result {
         Ok(output) => println!("=== {label} ===\n{output}\n=== end ==="),
         Err(e) => eprintln!("=== {label} failed: {e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }

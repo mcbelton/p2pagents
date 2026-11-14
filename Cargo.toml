@@ -7,7 +7,9 @@ edition = "2024"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+data-encoding = "2.11.1"
 github-copilot-sdk = { version = "1.0.34", default-features = false, features = ["runtime"] }
+iroh = "1.4.1"
 keyring = "4.2.0"
 rpassword = "7.5.5"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -16,3 +18,8 @@ tokio = { version = "1.54.1", features = ["full"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[patch.crates-io]
+# Same as iroh 1.4.1 without the cdylib crate type; see vendor/iroh/VENDORED.md.
+iroh = { path = "vendor/iroh" }
+

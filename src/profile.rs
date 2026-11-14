@@ -35,7 +35,14 @@ pub const INHERITED_CREDENTIAL_VARS: &[&str] = &[
     "CODEX_HOME",
 ];
 
-const KEYRING_SERVICE: &str = "p2pagents";
+/// OS credential store service name. Profiles under a custom `P2PAGENTS_HOME` get
+/// their own namespace so they never collide with the default profiles.
+fn keyring_service() -> String {
+    match std::env::var("P2PAGENTS_HOME") {
+        Ok(root) if !root.is_empty() => format!("p2pagents:{root}"),
+        _ => "p2pagents".to_owned(),
+    }
+}
 pub const DEFAULT_GITHUB_HOST: &str = "github.com";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +201,7 @@ impl Profile {
     }
 
     fn secret_entry(&self, provider: Provider) -> Result<keyring::Entry> {
-        keyring::Entry::new(KEYRING_SERVICE, &format!("{}/{provider}", self.name))
+        keyring::Entry::new(&keyring_service(), &format!("{}/{provider}", self.name))
             .context("opening the OS credential store")
     }
 
@@ -217,6 +224,63 @@ impl Profile {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e).context("deleting from the OS credential store"),
         }
+    }
+
+    fn identity_entry(&self) -> Result<keyring::Entry> {
+        keyring::Entry::new(&keyring_service(), &format!("{}/identity", self.name))
+            .context("opening the OS credential store")
+    }
+
+    /// This profile's agent identity (ed25519 key), created on first use and
+    /// kept in the OS credential store. Its public half is the endpoint id.
+    pub fn identity(&self) -> Result<iroh::SecretKey> {
+        let entry = self.identity_entry()?;
+        match entry.get_password() {
+            Ok(hex) => hex.parse().map_err(|e| {
+                anyhow!(
+                    "stored identity for profile '{}' is invalid: {e}",
+                    self.name
+                )
+            }),
+            Err(keyring::Error::NoEntry) => {
+                let key = iroh::SecretKey::generate();
+                entry
+                    .set_password(&data_encoding::HEXLOWER.encode(&key.to_bytes()))
+                    .context("saving the agent identity to the OS credential store")?;
+                Ok(key)
+            }
+            Err(e) => Err(e).context("reading the agent identity from the OS credential store"),
+        }
+    }
+
+    pub fn delete_identity(&self) -> Result<()> {
+        match self.identity_entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e).context("deleting the agent identity"),
+        }
+    }
+
+    /// Allowlist of peers this profile's agents talk to.
+    pub fn trust_path(&self) -> PathBuf {
+        self.dir.join("peers.json")
+    }
+
+    /// Deletes the profile: its identity, stored secrets and folder (including
+    /// the provider homes and their sign-ins).
+    pub fn delete(self) -> Result<()> {
+        for provider in [Provider::Copilot, Provider::Claude, Provider::Codex] {
+            self.delete_secret(provider)?;
+        }
+        self.delete_identity()?;
+        if self.dir.exists() {
+            std::fs::remove_dir_all(&self.dir)
+                .with_context(|| format!("deleting {}", self.dir.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn trust(&self) -> Result<crate::trust::TrustStore> {
+        crate::trust::TrustStore::load(&self.trust_path())
     }
 
     pub fn copilot_credentials(&self) -> Result<CopilotCredentials> {

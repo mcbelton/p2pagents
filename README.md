@@ -1,9 +1,10 @@
 # p2pagents
 
-Peer-to-peer agents in Rust that run and delegate LLM coding tasks. Agents connect over
-TCP, exchange newline-delimited JSON messages, discover each other by gossiping peer
-lists, and advertise which LLM providers they serve. Any agent can run a task locally or
-delegate it to a peer:
+Peer-to-peer agents in Rust that run and delegate LLM coding tasks **over the internet**.
+Agents connect with [iroh](https://iroh.computer) (encrypted QUIC, NAT hole punching, relay
+fallback), are addressed by public key instead of IP, only talk to peers on their
+allowlist, discover each other by gossip, and advertise which LLM providers they serve.
+Any agent can run a task locally or delegate it to a peer:
 
 | Provider | SDK | How it is used |
 | --- | --- | --- |
@@ -19,7 +20,7 @@ Rust ports.
 *profile* (default: its `--name`) with private Copilot, Claude and Codex homes and its own
 credentials, so different agents can use different GitHub, Anthropic and OpenAI accounts.
 An agent never uses the machine's global Copilot/Claude/Codex sign-in. See
-[Accounts and profiles](#accounts-and-profiles).
+[Accounts and profiles](#accounts-and-profiles) and [Internet P2P](#internet-p2p).
 
 ## Quick start (Windows, after setup)
 
@@ -30,16 +31,18 @@ so it also works in terminals opened before Rust was installed:
 cd D:\dev\p2pagents
 .\scripts\p2p.ps1 doctor      # checks every prerequisite, prints the fix for anything missing
 .\scripts\p2p.ps1 test        # automated tests (no LLM sign-in needed)
-.\scripts\p2p.ps1 demo        # signs profile "worker" in if needed, opens "worker" and "boss" windows
-.\scripts\p2p.ps1 live-test   # 3 agents, 2 profiles on 2 accounts, real Copilot delegation (needs Python)
+.\scripts\p2p.ps1 demo        # worker + boss windows, allowlisted to each other, connected over the internet
+.\scripts\p2p.ps1 live-test   # 4 agents over the internet, 2 accounts, allowlist + real Copilot delegation (needs Python)
 ```
 
-In the **boss** window type `/peers`, then `/delegate copilot Summarize README.md in 3 bullets`.
+In the **boss** window wait for `+ worker`, then type `/peers` and
+`/delegate copilot Summarize README.md in 3 bullets`.
 The answer is printed in the boss window, and the worker window shows the task starting and
 finishing. Type `/quit` in each window to exit.
 
-`demo` signs the `worker` profile in to Copilot with your first GitHub CLI account. To pick
-the account yourself: `.\scripts\p2p.ps1 agent auth login copilot --profile worker --gh-user <login>`.
+`demo` signs the `worker` profile in to Copilot with your first GitHub CLI account and
+allowlists `worker` and `boss` to each other. To pick the account yourself:
+`.\scripts\p2p.ps1 agent auth login copilot --profile worker --gh-user <login>`.
 To run any p2pagents command through the script: `.\scripts\p2p.ps1 agent <args>`, e.g.
 `.\scripts\p2p.ps1 agent auth status`.
 If PowerShell refuses to run the script, use
@@ -60,6 +63,7 @@ If PowerShell refuses to run the script, use
 | A ChatGPT account or OpenAI API key per profile | | `codex` provider |
 | Git | any | Source control |
 | Python 3 | any | Only for `.\scripts\p2p.ps1 live-test` |
+| Internet access: outbound UDP, or at least HTTPS (443) | | Internet mode: direct QUIC when UDP works, otherwise via the iroh relays over HTTPS |
 
 You only need the tools and credentials for the providers you enable. Rust crates
 (`tokio`, `serde`, `clap`, `github-copilot-sdk`, ...) are downloaded by Cargo, and the
@@ -172,7 +176,8 @@ profile is a private identity:
 ```
 
 Tokens and API keys are stored in the OS credential store (Windows Credential Manager,
-macOS Keychain, Linux Secret Service) under `p2pagents` / `<profile>/<provider>`.
+macOS Keychain, Linux Secret Service) under `p2pagents` / `<profile>/<provider>`, next to
+the profile's identity key (`<profile>/identity`). The allowlist is `<profile>\peers.json`.
 
 **Isolation guarantees**
 
@@ -216,13 +221,74 @@ p2pagents auth logout codex --profile worker1
 p2pagents auth login copilot --profile worker1 --gh-user alice
 p2pagents auth login copilot --profile worker2 --gh-user alice-corp --host mycorp.ghe.com
 p2pagents auth login claude  --profile worker2 --api-key
-
-p2pagents --name worker1 --listen 127.0.0.1:7001 --providers copilot --serve
-p2pagents --name worker2 --listen 127.0.0.1:7002 --providers copilot,claude --serve --peer 127.0.0.1:7001
+# allowlist them to each other (see Internet P2P), then:
+p2pagents --name worker1 --providers copilot --serve
+p2pagents --name worker2 --providers copilot,claude --serve
 ```
 
 Several agents can share one identity by passing the same `--profile`. Each still runs its
 own provider processes.
+
+`p2pagents profile delete --profile P` removes a profile: its identity key, stored
+credentials, allowlist and provider sign-ins.
+
+## Internet P2P
+
+Agents connect with [iroh](https://iroh.computer):
+
+- **Identity:** each profile has an ed25519 key, created on first use and kept in the OS
+  credential store. Its public half, the **endpoint id**, is the agent's address. QUIC/TLS
+  proves every connection really comes from that key.
+- **Reachability:** agents behind home or office NAT connect directly using UDP hole
+  punching; if that fails, traffic goes through public iroh relays over HTTPS (still
+  end-to-end encrypted; the relay can't read it). Agents are found by endpoint id through
+  iroh's DNS address lookup, so nobody needs a public IP or open ports.
+- **Allowlist (mutual):** an agent only accepts connections from, and only dials, keys on
+  its profile's allowlist (`<profile>\peers.json`). Unknown keys are refused
+  (`! refused connection from <id>`). Both sides must allowlist each other.
+- **Delegation rights:** a peer may make your agent run LLM tasks (on your accounts) only if
+  you allowed it with `--delegate`, and at most `--tasks-per-hour` (default 20) per hour.
+- **Discovery:** connected agents share each other's addresses; an agent auto-dials every
+  allowlisted peer at startup and every 30 seconds, so the mesh reforms after restarts.
+
+### Connect two machines
+
+```powershell
+# Alice (machine A), runs a worker that serves Copilot
+p2pagents auth login copilot --profile alice --gh-user alice
+p2pagents peers id --profile alice          # prints alice's endpoint id + ticket; send it to Bob
+
+# Bob (machine B, anywhere on the internet)
+p2pagents peers id --profile bob            # send bob's ticket to Alice
+p2pagents peers allow <alice-ticket> --profile bob
+
+# Alice allowlists Bob and lets him delegate up to 10 tasks per hour
+p2pagents peers allow <bob-ticket> --profile alice --delegate --tasks-per-hour 10
+
+# start both; they find each other by key, no IPs or --peer needed
+p2pagents --name alice --providers copilot --serve        # machine A
+p2pagents --name bob                                      # machine B
+```
+
+Then on Bob's agent: `/delegate copilot@alice <prompt>`.
+
+A ticket (`p2pa1...`) contains the endpoint id, a suggested name and known addresses. A
+bare endpoint id works too (add `--name`). A running agent prints its ticket at startup and
+with `/ticket`.
+
+| Peers command | Description |
+| --- | --- |
+| `p2pagents peers id --profile P` | Show P's endpoint id and ticket |
+| `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
+| `p2pagents peers list --profile P` | List allowlisted peers and their rights |
+| `p2pagents peers remove <name-or-id> --profile P` | Remove a peer |
+
+**LAN or VPN without internet services:** `--network local --listen <IP:PORT>` uses direct
+IP connections only (no relays, no DNS lookup); exchange tickets from running agents
+(`/ticket`), since they contain the IP addresses. The allowlist works the same.
+
+Internet mode uses the public relay and DNS lookup services run by n0 (iroh's maintainers)
+for connection setup. They see endpoint ids and IP addresses, never message contents.
 
 ## Verify the setup
 
@@ -239,25 +305,30 @@ cargo test
 
 ## Run
 
-Two agents, one of which serves Copilot and Claude to its peers. Sign its profile in first
-(see [Accounts and profiles](#accounts-and-profiles)):
+Two agents, one of which serves Copilot and Claude to its peers. Sign its profile in and
+allowlist the two profiles to each other first (see [Accounts and profiles](#accounts-and-profiles)
+and [Internet P2P](#internet-p2p)):
 
 ```powershell
 cargo run -- auth login copilot --profile worker --gh-user <login>
 cargo run -- auth login claude --profile worker
+cargo run -- peers id --profile boss                              # copy boss's ticket
+cargo run -- peers allow <boss-ticket> --profile worker --delegate
+cargo run -- peers id --profile worker                            # copy worker's ticket
+cargo run -- peers allow <worker-ticket> --profile boss
 
-# terminal 1: worker that runs tasks for peers, may edit files in D:\src\myrepo
-cargo run -- --name worker --listen 127.0.0.1:7000 --providers copilot,claude --serve --workspace D:\src\myrepo --access workspace-write
+# terminal 1 (any machine): worker that runs tasks for boss, may edit files in D:\src\myrepo
+cargo run -- --name worker --providers copilot,claude --serve --workspace D:\src\myrepo --access workspace-write
 
-# terminal 2: a peer that delegates work to it (needs no accounts)
-cargo run -- --name boss --peer 127.0.0.1:7000
+# terminal 2 (any machine): a peer that delegates work to it (needs no LLM accounts)
+cargo run -- --name boss
 ```
 
-In terminal 2:
+In terminal 2, once `+ worker` appears:
 
 ```text
 /peers
-  worker (127.0.0.1:7000) serves [Copilot, Claude]
+  worker (ee5c95828c) serves [Copilot, Claude]
 /delegate copilot Add unit tests for the parser module and make sure they pass
 /delegate claude@worker Review src/lib.rs for bugs
 ```
@@ -269,7 +340,8 @@ In terminal 2:
 | `<text>` | Broadcast a chat message |
 | `/ask <provider> <prompt>` | Run a task locally (needs `--providers`) |
 | `/delegate <provider>[@peer] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer) |
-| `/peers` | List peers and the providers they serve |
+| `/peers` | List connected peers and the providers they serve |
+| `/ticket` | Print this agent's ticket (endpoint id + current addresses) |
 | `/help`, `/quit` | Help, exit |
 
 Results print when they arrive, so you can keep typing while tasks run.
@@ -279,24 +351,27 @@ Results print when they arrive, so you can keep typing while tasks run.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--name <NAME>` | required | Agent name shown to peers |
-| `--profile <NAME>` | `--name` | Profile whose provider instances and accounts this agent uses |
-| `--listen <ADDR>` | `127.0.0.1:0` (random port) | Listen address. Use a concrete IP (not `0.0.0.0`); it is advertised to peers |
-| `--peer <ADDR>` | none | Peer to connect to on startup; repeatable |
+| `--profile <NAME>` | `--name` | Profile whose identity, allowlist and provider accounts this agent uses |
+| `--network <MODE>` | `internet` | `internet` (relays, NAT traversal, lookup by id) or `local` (direct IPs only) |
+| `--listen <ADDR>` | any port | UDP address to bind; required with `--network local` (use a concrete IP) |
+| `--peer <TICKET-OR-ID>` | none | Allowlisted peer to dial at startup; repeatable. Allowlisted peers are also dialed automatically |
 | `--providers <LIST>` | none | Comma-separated `copilot,claude,codex` to enable on this agent |
-| `--serve` | off | Run tasks delegated by peers with the enabled providers |
+| `--serve` | off | Run tasks that allowlisted peers with delegation rights send |
 | `--workspace <DIR>` | `.` | Directory the LLM agents work in |
 | `--access <MODE>` | `read-only` | `read-only` or `workspace-write` (see below) |
 | `--bridge <PATH>` | `bridge/index.mjs` in this repo (env `P2PAGENTS_BRIDGE`) | Node bridge script |
 
-Subcommands: `p2pagents auth login|status|logout` (see [Accounts and profiles](#accounts-and-profiles)).
-`P2PAGENTS_HOME` moves the profiles folder.
-
-For agents on different machines, listen on the machine's LAN IP, e.g. `--listen 192.168.1.10:7000`.
+Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
+`p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder (and uses a separate
+credential store namespace).
 
 ## Security model
 
-- An agent runs peer tasks **only** with `--serve`, only for the providers it enabled, and
-  at most 2 at a time (others queue).
+- Connections are encrypted and authenticated (QUIC/TLS with each agent's ed25519 key).
+  Only allowlisted keys can connect; everyone else is refused before any message is read.
+- An agent runs peer tasks **only** with `--serve`, only for the providers it enabled, only
+  from peers allowlisted with `--delegate`, within their hourly limit, and at most 2 at a
+  time (others queue).
 - `--workspace` and `--access` are decided by the agent that runs the task. A peer cannot
   choose the directory or raise the access level.
 - What each access level allows:
@@ -309,8 +384,8 @@ For agents on different machines, listen on the machine's LAN IP, e.g. `--listen
 
 - Each agent uses only its own profile's accounts and provider instances (see
   [Isolation guarantees](#accounts-and-profiles)). Delegating peers never get credentials.
-- Peer traffic is **unauthenticated and unencrypted** TCP. Only use `--serve` on trusted
-  networks (or localhost), especially with `workspace-write`.
+- Prompts from a peer you allow to delegate run with your accounts and in your workspace.
+  Only grant `--delegate` (and especially `--access workspace-write`) to people you trust.
 
 ## Test
 
@@ -320,7 +395,9 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The tests use a fake executor and a fake bridge ([tests/fixtures/fake_bridge.mjs](tests/fixtures/fake_bridge.mjs)),
-so they need Node.js but no LLM credentials.
+so they need Node.js but no LLM credentials. The multi-agent tests run real iroh QUIC
+endpoints on localhost in local mode, so they need no internet.
+`.\scripts\p2p.ps1 live-test` runs the end-to-end test over the internet.
 
 ## Troubleshooting
 
@@ -338,12 +415,19 @@ so they need Node.js but no LLM credentials.
 | `<provider> is not signed in for profile '<p>'` | The agent's profile has no account for that provider; run the printed `auth login` command. Agents never borrow the machine's global sign-in. |
 | `no GitHub CLI token for <user> on <host>` | Sign that account in to gh: `gh auth login --hostname <host>`, then check `gh auth status`. |
 | `Copilot rejected this profile's token` | The token is invalid, expired, or the account has no Copilot access. Sign in again with `auth login copilot`. |
-| Windows Firewall prompt on first run | Allow it if peers run on other machines; not needed for `127.0.0.1`. |
+| Windows Firewall prompt on first run | Allow it for direct (faster) connections; if blocked, agents still connect through the relays. |
+| `! refused connection from <id>` | That key is not on this profile's allowlist. If it should be: `p2pagents peers allow <id> --profile <p> --name <n>`. |
+| `<id> is not on the allowlist` when dialing | Allowlist the peer first; agents only dial allowlisted keys. |
+| Peers never connect (`+ name` doesn't appear) | Both sides must allowlist each other; check `peers list` on both. Check `warning: no relay reachable` at startup: the network must allow outbound HTTPS to `*.iroh.link` (or UDP). On an isolated LAN use `--network local`. |
+| `does not accept tasks from <name> (not allowed to delegate)` | The worker's owner must allow you with `peers allow ... --delegate`. |
+| `reached its limit of N tasks per hour` | Wait, or the worker's owner raises it with `peers allow ... --delegate --tasks-per-hour M`. |
+| `export ordinal too large` when linking `iroh` (Windows GNU) | Keep the `[patch.crates-io]` entry for `vendor/iroh` in `Cargo.toml` (see [vendor/iroh/VENDORED.md](vendor/iroh/VENDORED.md)). |
 
 ## Layout
 
-- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with capabilities, `peers`, `chat`, `task_request`, `task_result`)
-- [src/agent.rs](src/agent.rs): `Agent` node: listener, dialing, handshake, gossip, broadcast, task delegation, shutdown
+- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses and capabilities, `peers`, `chat`, `task_request`, `task_result`) and the `p2pagents/1` ALPN
+- [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, shutdown
+- [src/trust.rs](src/trust.rs): allowlist (`peers.json`) and `p2pa1...` tickets
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
 - [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with the access-based permission handler
 - [src/profile.rs](src/profile.rs): profiles: private provider homes, OS credential store secrets, environment isolation
@@ -352,5 +436,6 @@ so they need Node.js but no LLM credentials.
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/main.rs](src/main.rs): interactive CLI
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
-- [scripts/live_test.py](scripts/live_test.py): multi-process live P2P test: 2 profiles on 2 accounts, real Copilot
-- [tests/](tests/): multi-agent delegation, bridge and credential-isolation tests
+- [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
+- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests
+- [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)

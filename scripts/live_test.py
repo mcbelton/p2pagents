@@ -1,9 +1,12 @@
-"""Live P2P test: 3 p2pagents processes, each worker with its OWN Copilot instance and
-account (separate profiles), gossip discovery, chat, real Copilot delegation, disconnect.
+"""Live internet P2P test. Agents run in internet mode (iroh: QUIC, NAT traversal, public
+relays) and know each other only by endpoint id (public key), never by IP. Checks: own
+identity per profile, allowlist enforcement (intruder refused), delegation permission,
+each worker on its OWN Copilot instance and account, real Copilot delegation, disconnect.
 
-Needs a built binary (cargo build) and the GitHub CLI signed in to at least one account
-(`gh auth login`); with two accounts each worker uses a different one.
-Profiles are created in a temporary P2PAGENTS_HOME, so your real profiles are untouched.
+Needs a built binary (cargo build), internet access, and the GitHub CLI signed in to at
+least one account (`gh auth login`); with two accounts each worker uses a different one.
+Profiles live in a temporary P2PAGENTS_HOME (with their own keyring namespace) and are
+deleted afterwards, so your real profiles are untouched.
 Run: .\\scripts\\p2p.ps1 live-test
 """
 import json, os, re, shutil, subprocess, sys, tempfile, threading, time
@@ -18,7 +21,11 @@ results = []
 def gh_accounts():
     out = subprocess.run(["gh", "auth", "status", "--json", "hosts"], capture_output=True, text=True)
     hosts = json.loads(out.stdout or "{}").get("hosts", {})
-    return [(a["login"], host) for host, accts in hosts.items() for a in accts if a.get("state") == "success"]
+    accts = [(a["login"], host, a.get("active", False)) for host, accts in hosts.items() for a in accts
+             if a.get("state") == "success"]
+    # Prefer each host's active account.
+    accts.sort(key=lambda a: not a[2])
+    return [(login, host) for login, host, _ in accts]
 
 
 class Agent:
@@ -60,8 +67,14 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}: {name} {detail}", flush=True)
 
 
+def cli(*args):
+    out = subprocess.run([EXE, *args], env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+    return out.returncode, out.stdout + out.stderr
+
+
 ws = tempfile.mkdtemp(prefix="p2p-live-")
 agents = []
+PROFILES = ("worker1", "worker2", "boss", "intruder")
 try:
     accounts = gh_accounts()
     if not accounts:
@@ -69,54 +82,79 @@ try:
     acct1, acct2 = accounts[0], accounts[1 % len(accounts)]
     print(f"== sign in profiles: worker1 -> {acct1[0]}@{acct1[1]}, worker2 -> {acct2[0]}@{acct2[1]}")
     for profile, (user, host) in (("worker1", acct1), ("worker2", acct2)):
-        out = subprocess.run([EXE, "auth", "login", "copilot", "--profile", profile, "--gh-user", user, "--host", host],
-                             env=ENV, capture_output=True, text=True)
-        print(f"  {out.stdout.strip()}{out.stderr.strip()}")
-        check(f"{profile} signed in as {user}@{host}", f"signed in as {user}@{host}" in out.stdout)
+        _, out = cli("auth", "login", "copilot", "--profile", profile, "--gh-user", user, "--host", host)
+        print(f"  {out.strip()}")
+        check(f"{profile} signed in as {user}@{host}", f"signed in as {user}@{host}" in out)
 
     print("== an agent whose profile is not signed in must refuse, not borrow another account")
-    out = subprocess.run([EXE, "--name", "intruder", "--providers", "copilot"], env=ENV, capture_output=True,
-                         text=True, stdin=subprocess.DEVNULL, timeout=60)
-    check("unsigned profile refused", out.returncode != 0 and "not signed in for profile 'intruder'" in out.stderr,
-          out.stderr.strip())
+    code, out = cli("--name", "intruder", "--providers", "copilot")
+    check("unsigned profile refused", code != 0 and "not signed in for profile 'intruder'" in out, out.strip())
 
-    print("== start worker1 (own Copilot instance, read-only, repo workspace)")
-    w1 = Agent("worker1", ["--listen", "127.0.0.1:7601", "--providers", "copilot", "--serve", "--workspace", REPO])
+    print("== each profile gets its own identity key")
+    ids = {}
+    for profile in PROFILES:
+        _, out = cli("peers", "id", "--profile", profile)
+        ids[profile] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
+    check("4 distinct endpoint ids", len(set(ids.values())) == 4)
+
+    print("== allowlists by endpoint id only (no IPs/ports: must be found over the internet)")
+    def allow(profile, peer, delegate=False):
+        args = ["peers", "allow", ids[peer], "--profile", profile, "--name", peer] + (["--delegate"] if delegate else [])
+        code, out = cli(*args)
+        print(f"  {out.strip()}")
+        return code == 0
+    ok = all([
+        allow("worker1", "boss", delegate=True), allow("worker1", "worker2"),
+        allow("worker2", "boss", delegate=True), allow("worker2", "worker1"),
+        allow("boss", "worker1"), allow("boss", "worker2"),
+        allow("intruder", "worker1"),  # worker1 does NOT allow intruder
+    ])
+    check("allowlists written", ok)
+
+    print("== start worker1 (internet, own Copilot instance, read-only, repo workspace)")
+    w1 = Agent("worker1", ["--providers", "copilot", "--serve", "--workspace", REPO])
     agents.append(w1)
-    check("worker1 listening", w1.wait_for(r"listening on 127\.0\.0\.1:7601", 60))
+    check("worker1 online with a ticket", w1.wait_for(r"^ticket: p2pa1", 90))
     check("worker1 uses its own account", w1.wait_for(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'worker1'\]"))
 
-    print("== start worker2 (own Copilot instance, workspace-write, temp workspace) -> knows only worker1")
-    w2 = Agent("worker2", ["--listen", "127.0.0.1:7602", "--providers", "copilot", "--serve",
-                           "--access", "workspace-write", "--workspace", ws, "--peer", "127.0.0.1:7601"])
+    print("== start worker2 (internet, own Copilot instance, workspace-write, temp workspace)")
+    w2 = Agent("worker2", ["--providers", "copilot", "--serve", "--access", "workspace-write", "--workspace", ws])
     agents.append(w2)
-    check("worker2 uses its own account", w2.wait_for(rf"copilot: {re.escape(acct2[0])}@{re.escape(acct2[1])} \[profile 'worker2'\]", 60))
-    check("worker2 connected to worker1", w2.wait_for(r"^\+ worker1"))
+    check("worker2 uses its own account", w2.wait_for(rf"copilot: {re.escape(acct2[0])}@{re.escape(acct2[1])} \[profile 'worker2'\]", 90))
+    check("worker2 found worker1 by id over the internet", w2.wait_for(r"^\+ worker1", 120))
 
-    print("== start boss (no providers) -> knows only worker1")
-    boss = Agent("boss", ["--listen", "127.0.0.1:7603", "--peer", "127.0.0.1:7601"])
+    print("== start boss (internet, no providers); no --peer: it dials its allowlist by id")
+    boss = Agent("boss", [])
     agents.append(boss)
-    check("boss connected to worker1", boss.wait_for(r"^\+ worker1"))
-    check("boss discovered worker2 via gossip", boss.wait_for(r"^\+ worker2"))
+    check("boss connected to worker1", boss.wait_for(r"^\+ worker1", 120))
+    check("boss connected to worker2", boss.wait_for(r"^\+ worker2", 120))
+
+    print("== intruder (worker1 never allowlisted it) tries to connect")
+    intruder = Agent("intruder", [])
+    agents.append(intruder)
+    check("worker1 refused intruder", w1.wait_for(rf"refused connection from {ids['intruder']}", 120))
+    time.sleep(2)
+    check("intruder has no peers", not any(l.startswith("+ ") for l in intruder.lines))
+    intruder.stop()
 
     boss.send("/peers")
-    check("boss sees worker1 serving Copilot", boss.wait_for(r"worker1 \(127\.0\.0\.1:7601\) serves \[Copilot\]"))
-    check("boss sees worker2 serving Copilot", boss.wait_for(r"worker2 \(127\.0\.0\.1:7602\) serves \[Copilot\]"))
+    check("boss sees worker1 serving Copilot", boss.wait_for(r"worker1 \([0-9a-f]+\) serves \[Copilot\]"))
+    check("boss sees worker2 serving Copilot", boss.wait_for(r"worker2 \([0-9a-f]+\) serves \[Copilot\]"))
 
     print("== chat broadcast")
     boss.send("hello peers from boss")
     check("worker1 got chat", w1.wait_for(r"^<boss> hello peers from boss"))
     check("worker2 got chat", w2.wait_for(r"^<boss> hello peers from boss"))
 
-    print("== provider nobody serves")
-    boss.send("/delegate claude review the code")
-    check("claude delegation refused", boss.wait_for(r"no peer serves claude"))
+    print("== worker1 may not delegate to worker2 (allowlisted without --delegate)")
+    w1.send("/delegate copilot@worker2 hi")
+    check("delegation without permission refused", w1.wait_for(r"not allowed to delegate", 60))
 
-    print("== two real Copilot delegations in parallel")
+    print("== two real Copilot delegations in parallel over the internet")
     boss.send("/delegate copilot@worker1 Read src/protocol.rs and list the message types it defines, in one line.")
     boss.send("/delegate copilot@worker2 Create a file p2p_live.txt containing exactly: written via p2p delegation. Reply DONE.")
-    check("worker1 started task", w1.wait_for(r"task #\d+ from boss \(copilot\) started"))
-    check("worker2 started task", w2.wait_for(r"task #\d+ from boss \(copilot\) started"))
+    check("worker1 started task", w1.wait_for(r"task #\d+ from boss \(copilot\) started", 60))
+    check("worker2 started task", w2.wait_for(r"task #\d+ from boss \(copilot\) started", 60))
     check("worker1 result back at boss", boss.wait_for(r"=== copilot on worker1 ===", 300))
     check("worker2 result back at boss", boss.wait_for(r"=== copilot on worker2 ===", 300))
     time.sleep(1)
@@ -125,20 +163,22 @@ try:
     path = os.path.join(ws, "p2p_live.txt")
     content = open(path).read().strip() if os.path.exists(path) else None
     check("worker2 wrote p2p_live.txt in its workspace", content and "written via p2p delegation" in content, repr(content))
-    check("no task failures", not any("failed" in l for l in boss.lines))
+    check("no task failures at boss", not any("failed" in l for l in boss.lines))
     for profile in ("worker1", "worker2"):
         state = os.path.join(HOME, "profiles", profile, "copilot", "session-state")
         check(f"{profile}'s Copilot instance used its own COPILOT_HOME", os.path.isdir(state) and os.listdir(state), state)
 
     print("== worker2 leaves")
     w2.stop()
-    check("boss saw worker2 disconnect", boss.wait_for(r"^- worker2"))
-    check("worker1 saw worker2 disconnect", w1.wait_for(r"^- worker2"))
+    check("boss saw worker2 disconnect", boss.wait_for(r"^- worker2", 60))
+    check("worker1 saw worker2 disconnect", w1.wait_for(r"^- worker2", 60))
     boss.send("/delegate copilot@worker2 hi")
     check("delegating to departed peer refused", boss.wait_for(r"no peer named worker2"))
 finally:
     for a in reversed(agents):
         a.stop()
+    for profile in PROFILES:
+        cli("profile", "delete", "--profile", profile)
     shutil.rmtree(ws, ignore_errors=True)
     shutil.rmtree(HOME, ignore_errors=True)
 

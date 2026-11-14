@@ -1,24 +1,29 @@
-use std::net::SocketAddr;
-
 use anyhow::Result;
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::llm::{LlmTask, Provider};
 
-/// Wire messages, framed as one JSON object per line.
+/// QUIC ALPN identifying this protocol; peers speaking anything else are refused.
+pub const ALPN: &[u8] = b"p2pagents/1";
+
+/// Wire messages, framed as one JSON object per line on a QUIC stream. The
+/// sender's identity is not in the messages: it is the connection's
+/// cryptographically verified endpoint id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
     Hello {
         name: String,
-        listen_addr: SocketAddr,
+        /// The sender's current addresses, shared with other peers by gossip.
+        addr: EndpointAddr,
         /// LLM providers this agent runs tasks with on behalf of its peers.
         #[serde(default)]
         capabilities: Vec<Provider>,
     },
     Peers {
-        addrs: Vec<SocketAddr>,
+        addrs: Vec<EndpointAddr>,
     },
     Chat {
         from: String,
@@ -73,11 +78,15 @@ mod tests {
     }
 
     #[test]
-    fn hello_without_capabilities_is_accepted() {
-        let json = r#"{"type":"hello","name":"old","listen_addr":"127.0.0.1:1"}"#;
-        let Message::Hello { capabilities, .. } = serde_json::from_str(json).unwrap() else {
-            panic!("not a hello");
+    fn hello_with_addresses_round_trips() {
+        let id = iroh::SecretKey::generate().public();
+        let addr = EndpointAddr::new(id).with_ip_addr("127.0.0.1:4000".parse().unwrap());
+        let msg = Message::Hello {
+            name: "a".into(),
+            addr,
+            capabilities: vec![Provider::Claude],
         };
-        assert!(capabilities.is_empty());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
     }
 }
