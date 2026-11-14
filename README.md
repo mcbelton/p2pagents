@@ -24,43 +24,34 @@ An agent never uses the machine's global Copilot/Claude/Codex sign-in. See
 
 ## Install (no source code or Rust needed)
 
-Prebuilt binaries for Windows x64, Linux x64 and macOS (Apple Silicon) are published as
+Prebuilt binaries for Windows (x64, ARM64), Linux (x64, ARM64) and macOS (Apple Silicon) are published as
 [GitHub releases](https://github.com/mcbelton/p2pagents/releases). Everything an agent
 needs at runtime is in the one `p2pagents` executable, except the provider CLIs below.
 
 **1. Install p2pagents**
 
 ```powershell
-# Windows (the repo is private: you need read access and the GitHub CLI signed in to that account)
-gh release download -R mcbelton/p2pagents -p install.ps1 -O install.ps1; .\install.ps1
+# Windows (PowerShell)
+irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex
 ```
 
 ```sh
 # Linux / macOS
-gh release download -R mcbelton/p2pagents -p install.sh -O - | sh
+curl -fsSL https://github.com/mcbelton/p2pagents/releases/latest/download/install.sh | sh
 ```
 
 The installer puts `p2pagents` in `%LOCALAPPDATA%\p2pagents\bin` (Windows) or
-`~/.local/bin`, and adds it to `PATH`.
+`~/.local/bin`, and adds it to `PATH`; open a new terminal afterwards. You can also
+download the archive for your platform from the
+[releases page](https://github.com/mcbelton/p2pagents/releases) and put `p2pagents`
+anywhere on `PATH`. To install a specific version on Windows, download `install.ps1` and
+run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `P2PAGENTS_VERSION=v0.1.2 sh install.sh`).
 
-> **"release not found"?** The repo is private, and GitHub shows private repos as "not
-> found" to accounts without access. If `gh` has several accounts, the active one may be
-> wrong (check `gh auth status`). Download with the account that has access:
->
-> ```powershell
-> $env:GH_TOKEN = gh auth token --user <login-with-access>
-> gh release download -R mcbelton/p2pagents -p install.ps1 -O install.ps1 --clobber
-> Remove-Item Env:GH_TOKEN
-> .\install.ps1 -GhUser <login-with-access>      # Linux/macOS: P2PAGENTS_GH_USER=<login> sh install.sh
-> ```
->
-> Otherwise ask the owner to add your account as a collaborator. In a browser, sign in to
-> github.com with that account to see the releases page.
-
-If the repo is made public, no GitHub CLI is needed:
-`irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex`
-(or `curl -fsSL .../install.sh | sh`). You can also download the archive for your platform
-from the release page and put `p2pagents` anywhere on `PATH`.
+> **Forks or private copies:** for a private repo, the installers download through the
+> GitHub CLI. If `gh` has several accounts, pick one with access:
+> `.\install.ps1 -Repo <owner>/<repo> -GhUser <login>` (Linux/macOS:
+> `P2PAGENTS_REPO=<owner>/<repo> P2PAGENTS_GH_USER=<login> sh install.sh`). GitHub shows
+> private repos as "not found" to accounts without access.
 
 **2. Install what your agent uses**
 

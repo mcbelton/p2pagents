@@ -3,11 +3,6 @@
   Installs the p2pagents binary from GitHub releases (no source code or Rust needed).
 
 .EXAMPLE
-  # private repo (you need read access; uses your GitHub CLI sign-in):
-  gh release download -R mcbelton/p2pagents -p install.ps1 -O install.ps1; .\install.ps1
-  # gh has several accounts and another one is active: pick the one with access
-  .\install.ps1 -GhUser mcbelton
-  # public repo:
   irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex
 #>
 param(
@@ -18,31 +13,46 @@ param(
     [string]$GhUser
 )
 $ErrorActionPreference = 'Stop'
-$asset = 'p2pagents-x86_64-pc-windows-msvc.zip'
+$arch = try { [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { $env:PROCESSOR_ARCHITECTURE }
+# Native ARM64 build when available; x64 also runs on Windows ARM through emulation.
+$assets = if ($arch -match 'arm64') { 'p2pagents-aarch64-pc-windows-msvc.zip', 'p2pagents-x86_64-pc-windows-msvc.zip' }
+          else { @('p2pagents-x86_64-pc-windows-msvc.zip') }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "p2pagents-install-$PID"
 New-Item -ItemType Directory $tmp -Force | Out-Null
 $savedToken = $env:GH_TOKEN
 try {
-    $zip = Join-Path $tmp $asset
     $tag = if ($Version -eq 'latest') { @() } else { @($Version) }
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
+    $zip = $null
+    if (-not $GhUser) {
+        # Public repos: plain HTTPS, no GitHub sign-in needed.
+        foreach ($asset in $assets) {
+            $url = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download/$asset" }
+                   else { "https://github.com/$Repo/releases/download/$Version/$asset" }
+            try { Invoke-WebRequest $url -OutFile (Join-Path $tmp $asset) -UseBasicParsing; $zip = Join-Path $tmp $asset; break }
+            catch { $httpError = "$url : $($_.Exception.Message)" }
+        }
+    }
+    if (-not $zip) {
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            throw "Could not download $httpError. For a private repo, install the GitHub CLI and sign in with an account that can read it."
+        }
         if ($GhUser) {
             $env:GH_TOKEN = gh auth token --hostname github.com --user $GhUser
             if ($LASTEXITCODE -or -not $env:GH_TOKEN) { throw "gh has no github.com account '$GhUser'; sign it in with: gh auth login" }
         }
-        # Works for private repos the chosen GitHub account can read.
-        gh release download @tag -R $Repo -p $asset -D $tmp --clobber
-        if ($LASTEXITCODE) {
+        # Private repos: download as a GitHub account that can read the repo.
+        foreach ($asset in $assets) {
+            gh release download @tag -R $Repo -p $asset -D $tmp --clobber 2>$null
+            if (-not $LASTEXITCODE) { $zip = Join-Path $tmp $asset; break }
+        }
+        if (-not $zip) {
             $me = gh api user --jq .login 2>$null
             throw ("Could not download from $Repo as GitHub user '$me'. A private repo looks 'not found' to accounts " +
                 "without access. Use an account that can read it: .\install.ps1 -GhUser <login>  " +
                 "(see gh auth status), or ask the owner to add '$me' as a collaborator.")
         }
-    } else {
-        $url = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download/$asset" }
-               else { "https://github.com/$Repo/releases/download/$Version/$asset" }
-        Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
     }
+    Write-Host "Downloaded $(Split-Path $zip -Leaf) ($arch)"
     New-Item -ItemType Directory $InstallDir -Force | Out-Null
     Expand-Archive $zip -DestinationPath $InstallDir -Force
 } finally {
