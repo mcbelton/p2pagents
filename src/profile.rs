@@ -35,6 +35,61 @@ pub const INHERITED_CREDENTIAL_VARS: &[&str] = &[
     "CODEX_HOME",
 ];
 
+/// Where profile secrets (identity key, tokens, API keys) are kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretStore {
+    /// The OS credential store (Windows Credential Manager, macOS Keychain,
+    /// Linux Secret Service).
+    Keyring,
+    /// Owner-only files in `<profile>/secrets/`: used when no OS credential store is
+    /// available (headless Linux, WSL, containers) or `P2PAGENTS_SECRET_STORE=file`.
+    Files,
+}
+
+impl SecretStore {
+    pub fn current() -> Self {
+        match std::env::var("P2PAGENTS_SECRET_STORE").as_deref() {
+            Ok("file") => Self::Files,
+            Ok("keyring") => Self::Keyring,
+            _ if keyring::Entry::store_status().is_ok() => Self::Keyring,
+            _ => Self::Files,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Keyring => "OS credential store",
+            Self::Files => "owner-only files in each profile's secrets folder",
+        }
+    }
+}
+
+/// Writes `value` to `path`, readable only by the current user (0600 on Unix,
+/// inheriting the user-profile ACL on Windows).
+fn write_private_file(path: &Path, value: &str) -> Result<()> {
+    let dir = path.parent().expect("secret files live in a folder");
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(value.as_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, value).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
 /// OS credential store service name. Profiles under a custom `P2PAGENTS_HOME` get
 /// their own namespace so they never collide with the default profiles.
 fn keyring_service() -> String {
@@ -207,64 +262,91 @@ impl Profile {
         )
     }
 
-    fn secret_entry(&self, provider: Provider) -> Result<keyring::Entry> {
-        keyring::Entry::new(&keyring_service(), &format!("{}/{provider}", self.name))
+    fn secret_get(&self, key: &str) -> Result<Option<String>> {
+        match SecretStore::current() {
+            SecretStore::Keyring => match self.keyring_entry(key)?.get_password() {
+                Ok(v) => Ok(Some(v)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(e).context("reading the OS credential store"),
+            },
+            SecretStore::Files => {
+                let path = self.secret_file(key);
+                match std::fs::read_to_string(&path) {
+                    Ok(v) => Ok(Some(v.trim().to_owned())),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+                }
+            }
+        }
+    }
+
+    fn secret_set(&self, key: &str, value: &str) -> Result<()> {
+        match SecretStore::current() {
+            SecretStore::Keyring => self
+                .keyring_entry(key)?
+                .set_password(value)
+                .context("saving to the OS credential store"),
+            SecretStore::Files => write_private_file(&self.secret_file(key), value),
+        }
+    }
+
+    fn secret_delete(&self, key: &str) -> Result<()> {
+        match SecretStore::current() {
+            SecretStore::Keyring => match self.keyring_entry(key)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(e).context("deleting from the OS credential store"),
+            },
+            SecretStore::Files => match std::fs::remove_file(self.secret_file(key)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).context("deleting a stored secret"),
+            },
+        }
+    }
+
+    fn keyring_entry(&self, key: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(&keyring_service(), &format!("{}/{key}", self.name))
             .context("opening the OS credential store")
+    }
+
+    fn secret_file(&self, key: &str) -> PathBuf {
+        self.dir.join("secrets").join(key)
     }
 
     pub fn set_secret(&self, provider: Provider, secret: &str) -> Result<()> {
-        self.secret_entry(provider)?
-            .set_password(secret)
-            .context("saving to the OS credential store")
+        self.secret_set(&provider.to_string(), secret)
     }
 
     pub fn secret(&self, provider: Provider) -> Result<String> {
-        match self.secret_entry(provider)?.get_password() {
-            Ok(secret) => Ok(secret),
-            Err(keyring::Error::NoEntry) => Err(self.not_signed_in(provider)),
-            Err(e) => Err(e).context("reading the OS credential store"),
-        }
+        self.secret_get(&provider.to_string())?
+            .ok_or_else(|| self.not_signed_in(provider))
     }
 
     pub fn delete_secret(&self, provider: Provider) -> Result<()> {
-        match self.secret_entry(provider)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e).context("deleting from the OS credential store"),
-        }
-    }
-
-    fn identity_entry(&self) -> Result<keyring::Entry> {
-        keyring::Entry::new(&keyring_service(), &format!("{}/identity", self.name))
-            .context("opening the OS credential store")
+        self.secret_delete(&provider.to_string())
     }
 
     /// This profile's agent identity (ed25519 key), created on first use and
-    /// kept in the OS credential store. Its public half is the endpoint id.
+    /// kept in the secret store. Its public half is the endpoint id.
     pub fn identity(&self) -> Result<iroh::SecretKey> {
-        let entry = self.identity_entry()?;
-        match entry.get_password() {
-            Ok(hex) => hex.parse().map_err(|e| {
+        match self.secret_get("identity")? {
+            Some(hex) => hex.parse().map_err(|e| {
                 anyhow!(
                     "stored identity for profile '{}' is invalid: {e}",
                     self.name
                 )
             }),
-            Err(keyring::Error::NoEntry) => {
+            None => {
                 let key = iroh::SecretKey::generate();
-                entry
-                    .set_password(&data_encoding::HEXLOWER.encode(&key.to_bytes()))
-                    .context("saving the agent identity to the OS credential store")?;
+                self.secret_set("identity", &data_encoding::HEXLOWER.encode(&key.to_bytes()))
+                    .context("saving the agent identity")?;
                 Ok(key)
             }
-            Err(e) => Err(e).context("reading the agent identity from the OS credential store"),
         }
     }
 
     pub fn delete_identity(&self) -> Result<()> {
-        match self.identity_entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e).context("deleting the agent identity"),
-        }
+        self.secret_delete("identity")
     }
 
     /// Allowlist of peers this profile's agents talk to.

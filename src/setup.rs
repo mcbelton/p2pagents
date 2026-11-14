@@ -185,6 +185,10 @@ pub async fn doctor(bridge: &Path) -> Result<bool> {
     };
 
     let profiles = Profile::list()?;
+    println!(
+        "  info secret store         {}",
+        crate::profile::SecretStore::current().describe()
+    );
     if profiles.is_empty() {
         println!("  no profiles yet");
     }

@@ -246,7 +246,10 @@ profile is a private identity:
 
 Tokens and API keys are stored in the OS credential store (Windows Credential Manager,
 macOS Keychain, Linux Secret Service) under `p2pagents` / `<profile>/<provider>`, next to
-the profile's identity key (`<profile>/identity`). The allowlist is `<profile>\peers.json`.
+the profile's identity key (`<profile>/identity`). Where no OS credential store is
+available (headless Linux, WSL, containers), or with `P2PAGENTS_SECRET_STORE=file`, they
+are kept in owner-only files (`0600`) in `<profile>\secrets\` instead; `p2pagents doctor`
+shows which store is used. The allowlist is `<profile>\peers.json`.
 
 **Isolation guarantees**
 
