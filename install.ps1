@@ -5,25 +5,39 @@
 .EXAMPLE
   # private repo (you need read access; uses your GitHub CLI sign-in):
   gh release download -R mcbelton/p2pagents -p install.ps1 -O install.ps1; .\install.ps1
+  # gh has several accounts and another one is active: pick the one with access
+  .\install.ps1 -GhUser mcbelton
   # public repo:
   irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex
 #>
 param(
     [string]$Version = 'latest',
     [string]$Repo = 'mcbelton/p2pagents',
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'p2pagents\bin')
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'p2pagents\bin'),
+    # GitHub CLI account to download with (default: gh's active account).
+    [string]$GhUser
 )
 $ErrorActionPreference = 'Stop'
 $asset = 'p2pagents-x86_64-pc-windows-msvc.zip'
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "p2pagents-install-$PID"
 New-Item -ItemType Directory $tmp -Force | Out-Null
+$savedToken = $env:GH_TOKEN
 try {
     $zip = Join-Path $tmp $asset
     $tag = if ($Version -eq 'latest') { @() } else { @($Version) }
     if (Get-Command gh -ErrorAction SilentlyContinue) {
-        # Works for private repos the signed-in GitHub account can read.
+        if ($GhUser) {
+            $env:GH_TOKEN = gh auth token --hostname github.com --user $GhUser
+            if ($LASTEXITCODE -or -not $env:GH_TOKEN) { throw "gh has no github.com account '$GhUser'; sign it in with: gh auth login" }
+        }
+        # Works for private repos the chosen GitHub account can read.
         gh release download @tag -R $Repo -p $asset -D $tmp --clobber
-        if ($LASTEXITCODE) { throw "gh release download failed (do you have access to $Repo? try: gh auth status)" }
+        if ($LASTEXITCODE) {
+            $me = gh api user --jq .login 2>$null
+            throw ("Could not download from $Repo as GitHub user '$me'. A private repo looks 'not found' to accounts " +
+                "without access. Use an account that can read it: .\install.ps1 -GhUser <login>  " +
+                "(see gh auth status), or ask the owner to add '$me' as a collaborator.")
+        }
     } else {
         $url = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download/$asset" }
                else { "https://github.com/$Repo/releases/download/$Version/$asset" }
@@ -32,6 +46,7 @@ try {
     New-Item -ItemType Directory $InstallDir -Force | Out-Null
     Expand-Archive $zip -DestinationPath $InstallDir -Force
 } finally {
+    $env:GH_TOKEN = $savedToken
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 

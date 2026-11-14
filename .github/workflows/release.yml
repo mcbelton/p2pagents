@@ -43,7 +43,7 @@ jobs:
         run: |
           $name = "p2pagents-${{ matrix.target }}"
           New-Item -ItemType Directory $name | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/p2pagents.exe, README.md $name
+          Copy-Item target/${{ matrix.target }}/release/p2pagents.exe, README.md, LICENSE-MIT, LICENSE-APACHE $name
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
 
       - name: Package (Linux/macOS)
@@ -51,7 +51,7 @@ jobs:
         run: |
           name="p2pagents-${{ matrix.target }}"
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/p2pagents README.md "$name/"
+          cp target/${{ matrix.target }}/release/p2pagents README.md LICENSE-MIT LICENSE-APACHE "$name/"
           tar -czf "$name.tar.gz" -C "$name" .
 
       - uses: actions/upload-artifact@v4

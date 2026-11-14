@@ -41,7 +41,23 @@ gh release download -R mcbelton/p2pagents -p install.sh -O - | sh
 ```
 
 The installer puts `p2pagents` in `%LOCALAPPDATA%\p2pagents\bin` (Windows) or
-`~/.local/bin`, and adds it to `PATH`. If the repo is made public, no GitHub CLI is needed:
+`~/.local/bin`, and adds it to `PATH`.
+
+> **"release not found"?** The repo is private, and GitHub shows private repos as "not
+> found" to accounts without access. If `gh` has several accounts, the active one may be
+> wrong (check `gh auth status`). Download with the account that has access:
+>
+> ```powershell
+> $env:GH_TOKEN = gh auth token --user <login-with-access>
+> gh release download -R mcbelton/p2pagents -p install.ps1 -O install.ps1 --clobber
+> Remove-Item Env:GH_TOKEN
+> .\install.ps1 -GhUser <login-with-access>      # Linux/macOS: P2PAGENTS_GH_USER=<login> sh install.sh
+> ```
+>
+> Otherwise ask the owner to add your account as a collaborator. In a browser, sign in to
+> github.com with that account to see the releases page.
+
+If the repo is made public, no GitHub CLI is needed:
 `irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex`
 (or `curl -fsSL .../install.sh | sh`). You can also download the archive for your platform
 from the release page and put `p2pagents` anywhere on `PATH`.
@@ -503,3 +519,9 @@ endpoints on localhost in local mode, so they need no internet.
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
 - [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
+at your option. The vendored iroh copy in [vendor/iroh/](vendor/iroh/) keeps its own
+license (MIT OR Apache-2.0).

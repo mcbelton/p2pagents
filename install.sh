@@ -4,12 +4,14 @@
 #     gh release download -R mcbelton/p2pagents -p install.sh -O - | sh
 #   public repo:
 #     curl -fsSL https://github.com/mcbelton/p2pagents/releases/latest/download/install.sh | sh
-# Options (env vars): P2PAGENTS_VERSION (default latest), P2PAGENTS_REPO, P2PAGENTS_INSTALL_DIR.
+# Options (env vars): P2PAGENTS_VERSION (default latest), P2PAGENTS_REPO, P2PAGENTS_INSTALL_DIR,
+#   P2PAGENTS_GH_USER (GitHub CLI account to download with; default: gh's active account).
 set -eu
 
 repo="${P2PAGENTS_REPO:-mcbelton/p2pagents}"
 version="${P2PAGENTS_VERSION:-latest}"
 dir="${P2PAGENTS_INSTALL_DIR:-$HOME/.local/bin}"
+gh_user="${P2PAGENTS_GH_USER:-}"
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
@@ -21,10 +23,19 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 if command -v gh >/dev/null 2>&1; then
-  if [ "$version" = latest ]; then
-    gh release download -R "$repo" -p "$asset" -D "$tmp"
-  else
-    gh release download "$version" -R "$repo" -p "$asset" -D "$tmp"
+  if [ -n "$gh_user" ]; then
+    GH_TOKEN="$(gh auth token --hostname github.com --user "$gh_user")"
+    export GH_TOKEN
+  fi
+  tag=""
+  [ "$version" = latest ] || tag="$version"
+  # shellcheck disable=SC2086
+  if ! gh release download $tag -R "$repo" -p "$asset" -D "$tmp"; then
+    me="$(gh api user --jq .login 2>/dev/null || echo unknown)"
+    echo "Could not download from $repo as GitHub user '$me'. A private repo looks 'not found' to" >&2
+    echo "accounts without access. Use one that can read it: P2PAGENTS_GH_USER=<login> sh install.sh" >&2
+    echo "(see gh auth status), or ask the owner to add '$me' as a collaborator." >&2
+    exit 1
   fi
 else
   if [ "$version" = latest ]; then
