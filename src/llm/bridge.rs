@@ -51,7 +51,10 @@ impl Bridge {
     /// `env` (the agent profile's config homes and secrets) set instead.
     pub fn spawn_node(script: &Path, env: Vec<(String, OsString)>) -> Result<Self> {
         if !script.is_file() {
-            return Err(anyhow!("bridge script {} not found", script.display()));
+            return Err(anyhow!(
+                "bridge script {} not found; run `p2pagents setup` (needed for claude and codex)",
+                script.display()
+            ));
         }
         let mut cmd = Command::new("node");
         cmd.arg(script);

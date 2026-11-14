@@ -107,13 +107,18 @@ impl fmt::Debug for CopilotCredentials {
     }
 }
 
-pub fn profiles_root() -> Result<PathBuf> {
+/// Root folder for profiles and the installed bridge: `$P2PAGENTS_HOME` or `~/.p2pagents`.
+pub fn data_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("P2PAGENTS_HOME") {
-        return Ok(PathBuf::from(root).join("profiles"));
+        return Ok(PathBuf::from(root));
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .context("cannot find the home directory; set P2PAGENTS_HOME")?;
-    Ok(PathBuf::from(home).join(".p2pagents").join("profiles"))
+    Ok(PathBuf::from(home).join(".p2pagents"))
+}
+
+pub fn profiles_root() -> Result<PathBuf> {
+    Ok(data_root()?.join("profiles"))
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -159,7 +164,9 @@ impl Profile {
         };
         let mut names: Vec<String> = entries
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().join("profile.json").is_file())
+            .filter(|e| {
+                e.path().join("profile.json").is_file() || e.path().join("peers.json").is_file()
+            })
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         names.sort();

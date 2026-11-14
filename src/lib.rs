@@ -9,6 +9,7 @@ pub mod auth;
 pub mod llm;
 pub mod profile;
 pub mod protocol;
+pub mod setup;
 pub mod trust;
 
 pub use agent::{Agent, AgentConfig, Event, Network, PeerInfo};

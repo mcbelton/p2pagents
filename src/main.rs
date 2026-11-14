@@ -28,8 +28,6 @@ Each agent has its own identity (key) and Copilot/Claude/Codex accounts from its
 (--profile, default: --name). Peers must allowlist each other's keys:  p2pagents peers --help
 Sign a profile in to providers:  p2pagents auth --help";
 
-const BRIDGE_DEFAULT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bridge/index.mjs");
-
 /// Run a peer-to-peer agent that can run and delegate LLM coding tasks.
 #[derive(Parser)]
 #[command(version, after_help = COMMANDS, args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
@@ -51,6 +49,18 @@ enum Command {
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
+    /// Install the Claude/Codex bridge (Node packages) into ~/.p2pagents/bridge.
+    /// Not needed for Copilot-only agents.
+    Setup {
+        /// npm registry/mirror to install from (default: your npm config, usually registry.npmjs.org).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+    /// Check this machine for everything agents need (CLIs, bridge, internet relay, profiles).
+    Doctor {
+        #[command(flatten)]
+        bridge: BridgeArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -166,9 +176,15 @@ struct ProfileArg {
 
 #[derive(ClapArgs)]
 struct BridgeArg {
-    /// Node bridge script for the Claude and Codex SDKs.
-    #[arg(long, env = "P2PAGENTS_BRIDGE", default_value = BRIDGE_DEFAULT)]
-    bridge: PathBuf,
+    /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
+    #[arg(long, env = "P2PAGENTS_BRIDGE")]
+    bridge: Option<PathBuf>,
+}
+
+impl BridgeArg {
+    fn path(&self) -> PathBuf {
+        p2pagents::setup::resolve_bridge(self.bridge.clone())
+    }
 }
 
 #[derive(ClapArgs)]
@@ -216,6 +232,20 @@ async fn main() -> Result<()> {
             let name = profile.name.clone();
             profile.delete()?;
             println!("profile '{name}' deleted");
+            Ok(())
+        }
+        Some(Command::Setup { registry }) => {
+            let script = p2pagents::setup::install_bridge(registry.as_deref())?;
+            println!("bridge installed: {}", script.display());
+            println!(
+                "claude and codex providers are ready; sign a profile in with: p2pagents auth login claude --profile <name>"
+            );
+            Ok(())
+        }
+        Some(Command::Doctor { bridge }) => {
+            if !p2pagents::setup::doctor(&bridge.path()).await? {
+                std::process::exit(1);
+            }
             Ok(())
         }
         None => run_agent(cli.run).await,
@@ -324,7 +354,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                 (None, false, false) => LoginMethod::Browser,
             };
             let mut profile = Profile::open(&profile.name)?;
-            let account = ProviderTools::new(&bridge.bridge)
+            let account = ProviderTools::new(&bridge.path())
                 .login(&mut profile, provider, method)
                 .await?;
             println!(
@@ -338,7 +368,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             bridge,
         } => {
             let mut profile = Profile::open(&profile.name)?;
-            ProviderTools::new(&bridge.bridge).logout(&mut profile, provider)?;
+            ProviderTools::new(&bridge.path()).logout(&mut profile, provider)?;
             println!("profile '{}': {provider} signed out", profile.name);
         }
         AuthCommand::Status { profile, bridge } => {
@@ -351,7 +381,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                     "no profiles yet; create one with: p2pagents auth login copilot --profile <name> --gh-user <login>"
                 );
             }
-            let tools = ProviderTools::new(&bridge.bridge);
+            let tools = ProviderTools::new(&bridge.path());
             for name in names {
                 let profile = Profile::open(&name)?;
                 println!("profile '{name}' ({})", profile.dir.display());
@@ -391,7 +421,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 providers: args.providers.clone(),
                 workspace: args.workspace.clone(),
                 access: args.access,
-                bridge_script: args.bridge.bridge.clone(),
+                bridge_script: args.bridge.path(),
                 profile: profile.clone(),
             })
             .await?,

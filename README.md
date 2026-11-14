@@ -22,6 +22,53 @@ credentials, so different agents can use different GitHub, Anthropic and OpenAI 
 An agent never uses the machine's global Copilot/Claude/Codex sign-in. See
 [Accounts and profiles](#accounts-and-profiles) and [Internet P2P](#internet-p2p).
 
+## Install (no source code or Rust needed)
+
+Prebuilt binaries for Windows x64, Linux x64 and macOS (Apple Silicon) are published as
+[GitHub releases](https://github.com/mcbelton/p2pagents/releases). Everything an agent
+needs at runtime is in the one `p2pagents` executable, except the provider CLIs below.
+
+**1. Install p2pagents**
+
+```powershell
+# Windows (the repo is private: you need read access and the GitHub CLI signed in to that account)
+gh release download -R mcbelton/p2pagents -p install.ps1 -O install.ps1; .\install.ps1
+```
+
+```sh
+# Linux / macOS
+gh release download -R mcbelton/p2pagents -p install.sh -O - | sh
+```
+
+The installer puts `p2pagents` in `%LOCALAPPDATA%\p2pagents\bin` (Windows) or
+`~/.local/bin`, and adds it to `PATH`. If the repo is made public, no GitHub CLI is needed:
+`irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex`
+(or `curl -fsSL .../install.sh | sh`). You can also download the archive for your platform
+from the release page and put `p2pagents` anywhere on `PATH`.
+
+**2. Install what your agent uses**
+
+| You want to | Install |
+| --- | --- |
+| Run Copilot tasks | Copilot CLI: `winget install GitHub.Copilot` (or `npm install -g @github/copilot`) and a GitHub account with Copilot |
+| Sign agents in to GitHub accounts easily | GitHub CLI: `winget install GitHub.cli`, then `gh auth login` per account |
+| Run Claude or Codex tasks | Node.js 18+, then `p2pagents setup` (installs the Claude Agent SDK and Codex SDK into `~/.p2pagents/bridge`; add `--registry <mirror>` if public npm is blocked) |
+| Only delegate tasks to others | Nothing else |
+
+**3. Check, sign in, connect**
+
+```powershell
+p2pagents doctor                                         # checks CLIs, bridge, internet relay, profiles
+p2pagents auth login copilot --profile me --gh-user <github-login>
+p2pagents peers id --profile me                          # send your ticket to your peers
+p2pagents peers allow <their-ticket> --profile me [--delegate]
+p2pagents --name me --providers copilot --serve
+```
+
+See [Internet P2P](#internet-p2p) for how peers find each other and
+[Accounts and profiles](#accounts-and-profiles) for sign-in options. Building from source
+is described in the rest of this README.
+
 ## Quick start (Windows, after setup)
 
 Run these from the repo folder in any PowerShell window. The script reloads `PATH` itself,
@@ -161,6 +208,21 @@ manager). On Linux the Copilot SDK also needs OpenSSL 3 development files (`libs
 cd bridge
 npm install
 ```
+
+(From a source checkout the bridge is used in place. Installed binaries use
+`p2pagents setup` instead, which writes the same bridge to `~/.p2pagents/bridge`.)
+
+## Releasing
+
+Push a version tag; GitHub Actions ([.github/workflows/release.yml](.github/workflows/release.yml))
+builds Windows, Linux and macOS binaries and publishes them with the install scripts:
+
+```powershell
+# bump version in Cargo.toml first
+git tag v0.1.1; git push origin v0.1.1
+```
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs fmt, clippy and the tests on every push.
 
 ## Accounts and profiles
 
@@ -434,6 +496,8 @@ endpoints on localhost in local mode, so they need no internet.
 - [src/auth.rs](src/auth.rs): `auth login/status/logout` for Copilot, Claude and Codex
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
+- [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
+- [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot

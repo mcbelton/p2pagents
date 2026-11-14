@@ -117,7 +117,7 @@ impl CopilotBackend {
 }
 
 /// `COPILOT_CLI_PATH`, else `copilot` on `PATH` (the SDK itself does not search `PATH`).
-fn find_copilot_cli() -> Result<PathBuf> {
+pub fn find_copilot_cli() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("COPILOT_CLI_PATH") {
         return Ok(PathBuf::from(path));
     }
