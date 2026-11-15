@@ -529,7 +529,9 @@ Claude's sandbox runtime (on Windows a separate low-rights user) for Claude:
   nothing downloaded. Builds work when their dependencies are already cached.
 - **No way out**: requests to run a command outside the sandbox are refused.
 - **Credential folders unreadable** (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gh`,
-  `~/.p2pagents`, ...) on Linux and macOS for Copilot, and on every platform for Claude.
+  `~/.p2pagents`, ...): for Copilot wherever the sandbox reports the `denied_paths`
+  capability (Linux, macOS, and Windows with Copilot CLI 1.0.112+ on a current Windows
+  build), and on every platform for Claude.
 - **Fails closed**: if a host has no sandbox, Copilot tasks drop the shell tool (printed
   as `copilot: no OS sandbox on this host`) and Claude tasks fail rather than run
   unsandboxed. Run `copilot update` so p2pagents can check sandbox support at startup.
@@ -540,12 +542,12 @@ before they run.
 
 Limits to know:
 
-- **Copilot's sandbox on Windows does not block reads** outside the workspace yet (the
-  ProcessContainer backend can't enforce denied paths on current Windows builds and refuses
-  to run if asked to). A `full` peer's obfuscated command could read files your account
-  can read, though it has no network to send them out and only the task result goes back.
-  For untrusted peers on Windows, keep them at `workspace-write`, or run the serving agent
-  under a separate Windows account or in a VM/container.
+- **Sandboxed commands can still read other files your account can read** outside the
+  workspace (only the credential folders above are denied). They have no network to send
+  them anywhere, and only the task result goes back to the peer. On older Windows builds
+  or Copilot CLIs without `denied_paths`, the credential folders are readable too. For
+  untrusted peers keep them at `workspace-write`, or run the serving agent under a
+  separate OS account or in a VM/container.
 - **Searches see the whole workspace.** A `grep` over the workspace folder is approved as one
   request, so it can return lines from a `.env` inside it. Keep secrets out of the workspace
   you serve (or out of Git-ignored files in it).

@@ -53,22 +53,36 @@ pub(crate) fn available_tools(access: Access) -> Vec<&'static str> {
 /// Whether this host can run the Copilot CLI's OS sandbox for shell commands.
 #[derive(Debug, Clone)]
 enum SandboxSupport {
-    Supported,
+    Supported {
+        /// The backend can enforce `deniedPaths` (Linux/macOS, and Windows with a
+        /// recent Process Security Environment).
+        denied_paths: bool,
+    },
     Unsupported(String),
     /// The Copilot CLI is too old to report it.
     Unknown,
 }
 
+impl SandboxSupport {
+    fn denied_paths(&self) -> bool {
+        match self {
+            SandboxSupport::Supported { denied_paths } => *denied_paths,
+            // Older Windows backends refuse to run any command under a policy with
+            // denied paths; Bubblewrap and Seatbelt always enforce them.
+            _ => !cfg!(windows),
+        }
+    }
+}
+
 /// OS sandbox for shell commands at `full` access: Windows ProcessContainer,
 /// Linux Bubblewrap or macOS Seatbelt. Commands may write only in the workspace
-/// (plus temp and tool caches), have no network, and can't ask to run outside it.
-pub(crate) fn sandbox_config() -> SandboxConfig {
+/// (plus temp and tool caches), have no network, can't ask to run outside it, and
+/// (where the backend enforces it) can't read the home folder's credential stores.
+pub(crate) fn sandbox_config(deny_secrets: bool) -> SandboxConfig {
     let mut policy = json!({
         "network": { "allowOutbound": false, "allowLocalNetwork": false },
     });
-    // Windows' ProcessContainer can't enforce denied paths yet and refuses to run
-    // any command under a policy that has them.
-    if !cfg!(windows) {
+    if deny_secrets {
         policy["filesystem"] = json!({ "deniedPaths": home_secret_paths() });
     }
     serde_json::from_value(json!({
@@ -113,7 +127,12 @@ impl CopilotBackend {
             .with_context(|| format!("starting Copilot CLI {}", cli.display()))?;
         let login = github_login(&creds.token, &creds.host);
         let sandbox = match client.rpc().sandbox().get_host_support().await {
-            Ok(support) if support.supported => SandboxSupport::Supported,
+            Ok(support) if support.supported => SandboxSupport::Supported {
+                denied_paths: support
+                    .capabilities
+                    .iter()
+                    .any(|c| c.name == "denied_paths" && c.supported),
+            },
             Ok(support) => SandboxSupport::Unsupported(
                 support
                     .reason
@@ -177,7 +196,7 @@ impl CopilotBackend {
             .with_available_tools(available_tools(access))
             .with_permission_handler(Arc::new(policy));
         if access == Access::Full {
-            config = config.with_sandbox_config(sandbox_config());
+            config = config.with_sandbox_config(sandbox_config(self.sandbox.denied_paths()));
         }
         if let Some(model) = &task.model {
             config = config.with_model(model.clone());
@@ -447,16 +466,22 @@ mod tests {
 
     #[test]
     fn shell_runs_in_an_offline_sandbox_without_bypass() {
-        let config = serde_json::to_value(sandbox_config()).unwrap();
+        let config = serde_json::to_value(sandbox_config(true)).unwrap();
         assert_eq!(config["enabled"], true);
         assert_eq!(config["allowBypass"], false);
         assert_eq!(config["userPolicy"]["network"]["allowOutbound"], false);
         assert_eq!(config["userPolicy"]["network"]["allowLocalNetwork"], false);
-        assert_eq!(
-            config["userPolicy"]["filesystem"].is_null(),
-            cfg!(windows),
-            "denied paths only where the backend enforces them"
-        );
+        assert!(config["userPolicy"]["filesystem"]["deniedPaths"].is_array());
+        let without = serde_json::to_value(sandbox_config(false)).unwrap();
+        assert!(without["userPolicy"]["filesystem"].is_null());
+
+        let supported = SandboxSupport::Supported { denied_paths: true };
+        assert!(supported.denied_paths());
+        let old_windows = SandboxSupport::Supported {
+            denied_paths: false,
+        };
+        assert!(!old_windows.denied_paths());
+        assert_eq!(SandboxSupport::Unknown.denied_paths(), !cfg!(windows));
 
         let (_dir, ws) = workspace();
         let bypass = json!({
