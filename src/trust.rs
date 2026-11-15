@@ -33,9 +33,16 @@ pub struct TrustedPeer {
     pub can_delegate: bool,
     #[serde(default = "default_tasks_per_hour")]
     pub tasks_per_hour: u32,
-    /// Most a delegated task from this peer may do; capped by the agent's `--access`.
+    /// Most a delegated task from this peer may do; capped by each shared folder's maximum.
     #[serde(default)]
     pub access: Access,
+    /// Names of the folders shared with this peer (see [`crate::shares`]).
+    #[serde(default = "default_shares")]
+    pub shares: Vec<String>,
+}
+
+fn default_shares() -> Vec<String> {
+    vec![crate::shares::DATA_SHARE.to_owned()]
 }
 
 impl TrustedPeer {
@@ -141,6 +148,7 @@ mod tests {
             can_delegate: false,
             tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
             access: Access::ReadOnly,
+            shares: default_shares(),
         }
     }
 

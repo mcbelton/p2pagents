@@ -98,28 +98,38 @@ try:
     check("4 distinct endpoint ids", len(set(ids.values())) == 4)
 
     print("== allowlists by endpoint id only (no IPs/ports: must be found over the internet)")
-    def allow(profile, peer, delegate=False, access=None):
+    def allow(profile, peer, delegate=False, access=None, shares=None):
         args = ["peers", "allow", ids[peer], "--profile", profile, "--name", peer] + (["--delegate"] if delegate else [])
         args += ["--access", access] if access else []
+        args += ["--share", shares] if shares else []
         code, out = cli(*args)
         print(f"  {out.strip()}")
         return code == 0
+    print("== shared folders: worker1 shares this repo read-only as 'repo', worker2 a temp folder writable as 'code'")
+    _, out1 = cli("share", "add", "repo", REPO, "--profile", "worker1")
+    _, out2 = cli("share", "add", "code", ws, "--access", "workspace-write", "--profile", "worker2")
+    print(f"  {out1.strip()}\n  {out2.strip()}")
     ok = all([
-        allow("worker1", "boss", delegate=True), allow("worker1", "worker2"),
-        allow("worker2", "boss", delegate=True, access="workspace-write"), allow("worker2", "worker1"),
+        allow("worker1", "boss", delegate=True, shares="data,repo"), allow("worker1", "worker2"),
+        allow("worker2", "boss", delegate=True, access="workspace-write", shares="data,code"), allow("worker2", "worker1"),
         allow("boss", "worker1"), allow("boss", "worker2"),
         allow("intruder", "worker1"),  # worker1 does NOT allow intruder
     ])
     check("allowlists written", ok)
+    # Something worker1's owner chose to share with peers, in its .p2pdata folder.
+    data1 = os.path.join(HOME, ".p2pdata", "worker1")
+    os.makedirs(data1, exist_ok=True)
+    with open(os.path.join(data1, "notes.md"), "w") as f:
+        f.write("# Status\nThe weekly status token is p2pdata-token-7731.\n")
 
-    print("== start worker1 (internet, own Copilot instance, read-only, repo workspace)")
-    w1 = Agent("worker1", ["--providers", "copilot", "--serve", "--workspace", REPO])
+    print("== start worker1 (internet, own Copilot instance; peers get its .p2pdata folder and 'repo', read-only)")
+    w1 = Agent("worker1", ["--providers", "copilot", "--serve"])
     agents.append(w1)
     check("worker1 online with a ticket", w1.wait_for(r"^ticket: p2pa1", 90))
     check("worker1 uses its own account", w1.wait_for(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'worker1'\]"))
 
-    print("== start worker2 (internet, own Copilot instance, workspace-write, temp workspace)")
-    w2 = Agent("worker2", ["--providers", "copilot", "--serve", "--access", "workspace-write", "--workspace", ws])
+    print("== start worker2 (internet, own Copilot instance; boss may edit its 'code' folder)")
+    w2 = Agent("worker2", ["--providers", "copilot", "--serve"])
     agents.append(w2)
     check("worker2 uses its own account", w2.wait_for(rf"copilot: {re.escape(acct2[0])}@{re.escape(acct2[1])} \[profile 'worker2'\]", 90))
     check("worker2 found worker1 by id over the internet", w2.wait_for(r"^\+ worker1", 120))
@@ -151,9 +161,9 @@ try:
     w1.send("/delegate copilot@worker2 hi")
     check("delegation without permission refused", w1.wait_for(r"not allowed to delegate", 60))
 
-    print("== two real Copilot delegations in parallel over the internet")
-    boss.send("/delegate copilot@worker1 Read src/protocol.rs and list the message types it defines, in one line.")
-    boss.send("/delegate copilot@worker2 Create a file p2p_live.txt containing exactly: written via p2p delegation. Reply DONE.")
+    print("== two real Copilot delegations in parallel over the internet, in the folders shared with boss")
+    boss.send("/delegate copilot@worker1:repo Read src/protocol.rs and list the message types it defines, in one line.")
+    boss.send("/delegate copilot@worker2:code Create a file p2p_live.txt containing exactly: written via p2p delegation. Reply DONE.")
     check("worker1 started task", w1.wait_for(r"task #\d+ from boss \(copilot\) started", 60))
     check("worker2 started task", w2.wait_for(r"task #\d+ from boss \(copilot\) started", 60))
     check("worker1 result back at boss", boss.wait_for(r"=== copilot on worker1 ===", 300))
@@ -170,6 +180,16 @@ try:
         state = os.path.join(HOME, "profiles", profile, "copilot", "session-state")
         check(f"{profile}'s Copilot instance used its own COPILOT_HOME", os.path.isdir(state) and os.listdir(state), state)
 
+    print("== shared folders: by default a peer's task runs in the worker's .p2pdata folder only")
+    boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
+    boss.send("/delegate copilot@worker1 Read notes.md in the current folder and reply with only the status token it contains.")
+    boss.wait_for(r"=== copilot on worker1 ===", 300)
+    time.sleep(1)
+    check("boss's task ran in worker1's .p2pdata folder", any("p2pdata-token-7731" in l for l in boss.lines[boss.cursor:]))
+    boss.send("/delegate copilot@worker1:code hi")
+    check("worker1 refused a folder it did not share with boss",
+          boss.wait_for(r"worker1 has not shared a folder named 'code' with boss", 60))
+
     print("== privacy: a peer's task cannot read files outside the worker's workspace")
     outside = os.path.join(HOME, "outside-secret.txt")
     with open(outside, "w") as f:
@@ -184,7 +204,7 @@ try:
 
     print("== cancel: boss stops a long Copilot task running on worker1")
     boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
-    boss.send("/delegate copilot@worker1 Read every file under src/ and write a detailed 2000-word review of the whole codebase.")
+    boss.send("/delegate copilot@worker1:repo Read every file under src/ and write a detailed 2000-word review of the whole codebase.")
     started = boss.wait_for(r"delegating to worker1 .* as task (\d+)", 30)
     w1.wait_for(r"task #\d+ from boss \(copilot\) started", 60)
     time.sleep(3)

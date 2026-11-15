@@ -12,8 +12,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::audit::{AuditEntry, AuditLog, Outcome};
-use crate::llm::{Access, Executor, LlmTask, Provider};
+use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 use crate::protocol::{ALPN, Message, write_message};
+use crate::shares::{DATA_SHARE, ShareInfo, ShareStore, effective_access};
 use crate::trust::{TrustStore, TrustedPeer};
 
 /// Maximum number of peer-delegated tasks an agent runs at once; more are queued.
@@ -47,6 +48,8 @@ pub struct AgentConfig {
     pub executor: Option<Arc<dyn Executor>>,
     /// Where to record tasks peers ask this agent to run (none: no audit log).
     pub audit: Option<Arc<AuditLog>>,
+    /// Folders peers' tasks may run in (each peer only in those granted to it).
+    pub shares: ShareStore,
 }
 
 impl AgentConfig {
@@ -59,6 +62,7 @@ impl AgentConfig {
             trust: TrustStore::default(),
             executor: None,
             audit: None,
+            shares: ShareStore::default(),
         }
     }
 }
@@ -110,6 +114,8 @@ pub struct PeerInfo {
     pub name: String,
     pub id: EndpointId,
     pub capabilities: Vec<Provider>,
+    /// Folders this peer shares with us for tasks (name and access we get).
+    pub shares: Vec<ShareInfo>,
 }
 
 struct PeerHandle {
@@ -117,6 +123,7 @@ struct PeerHandle {
     name: String,
     addr: EndpointAddr,
     capabilities: Vec<Provider>,
+    shares: Vec<ShareInfo>,
     tx: mpsc::UnboundedSender<Message>,
     close: Arc<Notify>,
 }
@@ -160,6 +167,7 @@ struct Inner {
     shutdown: watch::Sender<bool>,
     executor: Option<Arc<dyn Executor>>,
     audit: Option<Arc<AuditLog>>,
+    shares: Mutex<ShareStore>,
     task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
@@ -204,6 +212,7 @@ impl Agent {
             shutdown: watch::Sender::new(false),
             executor: config.executor,
             audit: config.audit,
+            shares: Mutex::new(config.shares),
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -238,6 +247,11 @@ impl Agent {
     /// Providers this agent serves to peers (empty without an executor).
     pub fn capabilities(&self) -> Vec<Provider> {
         self.inner.capabilities()
+    }
+
+    /// Folders this agent shares (peers see only those granted to them).
+    pub fn shares(&self) -> ShareStore {
+        self.inner.shares.lock().unwrap().clone()
     }
 
     /// Dials an allowlisted peer. Returns once the connection is established;
@@ -279,6 +293,7 @@ impl Agent {
                 name: p.name.clone(),
                 id: *id,
                 capabilities: p.capabilities.clone(),
+                shares: p.shares.clone(),
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -300,8 +315,13 @@ impl Agent {
     /// Adds or updates an allowlisted peer and dials it. Persisting the allowlist
     /// is up to the caller.
     pub fn allow(&self, peer: TrustedPeer) {
-        let addr = peer.addr();
+        let (id, addr) = (peer.id, peer.addr());
         self.inner.trust.lock().unwrap().allow(peer);
+        // A connected peer learns its new folder grants right away.
+        let shares = self.inner.shares_for(&id);
+        if let Some(handle) = self.inner.peers.lock().unwrap().get(&id) {
+            let _ = handle.tx.send(Message::Shares { shares });
+        }
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let _ = dial(inner, addr).await;
@@ -467,6 +487,19 @@ enum Registration {
 }
 
 impl Inner {
+    /// Folders `peer` may run tasks in, by name and access (only if it may delegate
+    /// and this agent serves tasks).
+    fn shares_for(&self, peer: &EndpointId) -> Vec<ShareInfo> {
+        if self.executor.is_none() {
+            return Vec::new();
+        }
+        let trust = self.trust.lock().unwrap();
+        match trust.get(peer) {
+            Some(p) if p.can_delegate => self.shares.lock().unwrap().visible(&p.shares, p.access),
+            _ => Vec::new(),
+        }
+    }
+
     fn capabilities(&self) -> Vec<Provider> {
         self.executor
             .as_ref()
@@ -543,10 +576,10 @@ impl Inner {
         }
     }
 
-    /// Checks the allowlist permission and hourly quota for a task from `id`;
-    /// returns the access this peer is granted.
-    fn admit_task(&self, id: &EndpointId) -> Result<Access> {
-        let (name, can_delegate, per_hour, access) = {
+    /// Checks the allowlist permission, the shared folder and the hourly quota for
+    /// a task from `id`; returns where and with what access it may run.
+    fn admit_task(&self, id: &EndpointId, task: &LlmTask) -> Result<TaskContext> {
+        let (name, can_delegate, per_hour, grant, granted_shares) = {
             let trust = self.trust.lock().unwrap();
             let peer = trust
                 .get(id)
@@ -556,6 +589,7 @@ impl Inner {
                 peer.can_delegate,
                 peer.tasks_per_hour,
                 peer.access,
+                peer.shares.clone(),
             )
         };
         if !can_delegate {
@@ -564,6 +598,20 @@ impl Inner {
                 self.name
             );
         }
+        let share_name = task.share.as_deref().unwrap_or(DATA_SHARE);
+        let share = self
+            .shares
+            .lock()
+            .unwrap()
+            .get(share_name)
+            .filter(|_| granted_shares.iter().any(|s| s == share_name))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} has not shared a folder named '{share_name}' with {name}",
+                    self.name
+                )
+            })?;
         let now = Instant::now();
         let mut log = self.task_log.lock().unwrap();
         let recent = log.entry(*id).or_default();
@@ -580,7 +628,10 @@ impl Inner {
             );
         }
         recent.push_back(now);
-        Ok(access)
+        Ok(TaskContext {
+            access: effective_access(grant, share.max_access),
+            workspace: share.path,
+        })
     }
 
     /// Runs a peer's task until it finishes or `cancel` fires (the peer sent
@@ -649,8 +700,8 @@ impl Inner {
         if !executor.providers().contains(&task.provider) {
             bail!("{} does not serve {}", self.name, task.provider);
         }
-        let access = self.admit_task(id)?;
-        *granted = Some(access);
+        let ctx = self.admit_task(id, task)?;
+        *granted = Some(ctx.access);
         let _ = self.events.send(Event::TaskReceived {
             from: from.to_owned(),
             task_id,
@@ -658,7 +709,7 @@ impl Inner {
         });
         let work = async {
             let _slot = self.task_slots.acquire().await?;
-            executor.execute(task, access).await
+            executor.execute(task, &ctx).await
         };
         // Dropping `work` stops the provider run (each backend aborts on drop).
         tokio::select! {
@@ -685,6 +736,7 @@ async fn run_connection(
         name: inner.name.clone(),
         addr: inner.endpoint.addr(),
         capabilities: inner.capabilities(),
+        shares: inner.shares_for(&peer_id),
     };
     write_message(&mut send, &hello).await?;
     let first = lines
@@ -695,6 +747,7 @@ async fn run_connection(
         name: announced,
         addr,
         capabilities,
+        shares,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
@@ -717,6 +770,7 @@ async fn run_connection(
         name: name.clone(),
         addr,
         capabilities,
+        shares,
         tx: tx.clone(),
         close: close.clone(),
     };
@@ -807,6 +861,13 @@ async fn run_connection(
                         task_id,
                         if ok { Ok(output) } else { Err(output) },
                     );
+                }
+                Message::Shares { shares } => {
+                    if let Some(handle) = inner.peers.lock().unwrap().get_mut(&peer_id)
+                        && handle.conn_id == conn_id
+                    {
+                        handle.shares = shares;
+                    }
                 }
                 Message::Hello { .. } => bail!("unexpected second hello"),
                 Message::Unknown => {}

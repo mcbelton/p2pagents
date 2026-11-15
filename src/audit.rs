@@ -37,6 +37,9 @@ pub struct AuditEntry {
     pub peer_id: String,
     pub task_id: u64,
     pub provider: Provider,
+    /// Shared folder the task asked for.
+    #[serde(default)]
+    pub share: String,
     /// Access the task ran with (`None` when refused).
     pub access: Option<Access>,
     pub outcome: Outcome,
@@ -76,6 +79,10 @@ impl AuditEntry {
             peer_id: peer_id.to_string(),
             task_id,
             provider: task.provider,
+            share: task
+                .share
+                .clone()
+                .unwrap_or_else(|| crate::shares::DATA_SHARE.to_owned()),
             access,
             outcome,
             duration_ms: duration.as_millis() as u64,

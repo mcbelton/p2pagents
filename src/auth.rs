@@ -102,7 +102,7 @@ impl ProviderTools {
         match provider {
             Provider::Copilot => {
                 let creds = profile.copilot_credentials()?;
-                let backend = CopilotBackend::start(creds, std::env::temp_dir()).await?;
+                let backend = CopilotBackend::start(creds).await?;
                 let account = backend.account().await;
                 backend.stop().await;
                 let source = match &profile.config.copilot {

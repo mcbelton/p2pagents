@@ -91,6 +91,10 @@
               <span>Run on</span>
               <select id="target"></select>
             </label>
+            <label class="field-inline" id="share-field" hidden>
+              <span>Folder</span>
+              <select id="share"></select>
+            </label>
           </div>
         </div>
         <div class="input-row">
@@ -146,12 +150,17 @@
       <label class="field" id="access-field" hidden>
         <span>What their tasks may do</span>
         <select id="add-access" aria-describedby="access-hint">
-          <option value="read-only" selected>Read only: read and search files in the workspace</option>
-          <option value="workspace-write">Edit files: also create and edit workspace files</option>
+          <option value="read-only" selected>Read only: read and search files</option>
+          <option value="workspace-write">Edit files: also create and edit files</option>
           <option value="full">Full: also run shell commands in an OS sandbox (trusted peers)</option>
         </select>
         <span class="muted small" id="access-hint"></span>
       </label>
+      <fieldset class="field" id="shares-field" hidden>
+        <legend>Folders their tasks may use</legend>
+        <div id="add-shares" class="share-checks"></div>
+        <span class="muted small">Share more folders with <span class="mono">p2pagents share add</span>. Each folder caps the access above.</span>
+      </fieldset>
       <p class="form-error" id="add-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="add-cancel">Cancel</button>

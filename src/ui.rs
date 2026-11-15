@@ -28,7 +28,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{Agent, Event, Network};
 use crate::audit::{AuditLog, Outcome};
-use crate::llm::{Access, Executor, LlmTask, Provider};
+use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 use crate::profile::{Profile, validate_name};
 use crate::trust::{Ticket, TrustedPeer};
 
@@ -124,6 +124,7 @@ impl Shared {
                     "short": p.id.fmt_short().to_string(),
                     "name": p.name,
                     "capabilities": p.capabilities,
+                    "shares": p.shares,
                 })
             })
             .collect();
@@ -140,6 +141,7 @@ impl Shared {
                     "can_delegate": t.can_delegate,
                     "tasks_per_hour": t.tasks_per_hour,
                     "access": t.access,
+                    "shares": t.shares,
                     "connected": peers.iter().any(|p| p.id == t.id),
                 })
             })
@@ -178,6 +180,7 @@ impl Shared {
             "workspace": self.info.workspace.display().to_string(),
             "providers": self.info.providers,
             "accounts": accounts,
+            "shares": if self.info.serving { json!(self.agent.shares().shares) } else { json!([]) },
             "ticket": ticket,
         })
     }
@@ -441,6 +444,8 @@ struct TaskBody {
     prompt: String,
     /// "local", "auto" (first peer serving the provider), or a peer endpoint id.
     target: String,
+    /// For peers: the shared folder to run in (default: their `data` folder).
+    share: Option<String>,
 }
 
 async fn create_task(
@@ -451,7 +456,13 @@ async fn create_task(
     if prompt.is_empty() {
         return Err(bad_request("prompt is empty"));
     }
-    let task = LlmTask::new(body.provider, prompt.clone());
+    let mut task = LlmTask::new(body.provider, prompt.clone());
+    if let Some(share) = body
+        .share
+        .filter(|s| !s.is_empty() && body.target != "local")
+    {
+        task = task.in_share(share);
+    }
     enum Route {
         Local(Arc<dyn Executor>),
         Peer(iroh::EndpointId, String),
@@ -503,7 +514,13 @@ async fn create_task(
     let shared = s.clone();
     let handle = tokio::spawn(async move {
         let result = match route {
-            Route::Local(executor) => executor.execute(&task, Access::Full).await,
+            Route::Local(executor) => {
+                let ctx = TaskContext {
+                    access: shared.info.access,
+                    workspace: shared.info.workspace.clone(),
+                };
+                executor.execute(&task, &ctx).await
+            }
             Route::Peer(peer, _) => shared.agent.delegate(peer, task).await,
         };
         shared.running.lock().unwrap().remove(&id);
@@ -585,6 +602,8 @@ struct AllowBody {
     tasks_per_hour: Option<u32>,
     #[serde(default)]
     access: Access,
+    /// Folders the peer's tasks may use (default: the `data` share).
+    shares: Option<Vec<String>>,
 }
 
 async fn allow_peer(
@@ -603,6 +622,15 @@ async fn allow_peer(
     if ticket.addr.id == s.agent.id() {
         return Err(bad_request("that is this agent's own ticket"));
     }
+    let shares = body
+        .shares
+        .unwrap_or_else(|| vec![crate::shares::DATA_SHARE.to_owned()]);
+    let known = s.agent.shares();
+    if let Some(missing) = shares.iter().find(|n| known.get(n).is_none()) {
+        return Err(bad_request(format!(
+            "this agent shares no folder named '{missing}'"
+        )));
+    }
     s.agent.allow(TrustedPeer {
         name: name.clone(),
         id: ticket.addr.id,
@@ -616,6 +644,7 @@ async fn allow_peer(
         } else {
             Access::ReadOnly
         },
+        shares: shares.clone(),
     });
     s.save_trust()?;
     s.system(
@@ -623,7 +652,11 @@ async fn allow_peer(
         format!(
             "Allowlisted {name}{}",
             if body.delegate {
-                format!(" (may delegate tasks, {} access)", body.access)
+                format!(
+                    " (may delegate tasks, {} access, folders: {})",
+                    body.access,
+                    shares.join(", ")
+                )
             } else {
                 String::new()
             }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,14 +99,13 @@ pub(crate) fn sandbox_config(deny_secrets: bool) -> SandboxConfig {
 /// agent: its own `COPILOT_HOME`, its own token, and no fallback to the machine's
 /// signed-in user or inherited `GH_TOKEN`-style variables.
 pub struct CopilotBackend {
-    workspace: PathBuf,
     client: Client,
     login: Option<String>,
     sandbox: SandboxSupport,
 }
 
 impl CopilotBackend {
-    pub async fn start(creds: CopilotCredentials, workspace: PathBuf) -> Result<Self> {
+    pub async fn start(creds: CopilotCredentials) -> Result<Self> {
         let cli = find_copilot_cli()?;
         let mut env = vec![("COPILOT_HOME".to_owned(), creds.home.into_os_string())];
         if creds.host != DEFAULT_GITHUB_HOST {
@@ -142,7 +141,6 @@ impl CopilotBackend {
             Err(_) => SandboxSupport::Unknown,
         };
         Ok(Self {
-            workspace,
             client,
             login,
             sandbox,
@@ -177,7 +175,8 @@ impl CopilotBackend {
         let _ = self.client.stop().await;
     }
 
-    pub async fn run(&self, task: &LlmTask, access: Access) -> Result<String> {
+    /// Runs `task` in `workspace` with `access` (tools, permissions and sandbox follow it).
+    pub async fn run(&self, task: &LlmTask, access: Access, workspace: &Path) -> Result<String> {
         let access = match (&self.sandbox, access) {
             (SandboxSupport::Unsupported(reason), Access::Full) => {
                 eprintln!(
@@ -189,11 +188,11 @@ impl CopilotBackend {
         };
         let policy = AccessPolicy {
             access,
-            workspace: Workspace::new(&self.workspace)
-                .with_context(|| format!("opening workspace {}", self.workspace.display()))?,
+            workspace: Workspace::new(workspace)
+                .with_context(|| format!("opening workspace {}", workspace.display()))?,
         };
         let mut config = SessionConfig::default()
-            .with_working_directory(self.workspace.clone())
+            .with_working_directory(workspace.to_path_buf())
             .with_available_tools(available_tools(access))
             .with_permission_handler(Arc::new(policy));
         if access == Access::Full {

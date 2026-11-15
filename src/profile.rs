@@ -359,6 +359,33 @@ impl Profile {
         self.dir.join("audit.jsonl")
     }
 
+    /// Folders this profile shares with peers, besides the built-in data folder.
+    pub fn shares_path(&self) -> PathBuf {
+        self.dir.join("shares.json")
+    }
+
+    /// The profile's `.p2pdata` folder: the built-in read-only `data` share.
+    /// `~/.p2pdata/<profile>`, or `$P2PAGENTS_HOME/.p2pdata/<profile>`.
+    pub fn data_folder(&self) -> PathBuf {
+        let root = self
+            .dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&self.dir);
+        // ~/.p2pagents -> ~/.p2pdata; a custom P2PAGENTS_HOME keeps it inside.
+        let base = if root.file_name().is_some_and(|n| n == ".p2pagents") {
+            root.parent().unwrap_or(root)
+        } else {
+            root
+        };
+        base.join(".p2pdata").join(&self.name)
+    }
+
+    /// The folders this profile shares (always including `data`).
+    pub fn shares(&self) -> Result<crate::shares::ShareStore> {
+        crate::shares::ShareStore::load(&self.shares_path(), self.data_folder())
+    }
+
     /// Deletes the profile: its identity, stored secrets and folder (including
     /// the provider homes and their sign-ins).
     pub fn delete(self) -> Result<()> {

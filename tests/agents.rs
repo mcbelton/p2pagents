@@ -8,16 +8,22 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use p2pagents::audit::{AuditLog, Outcome};
+use p2pagents::shares::{DATA_SHARE, ShareInfo, ShareStore};
 use p2pagents::{
     Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
-    TrustStore, TrustedPeer,
+    TaskContext, TrustStore, TrustedPeer,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
+/// A node's built-in data folder (the fake executor never touches it).
+fn data_folder(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join("p2p-test-data").join(name)
+}
+
 /// Echoes the prompt; "hang" never completes (and counts in `dropped` when its run
-/// is dropped, i.e. stopped), "fail" errors and "access" returns the access the
-/// agent granted the task.
+/// is dropped, i.e. stopped), "fail" errors, "access" returns the access the agent
+/// granted the task and "where" the folder it runs in.
 struct FakeExecutor {
     providers: Vec<Provider>,
     dropped: Arc<AtomicUsize>,
@@ -38,14 +44,15 @@ impl Executor for FakeExecutor {
         self.providers.clone()
     }
 
-    async fn execute(&self, task: &LlmTask, grant: Access) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
         match task.prompt.as_str() {
             "hang" => {
                 let _count = CountDrop(self.dropped.clone());
                 std::future::pending().await
             }
             "fail" => anyhow::bail!("model error"),
-            "access" => Ok(grant.to_string()),
+            "access" => Ok(ctx.access.to_string()),
+            "where" => Ok(ctx.workspace.display().to_string()),
             prompt => Ok(format!("{} did: {prompt}", task.provider)),
         }
     }
@@ -59,6 +66,7 @@ struct Node {
     audit: Option<Arc<AuditLog>>,
     /// Hanging task runs that were stopped (see [`FakeExecutor`]).
     stopped: Arc<AtomicUsize>,
+    shares: ShareStore,
 }
 
 impl Node {
@@ -70,6 +78,7 @@ impl Node {
             executor: None,
             audit: None,
             stopped: Arc::default(),
+            shares: ShareStore::with_data(data_folder(name)),
         }
     }
 
@@ -94,6 +103,7 @@ impl Node {
             can_delegate: delegate.is_some(),
             tasks_per_hour: delegate.unwrap_or(0),
             access: Access::ReadOnly,
+            shares: vec![DATA_SHARE.to_owned()],
         });
     }
 
@@ -104,6 +114,7 @@ impl Node {
         config.trust = self.trust;
         config.executor = self.executor;
         config.audit = self.audit;
+        config.shares = self.shares;
         Agent::bind(config).await.unwrap()
     }
 }
@@ -314,7 +325,10 @@ async fn delegates_tasks_to_a_peer_that_serves_the_provider() {
         .delegate(peer.id, LlmTask::new(Provider::Codex, "access"))
         .await
         .unwrap();
-    assert_eq!(access, "workspace-write");
+    assert_eq!(
+        access, "read-only",
+        "the data folder caps every peer at read-only"
+    );
 
     let out = boss
         .delegate(peer.id, LlmTask::new(Provider::Codex, "add tests"))
@@ -573,4 +587,121 @@ async fn worker_cancels_tasks_when_the_requester_disconnects() {
         ),
         "{completed:?}"
     );
+}
+
+#[tokio::test]
+async fn peer_tasks_run_in_the_shared_data_folder_by_default() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let peer = boss.find_peer(Provider::Copilot).unwrap();
+    assert_eq!(
+        peer.shares,
+        [ShareInfo {
+            name: DATA_SHARE.into(),
+            access: Access::ReadOnly
+        }],
+        "peers learn folder names and access, never paths"
+    );
+    let folder = boss
+        .delegate(peer.id, LlmTask::new(Provider::Copilot, "where"))
+        .await
+        .unwrap();
+    assert_eq!(folder, data_folder("worker").display().to_string());
+    let access = boss
+        .delegate(peer.id, LlmTask::new(Provider::Copilot, "access"))
+        .await
+        .unwrap();
+    assert_eq!(access, "read-only");
+}
+
+#[tokio::test]
+async fn peers_reach_only_folders_shared_with_them() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["code", "secret"] {
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+    }
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    worker
+        .shares
+        .add("code", &dir.path().join("code"), Access::WorkspaceWrite)
+        .unwrap();
+    worker
+        .shares
+        .add("secret", &dir.path().join("secret"), Access::Full)
+        .unwrap();
+    let mut boss = Node::new("boss");
+    let mut other = Node::new("other");
+    mutual(&mut worker, &mut boss);
+    mutual(&mut worker, &mut other);
+    // boss may use data and code, with full access requested; other only data.
+    let boss_grant = worker
+        .trust
+        .peers
+        .iter_mut()
+        .find(|p| p.name == "boss")
+        .unwrap();
+    boss_grant.access = Access::Full;
+    boss_grant.shares = vec![DATA_SHARE.into(), "code".into()];
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    let (other, _oe) = other.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    other.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    wait_for_peers(&other, 1).await;
+
+    let seen: Vec<(String, Access)> = boss.peers()[0]
+        .shares
+        .iter()
+        .map(|s| (s.name.clone(), s.access))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (DATA_SHARE.to_owned(), Access::ReadOnly),
+            ("code".to_owned(), Access::WorkspaceWrite)
+        ],
+        "the unshared folder isn't even listed; access is capped per folder"
+    );
+
+    let in_code = |prompt: &str| LlmTask::new(Provider::Copilot, prompt).in_share("code");
+    let folder = boss.delegate(worker.id(), in_code("where")).await.unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&folder).unwrap(),
+        std::fs::canonicalize(dir.path().join("code")).unwrap()
+    );
+    let access = boss.delegate(worker.id(), in_code("access")).await.unwrap();
+    assert_eq!(
+        access, "workspace-write",
+        "lower of full grant and folder max"
+    );
+
+    for (who, share) in [(&boss, "secret"), (&other, "code"), (&boss, "missing")] {
+        let task = LlmTask::new(Provider::Copilot, "where").in_share(share);
+        let err = who.delegate(worker.id(), task).await.unwrap_err();
+        assert!(err.to_string().contains("has not shared a folder"), "{err}");
+    }
+
+    // Narrowing a connected peer's grant reaches it right away.
+    let mut grant = worker.trusted().get(&boss.id()).unwrap().clone();
+    grant.shares = vec![DATA_SHARE.into()];
+    worker.allow(grant);
+    timeout(Duration::from_secs(10), async {
+        while boss.peers()[0].shares.len() != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("boss saw its narrowed folder list");
+    let err = boss
+        .delegate(worker.id(), in_code("where"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("has not shared a folder"), "{err}");
 }

@@ -44,6 +44,31 @@
       "live": ["boss saw worker2 disconnect", "worker1 saw worker2 disconnect", "delegating to departed peer refused"]
     },
     {
+      "id": "SHR-1",
+      "area": "shared folders",
+      "claim": "Peer tasks run only in folders the owner shared with that peer, by default the profile's own .p2pdata folder (read-only). The agent's working folder and every other folder stay private, and folders are advertised to peers by name only, never by path.",
+      "tests": [
+        "lib::shares::data_folder_is_built_in_read_only_and_per_profile",
+        "lib::shares::shares_persist_and_names_are_validated",
+        "agents::peer_tasks_run_in_the_shared_data_folder_by_default",
+        "agents::peers_reach_only_folders_shared_with_them"
+      ],
+      "live": [
+        "boss's task ran in worker1's .p2pdata folder",
+        "worker1 refused a folder it did not share with boss"
+      ]
+    },
+    {
+      "id": "SHR-2",
+      "area": "shared folders",
+      "claim": "A peer's task gets the lower of the peer's grant and the shared folder's maximum access, so a coding folder can be shared writable with one peer while the data folder stays read-only.",
+      "tests": [
+        "lib::shares::effective_access_is_the_lower_of_grant_and_folder",
+        "agents::peers_reach_only_folders_shared_with_them"
+      ],
+      "live": ["worker2 wrote p2p_live.txt in its workspace", "worker2 audited boss's task with its grant"]
+    },
+    {
       "id": "DEL-1",
       "area": "delegation",
       "claim": "A peer can delegate tasks only if allowlisted with --delegate, and only within its hourly limit.",
@@ -74,7 +99,7 @@
     {
       "id": "DEL-3",
       "area": "delegation",
-      "claim": "A peer's task gets the lower of the peer's own grant (default read-only) and the agent's --access; peers can't raise it.",
+      "claim": "A peer's task gets the lower of the peer's own grant (default read-only) and the shared folder's maximum; peers can't raise it.",
       "tests": [
         "agents::delegates_tasks_to_a_peer_that_serves_the_provider",
         "lib::trust::allow_replaces_same_id_or_name_and_persists"

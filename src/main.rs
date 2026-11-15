@@ -11,7 +11,7 @@ use p2pagents::profile::DEFAULT_GITHUB_HOST;
 use p2pagents::trust::DEFAULT_TASKS_PER_HOUR;
 use p2pagents::{
     Access, Agent, AgentConfig, Event, Executor, ExecutorConfig, LlmTask, Network, Profile,
-    Provider, SdkExecutor, Ticket, TrustedPeer,
+    Provider, SdkExecutor, TaskContext, Ticket, TrustedPeer,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -19,7 +19,7 @@ const COMMANDS: &str = "\
 commands:
   <text>                                broadcast a chat message
   /ask <provider> <prompt>              run a task locally (provider: copilot|claude|codex)
-  /delegate <provider>[@peer] <prompt>  run a task on a peer that serves <provider>
+  /delegate <provider>[@peer[:folder]] <prompt>  run a task on a peer, in a folder it shares with you (default: data)
   /tasks                                list your running tasks
   /cancel <n>                           cancel your running task n (the peer stops it too)
   /peers                                list connected peers and the providers they serve
@@ -49,6 +49,9 @@ enum Command {
     /// Manage which peers (public keys) a profile's agents talk to and accept tasks from.
     #[command(subcommand)]
     Peers(PeersCommand),
+    /// Manage the folders a profile shares with peers for their tasks.
+    #[command(subcommand)]
+    Share(ShareCommand),
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
@@ -88,6 +91,39 @@ enum ProfileCommand {
 }
 
 #[derive(Subcommand)]
+enum ShareCommand {
+    /// Share a folder with peers (grant it per peer with `peers allow --share`).
+    #[command(after_help = "\
+examples:
+  p2pagents share add myrepo D:\\src\\myrepo --access workspace-write --profile alice
+  p2pagents peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
+Every profile also shares its own .p2pdata folder as 'data' (read-only); peers'
+tasks run there unless they name another folder shared with them.")]
+    Add {
+        /// Name peers use for the folder (e.g. `/delegate copilot@alice:myrepo ...`).
+        name: String,
+        /// Existing folder to share.
+        path: PathBuf,
+        /// Most any peer's task may do in this folder.
+        #[arg(long, value_enum, default_value_t = Access::ReadOnly)]
+        access: Access,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// List the folders a profile shares.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Stop sharing a folder.
+    Remove {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
 enum PeersCommand {
     /// Print this profile's endpoint id and a ticket to give to peers.
     Id {
@@ -118,9 +154,17 @@ agent's own --access.")]
         #[arg(long, default_value_t = DEFAULT_TASKS_PER_HOUR)]
         tasks_per_hour: u32,
         /// What this peer's tasks may do: read-only, workspace-write (edit files) or
-        /// full (also shell commands). Capped by the agent's --access.
+        /// full (also shell commands). Capped by each shared folder's maximum.
         #[arg(long, value_enum, default_value_t = Access::ReadOnly, requires = "delegate")]
         access: Access,
+        /// Shared folders this peer's tasks may use (see `p2pagents share`).
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "data",
+            requires = "delegate"
+        )]
+        share: Vec<String>,
     },
     /// List allowlisted peers.
     List {
@@ -232,11 +276,12 @@ struct RunArgs {
     /// Run tasks delegated by peers with the enabled providers.
     #[arg(long)]
     serve: bool,
-    /// Directory LLM agents work in.
+    /// Folder your own tasks (/ask, "This agent" in the web UI) work in. Peers never
+    /// get it: their tasks run only in folders you share (see `p2pagents share`).
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// Most any task on this agent may do: read-only, workspace-write (edit files) or
-    /// full (also shell commands). Peer tasks also get no more than the peer's grant.
+    /// Most your own tasks may do in --workspace: read-only, workspace-write (edit
+    /// files) or full (also shell commands). Peers' access is set per peer and folder.
     #[arg(long, value_enum, default_value_t = Access::ReadOnly)]
     access: Access,
     /// Open the web UI (served on 127.0.0.1 only) instead of the terminal prompt.
@@ -275,6 +320,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Auth(command)) => run_auth(command).await,
         Some(Command::Peers(command)) => run_peers(command),
+        Some(Command::Share(command)) => run_share(command),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
             let name = profile.name.clone();
@@ -368,6 +414,49 @@ fn civil_date(days: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+fn run_share(command: ShareCommand) -> Result<()> {
+    match command {
+        ShareCommand::Add {
+            name,
+            path,
+            access,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut shares = profile.shares()?;
+            let share = shares.add(&name, &path, access)?.clone();
+            shares.save(&profile.shares_path())?;
+            println!(
+                "profile '{}': sharing {} as '{name}' (at most {access}). Grant it to a peer with: p2pagents peers allow <peer> --profile {} --delegate --share data,{name}",
+                profile.name,
+                share.path.display(),
+                profile.name
+            );
+        }
+        ShareCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            for share in profile.shares()?.shares {
+                println!(
+                    "  {:<12} at most {:<16} {}",
+                    share.name,
+                    share.max_access.to_string(),
+                    share.path.display()
+                );
+            }
+        }
+        ShareCommand::Remove { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut shares = profile.shares()?;
+            if !shares.remove(&name)? {
+                bail!("profile '{}' shares no folder named '{name}'", profile.name);
+            }
+            shares.save(&profile.shares_path())?;
+            println!("profile '{}': stopped sharing '{name}'", profile.name);
+        }
+    }
+    Ok(())
+}
+
 fn run_peers(command: PeersCommand) -> Result<()> {
     match command {
         PeersCommand::Id { profile } => {
@@ -395,6 +484,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             delegate,
             tasks_per_hour,
             access,
+            share,
         } => {
             let profile = Profile::open(&profile.name)?;
             let ticket = Ticket::parse(&target)?;
@@ -405,6 +495,14 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             if ticket.addr.id == profile.identity()?.public() {
                 bail!("that is this profile's own id");
             }
+            let shared = profile.shares()?;
+            if let Some(missing) = share.iter().find(|s| shared.get(s).is_none()) {
+                bail!(
+                    "profile '{}' shares no folder named '{missing}'; add it first: p2pagents share add {missing} <folder> --profile {}",
+                    profile.name,
+                    profile.name
+                );
+            }
             let mut trust = profile.trust()?;
             trust.allow(TrustedPeer {
                 name: name.clone(),
@@ -413,10 +511,14 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 can_delegate: delegate,
                 tasks_per_hour,
                 access,
+                shares: share.clone(),
             });
             trust.save(&profile.trust_path())?;
             let rights = if delegate {
-                format!("may delegate up to {tasks_per_hour} tasks/hour with {access} access")
+                format!(
+                    "may delegate up to {tasks_per_hour} tasks/hour with {access} access in: {}",
+                    share.join(", ")
+                )
             } else {
                 "chat only, may not delegate".into()
             };
@@ -434,7 +536,12 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             }
             for p in trust.peers {
                 let rights = if p.can_delegate {
-                    format!("delegate <= {}/h, {}", p.tasks_per_hour, p.access)
+                    format!(
+                        "delegate <= {}/h, {}, folders: {}",
+                        p.tasks_per_hour,
+                        p.access,
+                        p.shares.join(",")
+                    )
                 } else {
                     "no delegation".into()
                 };
@@ -537,14 +644,17 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         Some(
             SdkExecutor::start(ExecutorConfig {
                 providers: args.providers.clone(),
-                workspace: args.workspace.clone(),
-                access: args.access,
                 bridge_script: args.bridge.path(),
                 profile: profile.clone(),
             })
             .await?,
         )
     };
+    let local = TaskContext {
+        access: args.access,
+        workspace: std::path::absolute(&args.workspace)?,
+    };
+    let shares = profile.shares()?;
 
     let (agent, mut events) = {
         if args.serve && executor.is_none() {
@@ -558,8 +668,12 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.bind = args.listen;
         config.trust = profile.trust()?;
         if args.serve {
+            let data = profile.data_folder();
+            std::fs::create_dir_all(&data)
+                .with_context(|| format!("creating the shared data folder {}", data.display()))?;
             config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
             config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
+            config.shares = shares.clone();
         }
         Agent::bind(config).await?
     };
@@ -587,15 +701,25 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         println!("{allowed} allowlisted peer(s); connecting automatically");
     }
     if let Some(executor) = &executor {
-        let served = if args.serve { ", served to peers" } else { "" };
         println!(
-            "providers: {:?} ({:?} in {}{served})",
+            "providers: {:?} (your tasks: {} in {})",
             executor.providers(),
             args.access,
-            args.workspace.display()
+            local.workspace.display()
         );
         for (provider, account) in executor.accounts() {
             println!("  {provider}: {account} [profile '{}']", profile.name);
+        }
+        if args.serve {
+            println!("folders shared with peers (each peer sees only those you granted it):");
+            for share in &shares.shares {
+                println!(
+                    "  {:<12} at most {:<16} {}",
+                    share.name,
+                    share.max_access.to_string(),
+                    share.path.display()
+                );
+            }
         }
     }
 
@@ -616,7 +740,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             network: args.network,
             serving: args.serve,
             access: args.access,
-            workspace: std::path::absolute(&args.workspace).unwrap_or(args.workspace.clone()),
+            workspace: local.workspace.clone(),
             providers: executor.as_ref().map(|e| e.providers()).unwrap_or_default(),
             accounts: executor
                 .as_ref()
@@ -710,11 +834,21 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             }
             "/peers" => {
                 for peer in agent.peers() {
+                    let shares: Vec<String> = peer
+                        .shares
+                        .iter()
+                        .map(|s| format!("{} ({})", s.name, s.access))
+                        .collect();
                     println!(
-                        "  {} ({}) serves {:?}",
+                        "  {} ({}) serves {:?}{}",
                         peer.name,
                         peer.id.fmt_short(),
-                        peer.capabilities
+                        peer.capabilities,
+                        if shares.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", folders shared with you: {}", shares.join(", "))
+                        }
                     );
                 }
             }
@@ -724,8 +858,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 (Ok((task, _)), Some(executor)) => {
                     let executor = executor.clone();
                     let label = format!("{} (local)", task.provider);
+                    let ctx = local.clone();
                     tasks.spawn(label.clone(), async move {
-                        print_result(&label, executor.execute(&task, Access::Full).await);
+                        print_result(&label, executor.execute(&task, &ctx).await);
                     });
                 }
             },
@@ -756,18 +891,26 @@ async fn run_agent(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Parses `<provider>[@peer] <prompt>`.
+/// Parses `<provider>[@peer[:folder]] <prompt>`.
 fn parse_task(rest: &str) -> Result<(LlmTask, Option<String>)> {
     let (target, prompt) = rest
         .trim()
         .split_once(' ')
-        .context("usage: <provider>[@peer] <prompt>")?;
+        .context("usage: <provider>[@peer[:folder]] <prompt>")?;
     let (provider, peer) = match target.split_once('@') {
-        Some((provider, peer)) => (provider, Some(peer.to_owned())),
+        Some((provider, peer)) => (provider, Some(peer)),
         None => (target, None),
     };
+    let (peer, share) = match peer.map(|p| p.split_once(':').unwrap_or((p, ""))) {
+        Some((peer, share)) => (Some(peer.to_owned()), Some(share).filter(|s| !s.is_empty())),
+        None => (None, None),
+    };
     let provider = Provider::from_str(provider, true).map_err(|e| anyhow!("{e}"))?;
-    Ok((LlmTask::new(provider, prompt.trim()), peer))
+    let mut task = LlmTask::new(provider, prompt.trim());
+    if let Some(share) = share {
+        task = task.in_share(share);
+    }
+    Ok((task, peer))
 }
 
 fn pick_peer(

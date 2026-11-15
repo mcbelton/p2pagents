@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::llm::{LlmTask, Provider};
+use crate::shares::ShareInfo;
 
 /// QUIC ALPN identifying this protocol; peers speaking anything else are refused.
 pub const ALPN: &[u8] = b"p2pagents/1";
@@ -21,6 +22,9 @@ pub enum Message {
         /// LLM providers this agent runs tasks with on behalf of its peers.
         #[serde(default)]
         capabilities: Vec<Provider>,
+        /// Folders the receiving peer may run tasks in (names and access, no paths).
+        #[serde(default)]
+        shares: Vec<ShareInfo>,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -41,6 +45,10 @@ pub enum Message {
     /// The requester no longer wants the result of `task_id`; the worker stops it.
     TaskCancel {
         task_id: u64,
+    },
+    /// The sender's folders the receiver may now use (sent when its grant changes).
+    Shares {
+        shares: Vec<ShareInfo>,
     },
     /// A message type from a newer version; ignored so mixed versions keep working.
     #[serde(other)]
@@ -105,6 +113,7 @@ mod tests {
             name: "a".into(),
             addr,
             capabilities: vec![Provider::Claude],
+            shares: Vec::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);

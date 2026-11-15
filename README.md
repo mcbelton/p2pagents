@@ -92,7 +92,8 @@ cd D:\dev\p2pagents
 ```
 
 In the **boss** window wait for `+ worker`, then type `/peers` and
-`/delegate copilot Summarize README.md in 3 bullets`.
+`/delegate copilot@worker:repo Summarize README.md in 3 bullets` (`repo` is this folder,
+which the demo shares read-only with boss; see [Shared folders](#shared-folders)).
 The answer is printed in the boss window, and the worker window shows the task starting and
 finishing. Type `/quit` in each window to exit.
 
@@ -344,7 +345,8 @@ p2pagents --name alice --providers copilot --serve        # machine A
 p2pagents --name bob                                      # machine B
 ```
 
-Then on Bob's agent: `/delegate copilot@alice <prompt>`.
+Then on Bob's agent: `/delegate copilot@alice <prompt>`. It runs in Alice's shared
+`.p2pdata` folder, read-only; see [Shared folders](#shared-folders) to share a repository.
 
 A ticket (`p2pa1...`) contains the endpoint id, a suggested name and known addresses. A
 bare endpoint id works too (add `--name`). A running agent prints its ticket at startup and
@@ -353,7 +355,8 @@ with `/ticket`.
 | Peers command | Description |
 | --- | --- |
 | `p2pagents peers id --profile P` | Show P's endpoint id and ticket |
-| `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
+| `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
+| `p2pagents share add <name> <folder> --profile P [--access LEVEL]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)) |
 | `p2pagents peers list --profile P` | List allowlisted peers and their rights |
 | `p2pagents peers remove <name-or-id> --profile P` | Remove a peer |
 
@@ -387,12 +390,13 @@ and [Internet P2P](#internet-p2p)):
 cargo run -- auth login copilot --profile worker --gh-user <login>
 cargo run -- auth login claude --profile worker
 cargo run -- peers id --profile boss                              # copy boss's ticket
-cargo run -- peers allow <boss-ticket> --profile worker --delegate --access full
+cargo run -- share add myrepo D:\src\myrepo --access full --profile worker
+cargo run -- peers allow <boss-ticket> --profile worker --delegate --access full --share data,myrepo
 cargo run -- peers id --profile worker                            # copy worker's ticket
 cargo run -- peers allow <worker-ticket> --profile boss
 
-# terminal 1 (any machine): worker that runs tasks for boss, may edit files and run builds/tests in D:\src\myrepo
-cargo run -- --name worker --providers copilot,claude --serve --workspace D:\src\myrepo --access full
+# terminal 1 (any machine): worker that runs tasks for boss; boss may edit files and run builds/tests in D:\src\myrepo
+cargo run -- --name worker --providers copilot,claude --serve
 
 # terminal 2 (any machine): a peer that delegates work to it (needs no LLM accounts)
 cargo run -- --name boss
@@ -413,7 +417,7 @@ In terminal 2, once `+ worker` appears:
 | --- | --- |
 | `<text>` | Broadcast a chat message |
 | `/ask <provider> <prompt>` | Run a task locally (needs `--providers`) |
-| `/delegate <provider>[@peer] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer) |
+| `/delegate <provider>[@peer[:folder]] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder) |
 | `/tasks` | List your running tasks with their numbers |
 | `/cancel <n>` | Cancel your running task `n`; the peer stops the model run and frees the slot |
 | `/peers` | List connected peers and the providers they serve |
@@ -469,8 +473,8 @@ cancels your running tasks the same way, so nothing keeps spending its accounts 
 | `--peer <TICKET-OR-ID>` | none | Allowlisted peer to dial at startup; repeatable. Allowlisted peers are also dialed automatically |
 | `--providers <LIST>` | none | Comma-separated `copilot,claude,codex` to enable on this agent |
 | `--serve` | off | Run tasks that allowlisted peers with delegation rights send |
-| `--workspace <DIR>` | `.` | Directory the LLM agents work in |
-| `--access <MODE>` | `read-only` | Most any task on this agent may do: `read-only`, `workspace-write` (edit files) or `full` (also shell). See [What tasks may do](#what-tasks-may-do) |
+| `--workspace <DIR>` | `.` | Folder **your own** tasks (`/ask`, *This agent* in the UI) work in. Never given to peers |
+| `--access <MODE>` | `read-only` | Most your own tasks may do there: `read-only`, `workspace-write` (edit files) or `full` (also shell). Peers' access is set per peer and folder ([Shared folders](#shared-folders)) |
 | `--bridge <PATH>` | `bridge/index.mjs` in this repo (env `P2PAGENTS_BRIDGE`) | Node bridge script |
 | `--ui` | off | Open the [web UI](#web-ui) instead of the terminal prompt |
 | `--ui-port <PORT>` | random | Port for the web UI on 127.0.0.1 (needs `--ui`) |
@@ -522,18 +526,49 @@ Press Ctrl+C in the terminal to stop the agent.
 - An agent runs peer tasks **only** with `--serve`, only for the providers it enabled, only
   from peers allowlisted with `--delegate`, within their hourly limit, and at most 2 at a
   time (others queue).
-- `--workspace` and access are decided by the agent that runs the task. A peer cannot
-  choose the directory or raise its access level. Each delegated task gets the **lower** of
-  the peer's grant (`peers allow ... --delegate --access <level>`, default `read-only`) and
-  the agent's `--access` (default `read-only`). Local tasks get the agent's `--access`.
+- Peers' tasks run **only in folders you shared with that peer** (see
+  [Shared folders](#shared-folders)), by default your profile's `.p2pdata` folder, read-only.
+  Your `--workspace` and every other folder stay private. A peer cannot choose a path or
+  raise its access: each task gets the **lower** of the peer's grant
+  (`peers allow ... --delegate --access <level>`, default `read-only`) and the folder's
+  maximum (`share add ... --access <level>`). Your own tasks get `--access` in `--workspace`.
+
+### Shared folders
+
+A worker decides exactly what each peer can see:
+
+- Every profile has a **data folder**, `~/.p2pdata/<profile>` (created when the agent starts
+  with `--serve`; under `$P2PAGENTS_HOME/.p2pdata` if that is set). It is the built-in share
+  `data`, always **read-only**. Put there what you want peers' tasks to see, e.g. a status
+  note your manager's agent can summarize. Peers' tasks run there unless they name another
+  folder.
+- To let a peer work on code, share the folder by name with a maximum access, and grant it:
+
+  ```powershell
+  p2pagents share add myrepo D:\src\myrepo --access workspace-write --profile alice
+  p2pagents peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
+  p2pagents share list --profile alice
+  ```
+
+  Bob then runs `/delegate copilot@alice:myrepo Add tests for the parser`. In the web UI,
+  Bob picks the folder next to *Run on*; Alice ticks folders in the **Add peer** dialog.
+- Peers see shared folders **by name and access only**, never their paths, and only the ones
+  granted to them (`/peers` lists them). Changing a connected peer's grant reaches it at once.
+- A task naming a folder that isn't shared with that peer is refused (and audited).
+
+| | `data` (built in) | A folder you add |
+| --- | --- | --- |
+| Where | `~/.p2pdata/<profile>` | Any existing folder |
+| Most a task can do | read-only | what you set with `share add --access` |
+| Who can use it | peers granted `data` (the default for `peers allow`) | peers you list in `--share` |
 
 ### What tasks may do
 
 | Level | Allows | Grant with |
 | --- | --- | --- |
-| `read-only` | Read and search files **in the workspace** | default |
-| `workspace-write` | Also create and edit files in the workspace. No shell commands | `--access workspace-write` on both the agent and the peer |
-| `full` | Also run shell commands (build, test, git) **inside an OS sandbox** | `--access full` on both. Only for peers you trust |
+| `read-only` | Read and search files **in the task's folder** | default |
+| `workspace-write` | Also create and edit files in the folder. No shell commands | `--access workspace-write` on the peer and the folder |
+| `full` | Also run shell commands (build, test, git) **inside an OS sandbox** | `--access full` on the peer and the folder. Only for peers you trust |
 
 Always enforced, at every level and for local tasks too:
 
@@ -689,6 +724,7 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
+- [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases

@@ -8,6 +8,7 @@ use p2pagents::audit::{AuditEntry, AuditLog};
 use p2pagents::ui::{self, UiInfo};
 use p2pagents::{
     Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, SecretKey,
+    TaskContext,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,7 +22,7 @@ impl Executor for Echo {
         vec![Provider::Copilot]
     }
 
-    async fn execute(&self, task: &LlmTask, _grant: Access) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<String> {
         if task.prompt == "hang" {
             std::future::pending::<()>().await;
         }

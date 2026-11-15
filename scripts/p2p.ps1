@@ -18,7 +18,7 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet('doctor', 'build', 'test', 'demo', 'live-test', 'evidence', 'agent')]
     [string]$Command = 'doctor',
-    # demo: folder the worker's Copilot may read (read-only). Default: this repo.
+    # demo: folder the worker shares read-only with boss as 'repo'. Default: this repo.
     [string]$Workspace,
     # evidence: also run the live internet test.
     [switch]$Live,
@@ -97,15 +97,16 @@ switch ($Command) {
         $shell = (Get-Process -Id $PID).Path
         $workerId = ((& $Exe peers id --profile worker) | Select-String 'endpoint id: (\w+)').Matches[0].Groups[1].Value
         $bossId = ((& $Exe peers id --profile boss) | Select-String 'endpoint id: (\w+)').Matches[0].Groups[1].Value
-        & $Exe peers allow $bossId --profile worker --name boss --delegate | Out-Null
+        & $Exe share add repo $Workspace --profile worker | Out-Null
+        & $Exe peers allow $bossId --profile worker --name boss --delegate --share data,repo | Out-Null
         & $Exe peers allow $workerId --profile boss --name worker | Out-Null
-        Write-Host "Allowlisted: worker <-> boss (boss may delegate to worker). Agents find each other by key over the internet."
-        $worker = "`$Host.UI.RawUI.WindowTitle='p2pagents worker'; & '$Exe' --name worker --providers copilot --serve --workspace '$Workspace'"
-        $boss = "`$Host.UI.RawUI.WindowTitle='p2pagents boss'; Write-Host 'Wait for + worker, then try:  /peers   and   /delegate copilot Summarize README.md in 3 bullets' -ForegroundColor Cyan; & '$Exe' --name boss"
+        Write-Host "Allowlisted: worker <-> boss (boss may delegate to worker, read-only, in worker's .p2pdata folder and 'repo' = $Workspace). Agents find each other by key over the internet."
+        $worker = "`$Host.UI.RawUI.WindowTitle='p2pagents worker'; & '$Exe' --name worker --providers copilot --serve"
+        $boss = "`$Host.UI.RawUI.WindowTitle='p2pagents boss'; Write-Host 'Wait for + worker, then try:  /peers   and   /delegate copilot@worker:repo Summarize README.md in 3 bullets' -ForegroundColor Cyan; & '$Exe' --name boss"
         Start-Process $shell -ArgumentList '-NoExit', '-Command', $worker -WorkingDirectory $Repo
         Start-Sleep 2
         Start-Process $shell -ArgumentList '-NoExit', '-Command', $boss -WorkingDirectory $Repo
-        Write-Host "Opened 2 windows: 'p2pagents worker' (serves Copilot, read-only in $Workspace) and 'p2pagents boss'."
+        Write-Host "Opened 2 windows: 'p2pagents worker' (serves Copilot; boss may read its .p2pdata folder and $Workspace) and 'p2pagents boss'."
         Write-Host 'Type commands in the boss window; /quit in each window to exit.'
     }
     'live-test' {

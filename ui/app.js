@@ -251,8 +251,14 @@ function renderMe() {
     fact("Providers", me.providers.map(providerLabel).join(", "));
     for (const a of me.accounts) fact(providerLabel(a.provider), a.account);
     fact("Serves peers", me.serving ? "Yes" : "No");
-    fact("Max access", ACCESS_SHORT[me.access] ?? me.access);
-    fact("Workspace", el("span", { class: "mono", text: me.workspace }));
+    fact("Your own tasks", el("span", {}, `${ACCESS_SHORT[me.access] ?? me.access} in `,
+      el("span", { class: "mono", text: me.workspace })));
+    if (me.serving) {
+      fact("Shared folders", el("ul", { class: "share-list" },
+        ...me.shares.map((s) => el("li", {},
+          el("strong", { text: s.name }), ` · at most ${ACCESS_SHORT[s.max_access] ?? s.max_access}`,
+          el("div", { class: "mono small", text: s.path })))));
+    }
   } else {
     fact("Providers", "None (delegates only)");
   }
@@ -294,7 +300,7 @@ function renderPeers() {
         el("span", { class: "sub" },
           el("span", { text: t.connected ? "Connected" : "Offline" }),
           t.can_delegate
-            ? el("span", { class: "badge ok", title: "May run tasks on this agent", text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h` })
+            ? el("span", { class: "badge ok", title: `May run tasks in: ${(t.shares ?? []).join(", ")}`, text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h · ${(t.shares ?? []).join(", ")}` })
             : el("span", { class: "badge neutral", text: "Chat only" }))),
       el("button", {
         type: "button", class: "icon-btn", title: `Remove ${t.name}`, "aria-label": `Remove ${t.name} from the allowlist`,
@@ -459,7 +465,20 @@ function renderTaskOptions() {
   for (const p of serving) targets.push([p.id, p.name]);
   targetSel.replaceChildren(...targets.map(([v, label]) => el("option", { value: v, text: label })));
   if (targets.some(([v]) => v === prevTarget)) targetSel.value = prevTarget;
+  renderShareOptions();
   updateComposer();
+}
+
+/** Folder picker for a peer target: the folders that peer shares with this agent. */
+function renderShareOptions() {
+  const sel = $("#share");
+  const prev = sel.value;
+  const peer = state.peers.find((p) => p.id === $("#target").value);
+  const shares = peer?.shares ?? [];
+  $("#share-field").hidden = !peer || !shares.length;
+  sel.replaceChildren(...shares.map((s) =>
+    el("option", { value: s.name, text: `${s.name} (${(ACCESS_SHORT[s.access] ?? s.access).toLowerCase()})` })));
+  if (shares.some((s) => s.name === prev)) sel.value = prev;
 }
 
 function updateComposer() {
@@ -491,7 +510,12 @@ async function submitComposer(e) {
     } else {
       const task = await api("/api/tasks", {
         method: "POST",
-        body: JSON.stringify({ provider: $("#provider").value, target: $("#target").value, prompt: text }),
+        body: JSON.stringify({
+          provider: $("#provider").value,
+          target: $("#target").value,
+          share: $("#share-field").hidden ? null : $("#share").value,
+          prompt: text,
+        }),
       });
       upsertTask(task);
       toast(`Task #${task.id} started on ${task.target}`);
@@ -507,27 +531,33 @@ async function submitComposer(e) {
 
 // ---------- allowlist ----------
 const ACCESS_SHORT = { "read-only": "Read only", "workspace-write": "Edit files", full: "Full" };
-const ACCESS_RANK = { "read-only": 0, "workspace-write": 1, full: 2 };
 
 function syncDelegateFields() {
   const on = $("#add-delegate").checked;
   $("#rate-field").hidden = !on;
   $("#access-field").hidden = !on;
+  $("#shares-field").hidden = !on;
   const chosen = $("#add-access").value;
-  const ceiling = state.me?.access ?? "read-only";
   const hint = [];
-  if (ACCESS_RANK[chosen] > ACCESS_RANK[ceiling]) {
-    hint.push(`This agent runs with --access ${ceiling}, so their tasks get ${ACCESS_SHORT[ceiling].toLowerCase()} until you restart it with a higher --access.`);
-  }
   if (chosen === "full") {
-    hint.push("Shell commands run in an OS sandbox: writes only in the workspace, no network.");
+    hint.push("Shell commands run in an OS sandbox: writes only in the folder, no network.");
   }
-  hint.push("Files outside the workspace and credential files (.env, keys, .ssh…) are always refused.");
+  hint.push("Their tasks run only in the folders you tick below; files outside them and credential files (.env, keys, .ssh…) are always refused.");
   $("#access-hint").textContent = hint.join(" ");
+}
+
+function renderShareChecks() {
+  const box = $("#add-shares");
+  box.replaceChildren(...(state.me?.shares ?? []).map((s) =>
+    el("label", { class: "check" },
+      el("input", { type: "checkbox", value: s.name, checked: s.name === "data" || undefined }),
+      el("span", {}, el("strong", { text: s.name }), ` · at most ${(ACCESS_SHORT[s.max_access] ?? s.max_access).toLowerCase()} · `,
+        el("span", { class: "mono", text: s.path })))));
 }
 
 function openAddDialog() {
   $("#add-form").reset();
+  renderShareChecks();
   syncDelegateFields();
   $("#add-error").textContent = "";
   $("#add-dialog").showModal();
@@ -553,6 +583,7 @@ async function submitAdd(e) {
         delegate,
         tasks_per_hour: delegate ? Number($("#add-rate").value) || 20 : null,
         access: delegate ? $("#add-access").value : "read-only",
+        shares: delegate ? [...document.querySelectorAll("#add-shares input:checked")].map((i) => i.value) : null,
       }),
     });
     $("#add-dialog").close();
@@ -635,7 +666,7 @@ function init() {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) submitComposer(e);
   });
   $("#provider").addEventListener("change", renderTaskOptions);
-  $("#target").addEventListener("change", updateComposer);
+  $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", () => state.me && copy(state.me.ticket, "Ticket"));
   $("#add-peer-btn").addEventListener("click", openAddDialog);

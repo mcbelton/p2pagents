@@ -95,6 +95,9 @@ pub struct LlmTask {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// For delegated tasks: the peer's shared folder to run in (default: its `data` share).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<String>,
 }
 
 impl LlmTask {
@@ -103,25 +106,33 @@ impl LlmTask {
             provider,
             prompt: prompt.into(),
             model: None,
+            share: None,
         }
     }
+
+    pub fn in_share(mut self, share: impl Into<String>) -> Self {
+        self.share = Some(share.into());
+        self
+    }
+}
+
+/// Where and with what access a task runs. Decided by the agent that runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskContext {
+    pub access: Access,
+    /// Folder the task works in: a shared folder for peers' tasks, `--workspace` for local ones.
+    pub workspace: PathBuf,
 }
 
 /// Runs [`LlmTask`]s. Implemented by [`SdkExecutor`]; tests can supply fakes.
 #[async_trait]
 pub trait Executor: Send + Sync {
     fn providers(&self) -> Vec<Provider>;
-    /// Runs `task` with the lower of `grant` and the executor's own access ceiling.
-    /// Local tasks pass [`Access::Full`] to get the ceiling; peer tasks pass the
-    /// peer's allowlist grant.
-    async fn execute(&self, task: &LlmTask, grant: Access) -> Result<String>;
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<String>;
 }
 
 pub struct ExecutorConfig {
     pub providers: Vec<Provider>,
-    pub workspace: PathBuf,
-    /// Highest access any task on this agent gets (`--access`).
-    pub access: Access,
     /// Path to `bridge/index.mjs`; needed for Claude and Codex.
     pub bridge_script: PathBuf,
     /// Identity whose private provider homes and credentials this agent uses.
@@ -129,11 +140,10 @@ pub struct ExecutorConfig {
 }
 
 /// Executes tasks with the official Copilot, Claude Agent and Codex SDKs, using
-/// provider instances private to this agent's profile.
+/// provider instances private to this agent's profile. Each task brings its own
+/// folder and access ([`TaskContext`]).
 pub struct SdkExecutor {
     providers: Vec<Provider>,
-    workspace: PathBuf,
-    access: Access,
     copilot: Option<CopilotBackend>,
     bridge: Option<Bridge>,
     accounts: Vec<(Provider, String)>,
@@ -146,17 +156,12 @@ impl SdkExecutor {
         let mut providers = config.providers;
         providers.sort();
         providers.dedup();
-        let workspace = std::path::absolute(&config.workspace)?;
-        if !workspace.is_dir() {
-            bail!("workspace {} is not a directory", workspace.display());
-        }
         let profile = &config.profile;
         let tools = ProviderTools::new(&config.bridge_script);
         let mut accounts = Vec::new();
 
         let copilot = if providers.contains(&Provider::Copilot) {
-            let backend =
-                CopilotBackend::start(profile.copilot_credentials()?, workspace.clone()).await?;
+            let backend = CopilotBackend::start(profile.copilot_credentials()?).await?;
             accounts.push((Provider::Copilot, backend.account().await?));
             Some(backend)
         } else {
@@ -180,8 +185,6 @@ impl SdkExecutor {
         };
         Ok(Arc::new(Self {
             providers,
-            workspace,
-            access: config.access,
             copilot,
             bridge,
             accounts,
@@ -200,29 +203,31 @@ impl Executor for SdkExecutor {
         self.providers.clone()
     }
 
-    async fn execute(&self, task: &LlmTask, grant: Access) -> Result<String> {
+    async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> Result<String> {
         if !self.providers.contains(&task.provider) {
             bail!("provider {} is not enabled on this agent", task.provider);
         }
-        let access = grant.min(self.access);
+        if !ctx.workspace.is_dir() {
+            bail!("folder {} does not exist", ctx.workspace.display());
+        }
         let run = async {
             match task.provider {
                 Provider::Copilot => {
                     self.copilot
                         .as_ref()
                         .expect("enabled")
-                        .run(task, access)
+                        .run(task, ctx.access, &ctx.workspace)
                         .await
                 }
                 Provider::Claude | Provider::Codex => {
                     self.bridge
                         .as_ref()
                         .expect("enabled")
-                        .run(task, &self.workspace, access)
+                        .run(task, &ctx.workspace, ctx.access)
                         .await
                 }
             }
         };
-        changes::track_changes(&self.workspace, access, run).await
+        changes::track_changes(&ctx.workspace, ctx.access, run).await
     }
 }
