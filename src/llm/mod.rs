@@ -72,8 +72,8 @@ pub enum Access {
     ReadOnly,
     /// Also create and edit files in the workspace (no shell commands).
     WorkspaceWrite,
-    /// Also run shell commands. Commands are not sandboxed for Copilot and Claude:
-    /// grant only to peers you trust with your machine.
+    /// Also run shell commands, inside each provider's OS sandbox (writes only in the
+    /// workspace, no network, no bypass).
     Full,
 }
 

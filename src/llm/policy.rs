@@ -48,6 +48,38 @@ const PROTECTED_DIRS: &[&str] = &[
 ];
 const PROTECTED_FILES: &[&str] = &[".mcp.json", ".gitmodules"];
 
+/// Credential locations in the home folder, relative to it.
+const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".p2pagents",
+    ".copilot",
+    ".config/gh",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+];
+
+/// Existing credential locations in the home folder (and the profiles folder) that
+/// OS sandboxes should deny to sandboxed commands.
+pub fn home_secret_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::env::home_dir()
+        .map(|home| HOME_SECRETS.iter().map(|rel| home.join(rel)).collect())
+        .unwrap_or_default();
+    if let Ok(root) = crate::profile::profiles_root() {
+        paths.push(root);
+    }
+    paths.retain(|p| p.exists());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// A task's workspace, canonicalized once so symlinks and `..` can't escape it.
 #[derive(Debug, Clone)]
 pub struct Workspace {

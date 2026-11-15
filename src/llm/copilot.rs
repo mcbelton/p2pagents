@@ -5,14 +5,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
+use github_copilot_sdk::rpc::SandboxConfig;
 use github_copilot_sdk::types::{
     MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId, SessionConfig,
     SessionId,
 };
 use github_copilot_sdk::{Client, ClientOptions};
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use super::policy::Workspace;
+use super::policy::{Workspace, home_secret_paths};
 use super::{Access, LlmTask};
 use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
@@ -49,6 +50,36 @@ pub(crate) fn available_tools(access: Access) -> Vec<&'static str> {
     tools
 }
 
+/// Whether this host can run the Copilot CLI's OS sandbox for shell commands.
+#[derive(Debug, Clone)]
+enum SandboxSupport {
+    Supported,
+    Unsupported(String),
+    /// The Copilot CLI is too old to report it.
+    Unknown,
+}
+
+/// OS sandbox for shell commands at `full` access: Windows ProcessContainer,
+/// Linux Bubblewrap or macOS Seatbelt. Commands may write only in the workspace
+/// (plus temp and tool caches), have no network, and can't ask to run outside it.
+pub(crate) fn sandbox_config() -> SandboxConfig {
+    let mut policy = json!({
+        "network": { "allowOutbound": false, "allowLocalNetwork": false },
+    });
+    // Windows' ProcessContainer can't enforce denied paths yet and refuses to run
+    // any command under a policy that has them.
+    if !cfg!(windows) {
+        policy["filesystem"] = json!({ "deniedPaths": home_secret_paths() });
+    }
+    serde_json::from_value(json!({
+        "enabled": true,
+        "allowBypass": false,
+        "addCurrentWorkingDirectory": true,
+        "userPolicy": policy,
+    }))
+    .expect("valid sandbox config")
+}
+
 /// A private GitHub Copilot CLI instance (official `github-copilot-sdk` crate) for one
 /// agent: its own `COPILOT_HOME`, its own token, and no fallback to the machine's
 /// signed-in user or inherited `GH_TOKEN`-style variables.
@@ -56,6 +87,7 @@ pub struct CopilotBackend {
     workspace: PathBuf,
     client: Client,
     login: Option<String>,
+    sandbox: SandboxSupport,
 }
 
 impl CopilotBackend {
@@ -80,10 +112,20 @@ impl CopilotBackend {
             .await
             .with_context(|| format!("starting Copilot CLI {}", cli.display()))?;
         let login = github_login(&creds.token, &creds.host);
+        let sandbox = match client.rpc().sandbox().get_host_support().await {
+            Ok(support) if support.supported => SandboxSupport::Supported,
+            Ok(support) => SandboxSupport::Unsupported(
+                support
+                    .reason
+                    .unwrap_or_else(|| "no sandbox backend on this host".into()),
+            ),
+            Err(_) => SandboxSupport::Unknown,
+        };
         Ok(Self {
             workspace,
             client,
             login,
+            sandbox,
         })
     }
 
@@ -116,6 +158,15 @@ impl CopilotBackend {
     }
 
     pub async fn run(&self, task: &LlmTask, access: Access) -> Result<String> {
+        let access = match (&self.sandbox, access) {
+            (SandboxSupport::Unsupported(reason), Access::Full) => {
+                eprintln!(
+                    "  copilot: no OS sandbox on this host ({reason}); running without shell commands"
+                );
+                Access::WorkspaceWrite
+            }
+            _ => access,
+        };
         let policy = AccessPolicy {
             access,
             workspace: Workspace::new(&self.workspace)
@@ -125,6 +176,9 @@ impl CopilotBackend {
             .with_working_directory(self.workspace.clone())
             .with_available_tools(available_tools(access))
             .with_permission_handler(Arc::new(policy));
+        if access == Access::Full {
+            config = config.with_sandbox_config(sandbox_config());
+        }
         if let Some(model) = &task.model {
             config = config.with_model(model.clone());
         }
@@ -194,6 +248,9 @@ pub(crate) fn refusal(
     req: &Value,
 ) -> Option<String> {
     use PermissionRequestKind::*;
+    if req["requestSandboxBypass"].as_bool() == Some(true) {
+        return Some("tasks may not run outside the sandbox".into());
+    }
     match kind {
         Some(Read) => {
             let paths = [strings(req, "path"), strings(req, "resolvedPath")].concat();
@@ -386,5 +443,27 @@ mod tests {
             assert!(refusal(Access::Full, &ws, Some(&kind), &json!({})).is_some());
         }
         assert!(refusal(Access::Full, &ws, None, &json!({})).is_some());
+    }
+
+    #[test]
+    fn shell_runs_in_an_offline_sandbox_without_bypass() {
+        let config = serde_json::to_value(sandbox_config()).unwrap();
+        assert_eq!(config["enabled"], true);
+        assert_eq!(config["allowBypass"], false);
+        assert_eq!(config["userPolicy"]["network"]["allowOutbound"], false);
+        assert_eq!(config["userPolicy"]["network"]["allowLocalNetwork"], false);
+        assert_eq!(
+            config["userPolicy"]["filesystem"].is_null(),
+            cfg!(windows),
+            "denied paths only where the backend enforces them"
+        );
+
+        let (_dir, ws) = workspace();
+        let bypass = json!({
+            "kind": "shell",
+            "fullCommandText": "cargo test",
+            "requestSandboxBypass": true,
+        });
+        assert!(refusal(Access::Full, &ws, Some(&Shell), &bypass).is_some());
     }
 }

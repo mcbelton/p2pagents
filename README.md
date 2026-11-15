@@ -493,7 +493,7 @@ Press Ctrl+C in the terminal to stop the agent.
 | --- | --- | --- |
 | `read-only` | Read and search files **in the workspace** | default |
 | `workspace-write` | Also create and edit files in the workspace. No shell commands | `--access workspace-write` on both the agent and the peer |
-| `full` | Also run shell commands (build, test, git) | `--access full` on both. Only for peers you trust like a user of your machine |
+| `full` | Also run shell commands (build, test, git) **inside an OS sandbox** | `--access full` on both. Only for peers you trust |
 
 Always enforced, at every level and for local tasks too:
 
@@ -513,16 +513,39 @@ Per provider:
 
 | | `read-only` | `workspace-write` | `full` |
 | --- | --- | --- | --- |
-| Copilot | only tools `view`, `glob`, `grep`; every read request is path-checked | adds `create`, `edit` (path-checked) | adds the shell tool (`powershell`/`bash`) |
-| Claude | `dontAsk` mode, tools `Read`, `Glob`, `Grep`, a PreToolUse hook path-checks every call; user/project settings not loaded | adds `Edit`, `Write`, `NotebookEdit` | adds `Bash` |
+| Copilot | only tools `view`, `glob`, `grep`; every read request is path-checked | adds `create`, `edit` (path-checked) | adds the shell tool (`powershell`/`bash`), run in the Copilot CLI's OS sandbox |
+| Claude | `dontAsk` mode, tools `Read`, `Glob`, `Grep`, a PreToolUse hook path-checks every call; user/project settings not loaded | adds `Edit`, `Write`, `NotebookEdit` | adds `Bash`, run in Claude's OS sandbox |
 | Codex | sandbox `read-only`, approvals `never`, no network or web search | sandbox `workspace-write` | same as `workspace-write` (never `danger-full-access`) |
+
+### The shell sandbox (`full`)
+
+Peers' shell commands never run directly on your machine. Each provider runs them in its
+OS sandbox: Windows ProcessContainer, Linux Bubblewrap or macOS Seatbelt for Copilot, and
+Claude's sandbox runtime (on Windows a separate low-rights user) for Claude:
+
+- **Writes only inside the workspace** (plus temp folders and toolchain caches such as
+  Cargo's registry), so a command can't change files elsewhere, even when obfuscated.
+- **No network**: no outbound or local-network connections, so nothing can be uploaded and
+  nothing downloaded. Builds work when their dependencies are already cached.
+- **No way out**: requests to run a command outside the sandbox are refused.
+- **Credential folders unreadable** (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gh`,
+  `~/.p2pagents`, ...) on Linux and macOS for Copilot, and on every platform for Claude.
+- **Fails closed**: if a host has no sandbox, Copilot tasks drop the shell tool (printed
+  as `copilot: no OS sandbox on this host`) and Claude tasks fail rather than run
+  unsandboxed. Run `copilot update` so p2pagents can check sandbox support at startup.
+
+On top of the sandbox, commands that name a URL, a path outside the workspace, the home
+folder (`~`, `$HOME`, `$env:USERPROFILE`, `%APPDATA%`, ...) or a credential file are refused
+before they run.
 
 Limits to know:
 
-- **Shell commands (`full`) are not sandboxed** for Copilot and Claude. Commands that name a
-  URL, a path outside the workspace, the home folder (`~`, `$HOME`, `$env:USERPROFILE`,
-  `%APPDATA%`, ...) or a credential file are refused, but this is a text check: an
-  obfuscated command can get past it. A `full` peer can do whatever your OS account can.
+- **Copilot's sandbox on Windows does not block reads** outside the workspace yet (the
+  ProcessContainer backend can't enforce denied paths on current Windows builds and refuses
+  to run if asked to). A `full` peer's obfuscated command could read files your account
+  can read, though it has no network to send them out and only the task result goes back.
+  For untrusted peers on Windows, keep them at `workspace-write`, or run the serving agent
+  under a separate Windows account or in a VM/container.
 - **Searches see the whole workspace.** A `grep` over the workspace folder is approved as one
   request, so it can return lines from a `.env` inside it. Keep secrets out of the workspace
   you serve (or out of Git-ignored files in it).

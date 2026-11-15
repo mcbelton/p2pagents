@@ -4,8 +4,9 @@
 //   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null}
 //   stdout: {"id":1,"ok":true,"text":"..."} or {"id":1,"ok":false,"error":"..."}
 // stdout is reserved for protocol lines; all logging goes to stderr.
-import { realpathSync } from "node:fs";
-import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 
 console.log = console.info = console.debug = (...args) => console.error(...args);
@@ -132,6 +133,33 @@ export function toolRefusal(cwd, access, tool, input = {}) {
   }
 }
 
+// Same list as HOME_SECRETS in src/llm/policy.rs.
+const HOME_SECRETS = [
+  ".ssh", ".aws", ".azure", ".gnupg", ".kube", ".docker", ".p2pagents", ".copilot",
+  ".config/gh", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+];
+
+/**
+ * Claude's OS sandbox for Bash at full access: no network, no unsandboxed escape,
+ * credential folders unreadable, and the task fails if the sandbox can't start.
+ */
+export function claudeSandbox(access) {
+  if (access !== "full") return undefined;
+  const home = homedir();
+  const denyRead = HOME_SECRETS.map((rel) => join(home, rel)).filter((p) => existsSync(p));
+  if (process.env.P2PAGENTS_HOME && existsSync(process.env.P2PAGENTS_HOME)) {
+    denyRead.push(process.env.P2PAGENTS_HOME);
+  }
+  return {
+    enabled: true,
+    failIfUnavailable: true,
+    allowUnsandboxedCommands: false,
+    autoAllowBashIfSandboxed: true,
+    network: { allowedDomains: [] },
+    filesystem: { denyRead },
+  };
+}
+
 async function runClaude({ prompt, cwd, model, access }) {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const guard = async (input) => {
@@ -157,6 +185,7 @@ async function runClaude({ prompt, cwd, model, access }) {
       allowedTools: CLAUDE_TOOLS[access],
       disallowedTools: ["WebFetch", "WebSearch", "Task"],
       settingSources: [],
+      sandbox: claudeSandbox(access),
       // Checks every tool call's paths, including pre-approved tools.
       hooks: { PreToolUse: [{ hooks: [guard] }] },
     },

@@ -4,7 +4,15 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { pathRefusal, toolRefusal } = await import("../../bridge/index.mjs");
+const { pathRefusal, toolRefusal, claudeSandbox } = await import("../../bridge/index.mjs");
+
+assert.equal(claudeSandbox("read-only"), undefined);
+assert.equal(claudeSandbox("workspace-write"), undefined);
+const sandbox = claudeSandbox("full");
+assert.equal(sandbox.enabled, true);
+assert.equal(sandbox.failIfUnavailable, true);
+assert.equal(sandbox.allowUnsandboxedCommands, false);
+assert.deepEqual(sandbox.network.allowedDomains, []);
 
 const ws = mkdtempSync(join(tmpdir(), "p2p-ws-"));
 const outside = mkdtempSync(join(tmpdir(), "p2p-out-"));

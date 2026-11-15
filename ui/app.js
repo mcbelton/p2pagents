@@ -476,7 +476,7 @@ function syncDelegateFields() {
     hint.push(`This agent runs with --access ${ceiling}, so their tasks get ${ACCESS_SHORT[ceiling].toLowerCase()} until you restart it with a higher --access.`);
   }
   if (chosen === "full") {
-    hint.push("Shell commands are not sandboxed: they can do anything your user account can.");
+    hint.push("Shell commands run in an OS sandbox: writes only in the workspace, no network.");
   }
   hint.push("Files outside the workspace and credential files (.env, keys, .ssh…) are always refused.");
   $("#access-hint").textContent = hint.join(" ");
