@@ -78,6 +78,7 @@ def cli(*args):
 
 
 ws = tempfile.mkdtemp(prefix="p2p-live-")
+svc = None
 agents = []
 PROFILES = ("worker1", "worker2", "boss", "intruder", "helper")
 try:
@@ -126,6 +127,28 @@ try:
     _, out3 = cli("share", "add", "app", app, "--access", "full", "--worktrees", "--check", f"has-file={has_file}",
                   "--profile", "worker2")
     print(f"  {out3.strip()}")
+    print("== ops: worker2 runs a 'service' with two monitors; a TSG covers api, nothing covers db")
+    svc = tempfile.mkdtemp(prefix="p2p-live-svc-")
+    with open(os.path.join(svc, "README.md"), "w") as f:
+        f.write("# Demo service\nThe file db.up marks the database as running. If db-health fails, the database "
+                "is stopped and must be started with the db-start command.\n")
+    exists = (lambda f: f"type {f}") if os.name == "nt" else (lambda f: f"cat {f}")
+    make = (lambda f: f"echo up> {f}") if os.name == "nt" else (lambda f: f"echo up > {f}")
+    _, out4 = cli("share", "add", "svc", svc, "--access", "full",
+                  "--check", f"api-health={exists('api.up')}", "--check", f"api-start={make('api.up')}",
+                  "--check", f"db-health={exists('db.up')}", "--check", f"db-start={make('db.up')}",
+                  "--profile", "worker2")
+    print(f"  {out4.strip()}")
+    _, out5 = cli("monitor", "add", "api", "--share", "svc", "--check", "api-health", "--every", "10",
+                  "--fail-after", "1", "--profile", "worker2")
+    _, out6 = cli("monitor", "add", "db", "--share", "svc", "--check", "db-health", "--every", "10",
+                  "--fail-after", "2", "--profile", "worker2")
+    print(f"  {out5.strip()}\n  {out6.strip()}")
+    guide = os.path.join(HOME, "api-down.md")
+    with open(guide, "w") as f:
+        f.write("---\ntsg: api-down\nmonitor: api\nfix: api-start\n---\n# The API is down\nStart it with api-start.\n")
+    _, out7 = cli("kb", "add", "api-down", guide, "--profile", "worker2")
+    print(f"  {out7.strip()}")
     ok = all([
         allow("worker1", "boss", delegate=True, shares="data,repo"), allow("worker1", "worker2"),
         allow("worker2", "boss", delegate=True, access="full", shares="data,code,app"), allow("worker2", "worker1"),
@@ -217,7 +240,7 @@ try:
     content = open(path).read().strip() if os.path.exists(path) else None
     check("worker2 wrote p2p_live.txt in its workspace", content and "written via p2p delegation" in content, repr(content))
     check("boss sees the files worker2's task changed", any("added `p2p_live.txt`" in l for l in boss.lines))
-    check("no task failures at boss", not any("failed" in l for l in boss.lines))
+    check("no task failures at boss", not any("failed" in l for l in boss.lines if not l.startswith("<")))
     for profile in ("worker1", "worker2"):
         state = os.path.join(HOME, "profiles", profile, "copilot", "session-state")
         check(f"{profile}'s Copilot instance used its own COPILOT_HOME", os.path.isdir(state) and os.listdir(state), state)
@@ -273,7 +296,7 @@ try:
     with open(plan_file, "w") as f:
         f.write("claim: LIVE-1 worker2 adds evidence.txt and its owner's check passes\n"
                 "claim: LIVE-2 a teammate signs off the change\n"
-                "make @worker2:app verify=has-file attempts=2 claims=LIVE-1 Create a file named evidence.txt "
+                "make @worker2:app verify=has-file attempts=2 claims=LIVE-1 save=evidence-notes Create a file named evidence.txt "
                 "in the current folder containing exactly: proven by p2p. Reply DONE.\n"
                 "signoff after make approve @worker1 claims=LIVE-2 Approve if the change looks right.\n")
     boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
@@ -301,7 +324,30 @@ try:
     print(f"  {out.strip()}")
     check("the saved run's signatures re-verify offline",
           code == 0 and "all 2 signed records verify" in out and os.path.exists(os.path.join(run_dir, "make.patch")))
+    check("boss saved the verified result as knowledge",
+          boss.wait_for(r"knowledge saved: evidence-notes", 5)
+          and "evidence.txt" in cli("kb", "show", "evidence-notes", "--profile", "boss")[1])
     shutil.rmtree(app, ignore_errors=True)
+
+    print("== ops: incidents on worker2's monitors")
+    check("a troubleshooting guide fixed the incident without the model",
+          w2.wait_for(r"\[api\] Resolved: auto-fixed with TSG api-down", 60))
+    assessed = w2.wait_for(r"\[db\] Assessed: debugging agent: confidence", 300)
+    check("the debugging agent diagnosed an incident no guide covers", assessed, assessed)
+    outcome = w2.wait_for(r"\[db\] (Learned|Escalated): ", 120)
+    print(f"  (db incident outcome: {outcome})")
+    check("the team was alerted by chat",
+          any(re.search(r"^<worker2> \[worker2 alert\] (api|db) ", l) for l in w1.lines)
+          or (setattr(w1, "cursor", 0) or w1.wait_for(r"^<worker2> \[worker2 alert\] (api|db) ", 120)))
+    code, out = cli("ops", "report", "--profile", "worker2")
+    print("\n".join("  " + l for l in out.splitlines()[:16]))
+    check("monitors recorded metrics and the ops report shows them",
+          code == 0 and re.search(r"\| api \| [\d.]+% \(\d+ samples\)", out) and "TSG api-down" in out)
+    code, out = cli("kb", "learn", "--profile", "worker2")
+    _, summary = cli("kb", "show", "ops-summary", "--profile", "worker2")
+    check("kb learn wrote the ops summary into the knowledge base", code == 0 and "## Health" in summary and "| db |" in summary)
+    _, kb_list = cli("kb", "list", "--profile", "worker2")
+    print("\n".join("  " + l for l in kb_list.splitlines()))
 
     print("== worker2 leaves")
     w2.stop()
@@ -328,6 +374,8 @@ finally:
     for profile in PROFILES:
         cli("profile", "delete", "--profile", profile)
     shutil.rmtree(ws, ignore_errors=True)
+    if svc:
+        shutil.rmtree(svc, ignore_errors=True)
     shutil.rmtree(HOME, ignore_errors=True)
 
 passed = sum(ok for _, ok in results)

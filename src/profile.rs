@@ -393,6 +393,20 @@ impl Profile {
         self.dir.join("runs")
     }
 
+    /// The knowledge base (private to this profile).
+    pub fn knowledge(&self) -> crate::knowledge::KnowledgeBase {
+        crate::knowledge::KnowledgeBase::new(self.dir.join("knowledge"))
+    }
+
+    /// Metrics and incident logs.
+    pub fn ops_store(&self) -> crate::ops::OpsStore {
+        crate::ops::OpsStore::new(self.dir.join("ops"))
+    }
+
+    pub fn monitors_path(&self) -> PathBuf {
+        self.dir.join("monitors.json")
+    }
+
     /// Where per-task git worktrees are created: outside the profiles folder (like
     /// the data folder), since providers deny tasks access to profiles.
     pub fn worktrees_dir(&self) -> PathBuf {

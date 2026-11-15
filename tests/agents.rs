@@ -1232,3 +1232,54 @@ async fn plans_prove_claims_with_checks_and_a_team_members_approval() {
     .await;
     assert!(alice.approvals().is_empty());
 }
+
+#[tokio::test]
+async fn plans_save_verified_results_as_knowledge_and_use_it_later() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let home = tempfile::tempdir().unwrap();
+    let kb = p2pagents::knowledge::KnowledgeBase::new(home.path());
+
+    // A discovery run saves the worker's (signed, verified) result as a topic.
+    let first = Plan::parse("arch @worker save=architecture map the services").unwrap();
+    let states = run_plan(
+        &boss,
+        &SquadStore::default(),
+        &first.with_knowledge(&kb).unwrap(),
+        |_, _| {},
+    )
+    .await;
+    assert_eq!(
+        p2pagents::plan::save_knowledge(&kb, &first, &states, "run-1"),
+        ["architecture"]
+    );
+    assert!(
+        kb.read("architecture")
+            .unwrap()
+            .contains("copilot did: map the services")
+    );
+
+    // A later run gets that knowledge in its prompt.
+    let second = Plan::parse("design @worker context=architecture design the change").unwrap();
+    let states = run_plan(
+        &boss,
+        &SquadStore::default(),
+        &second.with_knowledge(&kb).unwrap(),
+        |_, _| {},
+    )
+    .await;
+    match &states["design"] {
+        StepState::Done { output, .. } => {
+            assert!(output.contains("### Knowledge: architecture"), "{output}");
+            assert!(output.contains("copilot did: map the services"), "{output}");
+            assert!(output.ends_with("design the change"), "{output}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let _ = worker;
+}

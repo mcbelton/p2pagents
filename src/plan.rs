@@ -31,6 +31,7 @@ use tokio::task::JoinSet;
 
 use crate::agent::{Agent, Delivered, PeerInfo};
 use crate::evidence::Evidence;
+use crate::knowledge::{KnowledgeBase, check_topics};
 use crate::llm::{LlmTask, Provider};
 use crate::profile::validate_name;
 
@@ -139,6 +140,12 @@ pub struct Step {
     /// A team member's sign-off instead of an LLM task (`approve @person`).
     #[serde(default)]
     pub approve: bool,
+    /// Knowledge base topics put in the prompt (`context=a,b` or `context=all`).
+    #[serde(default)]
+    pub context: Vec<String>,
+    /// Knowledge base topic the step's verified result is saved as (`save=topic`).
+    #[serde(default)]
+    pub save: Option<String>,
 }
 
 /// A statement the plan must prove with evidence (`claim: ID text`).
@@ -241,6 +248,9 @@ impl Plan {
                     step.id
                 );
             }
+            if step.approve && step.save.is_some() {
+                bail!("approval step '{}' has no result to save", step.id);
+            }
             if step.approve && matches!(step.target, Target::Squad(_)) {
                 bail!("approval step '{}' needs a person: @name or @me", step.id);
             }
@@ -275,6 +285,59 @@ impl Plan {
         }
         Ok(())
     }
+}
+
+impl Plan {
+    /// The plan with each step's `context=` knowledge put in front of its prompt.
+    /// Fails if a topic doesn't exist.
+    pub fn with_knowledge(&self, kb: &KnowledgeBase) -> Result<Plan> {
+        let mut plan = self.clone();
+        for step in &mut plan.steps {
+            if step.context.is_empty() {
+                continue;
+            }
+            check_topics(kb, &step.context).with_context(|| format!("step '{}'", step.id))?;
+            let knowledge = kb.context(&step.context)?;
+            step.prompt = format!(
+                "Knowledge about this system (from earlier, verified work):\n{knowledge}\n---\n{}",
+                step.prompt
+            );
+        }
+        Ok(plan)
+    }
+}
+
+/// Saves the result of every finished step with `save=` into `kb`, if its evidence
+/// was verified (or it ran locally); returns the topics written.
+pub fn save_knowledge(
+    kb: &KnowledgeBase,
+    plan: &Plan,
+    states: &BTreeMap<String, StepState>,
+    run_id: &str,
+) -> Vec<String> {
+    let mut saved = Vec::new();
+    for step in &plan.steps {
+        let (
+            Some(topic),
+            Some(StepState::Done {
+                peer,
+                output,
+                verified: true,
+                ..
+            }),
+        ) = (&step.save, states.get(&step.id))
+        else {
+            continue;
+        };
+        let source = format!(
+            "run {run_id}, step {} by {peer} (signed, verified)",
+            step.id
+        );
+        if kb.write(topic, output, &source).is_ok() {
+            saved.push(topic.clone());
+        }
+    }
+    saved
 }
 
 fn parse_claim(rest: &str) -> Result<ClaimDef> {
@@ -334,6 +397,7 @@ fn parse_step(line: &str) -> Result<Step> {
     };
     let mut provider = Provider::Copilot;
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
+    let (mut context, mut save) = (Vec::new(), None);
     loop {
         match words.peek().copied() {
             Some("using") => {
@@ -360,6 +424,12 @@ fn parse_step(line: &str) -> Result<Step> {
                     }
                     "claims" | "claim" => claims = list(value),
                     "apply" => apply = Some(value.to_owned()).filter(|v| !v.is_empty()),
+                    "context" => context = list(value),
+                    "save" => {
+                        validate_name(value)
+                            .map_err(|_| anyhow!("save= needs a topic name, got {value:?}"))?;
+                        save = Some(value.to_owned());
+                    }
                     _ => break,
                 }
                 words.next();
@@ -383,6 +453,8 @@ fn parse_step(line: &str) -> Result<Step> {
         claims,
         apply,
         approve,
+        context,
+        save,
     })
 }
 
@@ -803,6 +875,58 @@ mod tests {
         fails(
             "claim: C-1 x\nclaim: C-1 y\na @x do",
             "claim 'C-1' is defined twice",
+        );
+        fails("a approve @me save=notes ok?", "no result to save");
+        fails("a @x save=../up do", "save= needs a topic name");
+    }
+
+    #[test]
+    fn steps_use_and_grow_the_knowledge_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path());
+        kb.write("architecture", "Three services.", "").unwrap();
+        let plan = Plan::parse(
+            "design @x context=architecture save=design Design it\nplain @x save=other Do it\nlocal @x save=mine Note it",
+        )
+        .unwrap();
+        let ready = plan.with_knowledge(&kb).unwrap();
+        assert!(
+            ready.steps[0]
+                .prompt
+                .contains("### Knowledge: architecture\nThree services.")
+        );
+        assert!(ready.steps[0].prompt.ends_with("---\nDesign it"));
+        assert_eq!(ready.steps[1].prompt, "Do it");
+        let missing = Plan::parse("a @x context=nope do").unwrap();
+        assert!(
+            missing
+                .with_knowledge(&kb)
+                .unwrap_err()
+                .to_string()
+                .contains("step 'a'")
+        );
+
+        let done = |verified| StepState::Done {
+            peer: "x".into(),
+            output: "The design.".into(),
+            evidence: None,
+            verified,
+            patch: None,
+        };
+        let states: BTreeMap<String, StepState> = [
+            ("design".to_owned(), done(true)),
+            ("plain".to_owned(), done(false)),
+            ("local".to_owned(), StepState::failed(None, "no".into())),
+        ]
+        .into();
+        assert_eq!(save_knowledge(&kb, &plan, &states, "r1"), ["design"]);
+        let saved = kb.read("design").unwrap();
+        assert!(
+            saved.contains("source: run r1, step design by x") && saved.contains("The design.")
+        );
+        assert!(
+            kb.read("other").is_err(),
+            "unverified results aren't knowledge"
         );
     }
 

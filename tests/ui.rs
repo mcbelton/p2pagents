@@ -537,3 +537,141 @@ async fn ui_runs_plans_and_shows_squads() {
     boss.shutdown().await;
     worker.shutdown().await;
 }
+
+#[tokio::test]
+async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
+    use p2pagents::ops::{IncidentEvent, IncidentKind, Monitor, MonitorStore, Sample};
+    let home = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "solo").unwrap();
+    let app = tempfile::tempdir().unwrap();
+    let mut shares = ShareStore::with_data(home.path().join("data"));
+    let checks = [("health".to_owned(), "exit 0".to_owned())].into();
+    shares
+        .add_with("app", app.path(), Access::Full, checks, false)
+        .unwrap();
+    let mut monitors = MonitorStore::default();
+    let monitor = Monitor {
+        name: "api".into(),
+        share: "app".into(),
+        check: "health".into(),
+        every_secs: 60,
+        fail_after: 3,
+        slo: 99.0,
+    };
+    monitors.set(monitor, &shares).unwrap();
+    monitors.save(&profile.monitors_path()).unwrap();
+    let now = p2pagents::runs::unix_now();
+    let store = profile.ops_store();
+    for ok in [true, false] {
+        store
+            .record_sample(&Sample {
+                ts: now,
+                monitor: "api".into(),
+                ok,
+                ms: 120,
+                exit: Some(if ok { 0 } else { 1 }),
+            })
+            .unwrap();
+    }
+    store
+        .record_incident(&IncidentEvent {
+            ts: now,
+            incident: now,
+            monitor: "api".into(),
+            kind: IncidentKind::Opened,
+            text: "api failed".into(),
+            checks: vec![],
+        })
+        .unwrap();
+    profile
+        .knowledge()
+        .write("architecture", "Two services.", "test")
+        .unwrap();
+
+    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile,
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let get = |path: &str| {
+        let (host, token, path) = (host.clone(), token.to_owned(), path.to_owned());
+        async move { request(port, "GET", &path, &host, Some(&token), None).await }
+    };
+
+    assert_eq!(
+        request(port, "GET", "/api/ops", &host, None, None)
+            .await
+            .status,
+        401
+    );
+    let ops = get("/api/ops").await.json();
+    assert_eq!(ops["monitors"][0]["name"], "api");
+    assert_eq!(ops["monitors"][0]["availability"], 50.0);
+    assert_eq!(ops["monitors"][0]["meets_slo"], false);
+    assert_eq!(ops["open_incidents"], 1);
+    assert_eq!(ops["incidents"][0]["kind"], "opened");
+    assert_eq!(ops["knowledge"][0]["name"], "architecture");
+    let topic = get("/api/kb/architecture").await.json();
+    assert!(topic["text"].as_str().unwrap().contains("Two services."));
+    assert_eq!(get("/api/kb/missing").await.status, 404);
+
+    let books = get("/api/playbooks").await.json();
+    let names: Vec<&str> = books["playbooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["bootstrap", "discover", "sdlc", "learn"]);
+    let post = |path: &str, body: &str| {
+        let (host, token, path, body) = (
+            host.clone(),
+            token.to_owned(),
+            path.to_owned(),
+            body.to_owned(),
+        );
+        async move { request(port, "POST", &path, &host, Some(&token), Some(&body)).await }
+    };
+    let filled = post(
+        "/api/playbooks/discover",
+        r#"{"vars":{"peer":"alice","folder":"repo"}}"#,
+    )
+    .await;
+    assert_eq!(filled.status, 200, "{}", filled.body);
+    assert!(
+        filled.json()["text"]
+            .as_str()
+            .unwrap()
+            .contains("@alice:repo")
+    );
+    let missing = post("/api/playbooks/sdlc", r#"{"vars":{"peer":"alice"}}"#).await;
+    assert_eq!(missing.status, 400);
+    assert!(missing.body.contains("needs: change"), "{}", missing.body);
+
+    // Plans can only use knowledge that exists.
+    let unknown = post("/api/plans", r#"{"text":"a @alice context=nope do it"}"#).await;
+    assert_eq!(unknown.status, 400);
+    assert!(unknown.body.contains("no topic 'nope'"), "{}", unknown.body);
+    agent.shutdown().await;
+}

@@ -607,6 +607,101 @@ async function openRun(id) {
   }
 }
 
+// ---------- playbooks ----------
+let playbooks = [];
+async function loadPlaybooks() {
+  playbooks = (await api("/api/playbooks")).playbooks;
+  const select = $("#playbook");
+  for (const p of playbooks) select.append(el("option", { value: p.name, text: `${p.name}: ${p.description}` }));
+}
+
+function openPlaybook() {
+  const p = playbooks.find((x) => x.name === $("#playbook").value);
+  if (!p) {
+    $("#composer-input").focus();
+    return;
+  }
+  $("#playbook-h").textContent = `Playbook: ${p.name}`;
+  $("#playbook-desc").textContent = p.description;
+  $("#playbook-error").textContent = "";
+  const peers = state.trusted.map((t) => t.name);
+  $("#playbook-vars").replaceChildren(...p.vars.map((v) => {
+    const input = el("input", { type: "text", name: v.name, value: v.default ?? "", spellcheck: "false", required: v.default ? null : "required" });
+    if (v.name === "peer" && !input.value && peers.length) input.value = peers[0];
+    return el("label", { class: "field" }, el("span", { text: v.default ? v.name : `${v.name} (required)` }), input);
+  }));
+  $("#playbook-dialog").showModal();
+  $("#playbook-vars input")?.focus();
+}
+
+async function submitPlaybook(e) {
+  e.preventDefault();
+  const vars = Object.fromEntries([...document.querySelectorAll("#playbook-vars input")].map((i) => [i.name, i.value]));
+  try {
+    const res = await api(`/api/playbooks/${encodeURIComponent($("#playbook").value)}`, { method: "POST", body: JSON.stringify({ vars }) });
+    $("#composer-input").value = res.text;
+    $("#playbook-dialog").close();
+    $("#composer-input").focus();
+    toast("Playbook filled in: review it, then Ctrl+Enter to run");
+  } catch (err) {
+    $("#playbook-error").textContent = err.message;
+  }
+}
+
+// ---------- health and knowledge ----------
+const INCIDENT_TEXT = { opened: "Incident opened", tsg: "TSG", assessed: "Debugging agent", learned: "Learned a TSG", escalated: "Needs a person", resolved: "Resolved" };
+
+async function loadOps() {
+  const ops = await api("/api/ops");
+  $("#incident-count").textContent = ops.open_incidents;
+  $("#incident-count").classList.toggle("alert", ops.open_incidents > 0);
+  const health = $("#health");
+  health.replaceChildren();
+  if (!ops.monitors.length) {
+    health.append(el("p", { class: "muted small" }, "No monitors. Add one with ", el("span", { class: "mono", text: "p2pagents monitor add" }), " to track availability and heal incidents."));
+  }
+  const list = el("ul", { class: "monitor-list" });
+  for (const m of ops.monitors) {
+    const state = m.open_incident ? "incident" : m.last_ok === false ? "failing" : m.last_ok ? "up" : "unknown";
+    list.append(el("li", { class: `monitor ${state}` },
+      el("span", { class: "dot", "aria-hidden": "true" }),
+      el("span", { class: "name", text: m.name }),
+      el("span", { class: "muted small", text: `${m.availability == null ? "no data" : `${m.availability.toFixed(2)}%`} · SLO ${m.slo}%${m.meets_slo === false ? " missed" : ""}${m.p95_ms != null ? ` · p95 ${m.p95_ms} ms` : ""}` }),
+      el("span", { class: `status ${state === "up" ? "done" : state === "unknown" ? "skipped" : "failed"}`, text: { up: "Up", failing: "Failing", incident: "Incident", unknown: "Unknown" }[state] })));
+  }
+  health.append(list);
+  const t = ops.tasks;
+  health.append(el("p", { class: "task-meta", text: `Last 24 h: ${t.total} peer tasks (${t.done} done, ${t.failed} failed, ${t.refused} refused)${t.avg_secs != null ? `, ${t.avg_secs.toFixed(1)}s avg` : ""} · evidence runs ${ops.runs.passed}/${ops.runs.total} passed` }));
+  if (ops.incidents.length) {
+    health.append(el("details", {}, el("summary", { text: `Incident log (${ops.incidents.length})` }),
+      el("ol", { class: "incident-log" }, ...ops.incidents.map((e) => el("li", { class: `incident ${e.kind}` },
+        el("strong", { text: `${clock(e.ts * 1000)} ${e.monitor} · ${INCIDENT_TEXT[e.kind] ?? e.kind}: ` }),
+        e.text.split("\n")[0])))));
+  }
+  const kb = $("#kb-list");
+  $("#kb-count").textContent = ops.knowledge.length;
+  kb.replaceChildren(...(ops.knowledge.length ? ops.knowledge.map((k) => el("li", {},
+    el("button", { type: "button", class: "run-open", onclick: () => openTopic(k.name), "aria-label": `Open knowledge topic ${k.name}` },
+      el("span", { class: "task-title", text: k.name }),
+      k.tsg ? el("span", { class: `badge ${k.tsg.status === "active" ? "ok" : "neutral"}`, text: `TSG · ${k.tsg.status}` })
+        : el("span", { class: "muted small", text: `${k.chars} chars` })))) :
+    [el("li", { class: "empty" }, "Nothing yet. Try the ", el("strong", { text: "discover" }), " playbook on an existing project.")]));
+}
+
+async function openTopic(topic) {
+  try {
+    const res = await api(`/api/kb/${encodeURIComponent(topic)}`);
+    $("#run-h").textContent = `Knowledge: ${topic}`;
+    $("#run-verdict").textContent = "";
+    $("#run-signatures").replaceChildren();
+    $("#run-report").replaceChildren(renderMarkdown(res.text.replace(/^<!--.*-->\n/, "")));
+    $("#run-dialog").showModal();
+    $("#run-close").focus();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
 // ---------- audit log ----------
 const OUTCOME_TEXT = { done: "Done", failed: "Failed", cancelled: "Cancelled", refused: "Refused" };
 const OUTCOME_CLASS = { done: "done", failed: "failed", cancelled: "cancelled", refused: "failed" };
@@ -681,6 +776,7 @@ function updateComposer() {
   const input = $("#composer-input");
   const noProviders = task && !availableProviders().length;
   $("#task-opts").hidden = !task;
+  $("#playbook-opts").hidden = !plan;
   input.rows = plan ? 6 : 2;
   input.placeholder = plan
     ? `claim: ID statement, then one step per line: id [after a,b] [approve] @peer[:folder]|#squad [using claude] [verify=a,b attempts=N claims=ID apply=step] prompt\n${PLAN_EXAMPLE}`
@@ -815,7 +911,7 @@ async function loadState() {
   renderFeed();
   renderTasks();
   renderApprovals();
-  await Promise.all([loadAudit(), loadRuns()]);
+  await Promise.all([loadAudit(), loadRuns(), loadOps()]);
 }
 
 let events = null;
@@ -829,6 +925,7 @@ function connectEvents() {
     else if (msg.type === "task") upsertTask(msg.task);
     else if (msg.type === "audit") loadAudit().catch((err) => toast(err.message, "error"));
     else if (msg.type === "runs") loadRuns().catch((err) => toast(err.message, "error"));
+    else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
     else if (msg.type === "approvals") {
       const before = state.approvals?.length ?? 0;
       state.approvals = msg.approvals;
@@ -881,6 +978,12 @@ function init() {
     if (state.mode === "plan" ? e.ctrlKey || e.metaKey : !e.shiftKey) submitComposer(e);
   });
   $("#add-squad-btn").addEventListener("click", openSquadDialog);
+  $("#playbook-use").addEventListener("click", openPlaybook);
+  $("#playbook-cancel").addEventListener("click", () => $("#playbook-dialog").close());
+  $("#playbook-form").addEventListener("submit", submitPlaybook);
+  loadPlaybooks().catch((err) => toast(err.message, "error"));
+  // Monitors run in the background: refresh the health panel now and then.
+  setInterval(() => { if (!document.hidden) loadOps().catch(() => {}); }, 20000);
   $("#run-close").addEventListener("click", () => $("#run-dialog").close());
   $("#run-dialog").addEventListener("click", (e) => {
     if (e.target === e.currentTarget) $("#run-dialog").close();

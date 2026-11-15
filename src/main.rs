@@ -68,6 +68,19 @@ enum Command {
     /// Evidence runs: saved plan runs with a verdict per claim and signed evidence.
     #[command(subcommand)]
     Runs(RunsCommand),
+    /// The knowledge base: what agents learned about your systems (topics, TSGs).
+    #[command(subcommand)]
+    Kb(KbCommand),
+    /// Ready-made plans: bootstrap, discover, sdlc, learn.
+    #[command(subcommand)]
+    Playbook(PlaybookCommand),
+    /// Monitors: a folder's check run on a schedule; failures open incidents that
+    /// TSGs or the debugging agent try to fix.
+    #[command(subcommand)]
+    Monitor(MonitorCommand),
+    /// Operations: health report and incidents.
+    #[command(subcommand)]
+    Ops(OpsCommand),
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
@@ -156,6 +169,121 @@ In a plan, `#qa` runs a step on the least busy online member of squad qa.")]
     /// Remove a squad.
     Remove {
         name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum KbCommand {
+    /// List topics (troubleshooting guides are marked).
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Print a topic.
+    Show {
+        topic: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Add or replace a topic from a Markdown file (`-` for stdin).
+    Add {
+        topic: String,
+        file: PathBuf,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    Remove {
+        topic: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Topics containing all the words.
+    Search {
+        #[arg(required = true)]
+        words: Vec<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Learn from how things ran: write the ops report (health, incidents, tasks,
+    /// runs) into the topic `ops-summary`, for the learn playbook and context=all.
+    Learn {
+        #[arg(long, default_value_t = 168)]
+        hours: u64,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlaybookCommand {
+    /// List the playbooks and what they need.
+    List,
+    /// Print a playbook as a plan, filled in with --set values.
+    #[command(after_help = "\
+examples:
+  p2pagents playbook show discover --set peer=alice --set folder=app --set project=Shop > discover.plan
+  p2pagents playbook show sdlc --set peer=alice --set change=\"Add CSV export\" --set change_id=csv
+Then run it in an agent with /plan <file>, or pick the playbook in the web UI's Plan mode.")]
+    Show {
+        name: String,
+        /// A value for a placeholder: NAME=VALUE (repeatable).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MonitorCommand {
+    /// Add or replace a monitor (runs in this profile's agent while it is running).
+    #[command(after_help = "\
+example:
+  p2pagents share add app D:\\src\\app --access full --check health=\"curl -fsS http://localhost:8080/health\" --check restart=\"pwsh -File restart.ps1\" --profile alice
+  p2pagents monitor add api --share app --check health --every 60 --slo 99.5 --profile alice")]
+    Add {
+        name: String,
+        /// Shared folder whose check to run (fixes run there too).
+        #[arg(long)]
+        share: String,
+        #[arg(long)]
+        check: String,
+        /// Seconds between runs (at least 10).
+        #[arg(long, default_value_t = 60)]
+        every: u64,
+        /// Failures in a row that open an incident.
+        #[arg(long, default_value_t = 3)]
+        fail_after: u32,
+        /// Availability objective, percent.
+        #[arg(long, default_value_t = 99.0)]
+        slo: f64,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    Remove {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum OpsCommand {
+    /// Health against SLOs, incidents, peer tasks and evidence runs (Markdown).
+    Report {
+        #[arg(long, default_value_t = 24)]
+        hours: u64,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Incident events, oldest first.
+    Incidents {
+        #[arg(long, default_value_t = 24)]
+        hours: u64,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -435,6 +563,10 @@ async fn main() -> Result<()> {
         Some(Command::Worker(command)) => run_worker(command),
         Some(Command::Squad(command)) => run_squad(command),
         Some(Command::Runs(command)) => run_runs(command),
+        Some(Command::Kb(command)) => run_kb(command),
+        Some(Command::Playbook(command)) => run_playbook(command),
+        Some(Command::Monitor(command)) => run_monitor(command),
+        Some(Command::Ops(command)) => run_ops(command),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
             let name = profile.name.clone();
@@ -602,6 +734,284 @@ fn share_extras(share: &p2pagents::shares::Share) -> String {
         extras += "; a git worktree per editing task";
     }
     extras
+}
+
+/// Runs the profile's monitors in the background (if any). Incidents are printed and
+/// sent to connected peers as chat, so the team sees alerts.
+fn start_monitors(
+    profile: &Profile,
+    agent: &Agent,
+    executor: Option<Arc<dyn Executor>>,
+    shares: &p2pagents::shares::ShareStore,
+) -> Result<()> {
+    use p2pagents::ops::{IncidentEvent, IncidentKind, MonitorStore, Ops};
+    let monitors = MonitorStore::load(&profile.monitors_path())?.monitors;
+    if monitors.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "monitors: {} (incidents try troubleshooting guides, then {})",
+        monitors
+            .iter()
+            .map(|m| format!("{} every {}s", m.name, m.every_secs))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if executor.is_some() {
+            "the debugging agent"
+        } else {
+            "a person (no --providers for a debugging agent)"
+        }
+    );
+    let alerts = agent.clone();
+    let name = agent.name().to_owned();
+    let notify = move |e: &IncidentEvent| {
+        let line = e.text.lines().next().unwrap_or_default();
+        println!("! [{}] {:?}: {line}", e.monitor, e.kind);
+        if matches!(
+            e.kind,
+            IncidentKind::Opened
+                | IncidentKind::Escalated
+                | IncidentKind::Resolved
+                | IncidentKind::Learned
+        ) {
+            alerts.broadcast(format!(
+                "[{name} alert] {} {}: {line}",
+                e.monitor,
+                format!("{:?}", e.kind).to_lowercase()
+            ));
+        }
+    };
+    let ops = Arc::new(Ops {
+        agent_name: agent.name().to_owned(),
+        monitors,
+        shares: shares.clone(),
+        store: profile.ops_store(),
+        kb: profile.knowledge(),
+        executor,
+        notify: Arc::new(notify),
+    });
+    tokio::spawn(ops.run());
+    // Keep learning: refresh the ops summary in the knowledge base every hour.
+    let profile = profile.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            if let Ok(report) = ops_report(&profile, 168) {
+                let _ = profile.knowledge().write(
+                    "ops-summary",
+                    &report,
+                    "ops report of the last 168 hours (refreshed hourly)",
+                );
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The profile's ops report for the last `hours`.
+fn ops_report(profile: &Profile, hours: u64) -> Result<String> {
+    use p2pagents::ops::{MonitorStore, report};
+    let monitors = MonitorStore::load(&profile.monitors_path())?.monitors;
+    let since_ms = p2pagents::runs::unix_now().saturating_sub(hours * 3600) * 1000;
+    let audit: Vec<_> = AuditLog::read(&profile.audit_path(), usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.ts_ms >= since_ms)
+        .collect();
+    let runs = p2pagents::runs::RunRecord::list(&profile.runs_dir()).unwrap_or_default();
+    Ok(report(
+        &profile.name,
+        hours,
+        &monitors,
+        &profile.ops_store(),
+        &audit,
+        &runs,
+    ))
+}
+
+fn run_kb(command: KbCommand) -> Result<()> {
+    match command {
+        KbCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let topics = profile.knowledge().list();
+            if topics.is_empty() {
+                println!(
+                    "profile '{}' has no knowledge yet: run the discover playbook, or kb add",
+                    profile.name
+                );
+            }
+            for t in topics {
+                let kind = match &t.tsg {
+                    Some(g) => format!(
+                        "TSG ({}, fix: {}{})",
+                        g.status,
+                        g.fix,
+                        g.monitor
+                            .as_ref()
+                            .map(|m| format!(", monitor {m}"))
+                            .unwrap_or_default()
+                    ),
+                    None => format!("{} chars", t.chars),
+                };
+                println!("  {:<28} {kind}", t.name);
+            }
+        }
+        KbCommand::Show { topic, profile } => {
+            print!(
+                "{}",
+                Profile::open(&profile.name)?.knowledge().read(&topic)?
+            )
+        }
+        KbCommand::Add {
+            topic,
+            file,
+            profile,
+        } => {
+            let text = if file.as_os_str() == "-" {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                text
+            } else {
+                std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?
+            };
+            let profile = Profile::open(&profile.name)?;
+            profile.knowledge().write(&topic, &text, "added by hand")?;
+            println!("profile '{}': saved topic {topic}", profile.name);
+        }
+        KbCommand::Remove { topic, profile } => {
+            if !Profile::open(&profile.name)?.knowledge().remove(&topic)? {
+                bail!("there is no topic '{topic}'");
+            }
+        }
+        KbCommand::Search { words, profile } => {
+            for topic in Profile::open(&profile.name)?
+                .knowledge()
+                .search(&words.join(" "))
+            {
+                println!("  {topic}");
+            }
+        }
+        KbCommand::Learn { hours, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let report = ops_report(&profile, hours)?;
+            profile.knowledge().write(
+                "ops-summary",
+                &report,
+                &format!("ops report of the last {hours} hours"),
+            )?;
+            println!(
+                "profile '{}': wrote topic ops-summary ({} chars); analyze it with the learn playbook",
+                profile.name,
+                report.chars().count()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_playbook(command: PlaybookCommand) -> Result<()> {
+    use p2pagents::playbooks;
+    match command {
+        PlaybookCommand::List => {
+            for (name, description) in playbooks::list() {
+                let vars: Vec<String> = playbooks::variables(name)?
+                    .into_iter()
+                    .map(|(v, d)| match d {
+                        Some(d) => format!("{v}={d}"),
+                        None => format!("{v} (required)"),
+                    })
+                    .collect();
+                println!(
+                    "  {name:<10} {description}\n             --set {}",
+                    vars.join(", ")
+                );
+            }
+        }
+        PlaybookCommand::Show { name, set } => {
+            let mut vars = std::collections::BTreeMap::new();
+            for pair in set {
+                let (k, v) = pair
+                    .split_once('=')
+                    .with_context(|| format!("--set {pair:?} must look like NAME=VALUE"))?;
+                vars.insert(k.trim().to_owned(), v.to_owned());
+            }
+            print!("{}", playbooks::render(&name, &vars)?);
+        }
+    }
+    Ok(())
+}
+
+fn run_monitor(command: MonitorCommand) -> Result<()> {
+    use p2pagents::ops::{Monitor, MonitorStore};
+    match command {
+        MonitorCommand::Add {
+            name,
+            share,
+            check,
+            every,
+            fail_after,
+            slo,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut store = MonitorStore::load(&profile.monitors_path())?;
+            store.set(
+                Monitor {
+                    name: name.clone(),
+                    share,
+                    check,
+                    every_secs: every,
+                    fail_after,
+                    slo,
+                },
+                &profile.shares()?,
+            )?;
+            store.save(&profile.monitors_path())?;
+            println!(
+                "profile '{}': monitor {name} every {every}s (SLO {slo}%); it runs while the profile's agent runs",
+                profile.name
+            );
+        }
+        MonitorCommand::List { profile } => {
+            for m in MonitorStore::load(&Profile::open(&profile.name)?.monitors_path())?.monitors {
+                println!(
+                    "  {:<12} {}:{} every {}s, incident after {} failures, SLO {}%",
+                    m.name, m.share, m.check, m.every_secs, m.fail_after, m.slo
+                );
+            }
+        }
+        MonitorCommand::Remove { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut store = MonitorStore::load(&profile.monitors_path())?;
+            if !store.remove(&name) {
+                bail!("there is no monitor '{name}'");
+            }
+            store.save(&profile.monitors_path())?;
+        }
+    }
+    Ok(())
+}
+
+fn run_ops(command: OpsCommand) -> Result<()> {
+    match command {
+        OpsCommand::Report { hours, profile } => {
+            print!("{}", ops_report(&Profile::open(&profile.name)?, hours)?)
+        }
+        OpsCommand::Incidents { hours, profile } => {
+            let since = p2pagents::runs::unix_now().saturating_sub(hours * 3600);
+            for e in Profile::open(&profile.name)?.ops_store().incidents(since) {
+                println!(
+                    "{}  {:<10} {:<10} {}",
+                    p2pagents::runs::utc(e.ts),
+                    e.monitor,
+                    format!("{:?}", e.kind).to_lowercase(),
+                    e.text.lines().next().unwrap_or_default()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_runs(command: RunsCommand) -> Result<()> {
@@ -1064,6 +1474,13 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         }
     }
 
+    start_monitors(
+        &profile,
+        &agent,
+        executor.clone().map(|e| e as Arc<dyn Executor>),
+        &shares,
+    )?;
+
     for peer in &args.peers {
         let result = match Ticket::parse(peer) {
             Ok(ticket) => agent.connect(ticket.addr).await,
@@ -1227,9 +1644,15 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let file = rest.trim();
                 let text = std::fs::read_to_string(file)
                     .with_context(|| format!("reading plan file {file:?}"));
-                match text.and_then(|text| Plan::parse(&text).map(|plan| (text, plan))) {
+                let kb = profile.knowledge();
+                let parsed = text.and_then(|text| {
+                    let plan = Plan::parse(&text)?;
+                    let ready = plan.with_knowledge(&kb)?;
+                    Ok((text, plan, ready))
+                });
+                match parsed {
                     Err(e) => eprintln!("{e:#}"),
-                    Ok((text, plan)) => {
+                    Ok((text, plan, ready)) => {
                         let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                         let agent = agent.clone();
                         let runs_dir = profile.runs_dir();
@@ -1237,7 +1660,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                             format!("plan {file} ({} steps)", plan.steps.len()),
                             async move {
                                 let started = p2pagents::runs::unix_now();
-                                let states = run_plan(&agent, &squads, &plan, print_step).await;
+                                let states = run_plan(&agent, &squads, &ready, print_step).await;
                                 let mut run = p2pagents::runs::RunRecord::new(
                                     agent.name(),
                                     &agent.id().to_string(),
@@ -1259,6 +1682,11 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                                 match run.save(&runs_dir) {
                                     Ok(report) => println!("  report: {}", report.display()),
                                     Err(e) => eprintln!("could not save the run: {e:#}"),
+                                }
+                                let saved =
+                                    p2pagents::plan::save_knowledge(&kb, &plan, &states, &run.id);
+                                if !saved.is_empty() {
+                                    println!("  knowledge saved: {}", saved.join(", "));
                                 }
                             },
                         );

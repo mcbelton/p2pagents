@@ -107,6 +107,13 @@
               <select id="share"></select>
             </label>
           </div>
+          <div class="task-opts" id="playbook-opts" hidden>
+            <label class="field-inline">
+              <span>Playbook</span>
+              <select id="playbook"><option value="">Write your own…</option></select>
+            </label>
+            <button type="button" class="btn small" id="playbook-use">Use</button>
+          </div>
         </div>
         <div class="input-row">
           <label for="composer-input" class="visually-hidden" id="composer-label">Message</label>
@@ -134,6 +141,21 @@
           <span class="count" id="task-count">0</span>
         </div>
         <ol class="task-list" id="task-list"></ol>
+      </section>
+      <section class="runs-panel" aria-labelledby="health-h">
+        <div class="card-head panel-head">
+          <h2 id="health-h">Health</h2>
+          <span class="count" id="incident-count" title="Open incidents">0</span>
+        </div>
+        <div id="health"></div>
+      </section>
+      <section class="runs-panel" aria-labelledby="kb-h">
+        <div class="card-head panel-head">
+          <h2 id="kb-h">Knowledge</h2>
+          <span class="count" id="kb-count">0</span>
+        </div>
+        <p class="muted small">What agents learned about your systems: saved by plan steps (<span class="mono">save=</span>), used by them (<span class="mono">context=</span>). TSGs fix incidents automatically.</p>
+        <ul class="kb-list" id="kb-list"></ul>
       </section>
       <section class="runs-panel" aria-labelledby="runs-h">
         <div class="card-head panel-head">
@@ -226,6 +248,19 @@
       <ul id="run-signatures" class="signature-list"></ul>
       <div id="run-report" class="result" tabindex="0"></div>
     </div>
+  </dialog>
+
+  <dialog id="playbook-dialog" aria-labelledby="playbook-h">
+    <form method="dialog" id="playbook-form" novalidate>
+      <h2 id="playbook-h">Playbook</h2>
+      <p class="muted small" id="playbook-desc"></p>
+      <div id="playbook-vars" class="playbook-vars"></div>
+      <p class="form-error" id="playbook-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="playbook-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Fill in the plan</button>
+      </div>
+    </form>
   </dialog>
 
   <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>

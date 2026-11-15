@@ -346,6 +346,69 @@
       "tests": ["ui::ui_runs_plans_and_shows_squads"]
     },
     {
+      "id": "KB-1",
+      "area": "knowledge",
+      "claim": "Plan steps save their verified results into the profile's private knowledge base (save=) and later steps get that knowledge in their prompt (context=); unverified results never become knowledge, topics are plain names, and a plan naming a missing topic is refused before anything runs.",
+      "tests": [
+        "lib::knowledge::topics_are_written_listed_searched_and_given_as_context",
+        "lib::plan::steps_use_and_grow_the_knowledge_base",
+        "agents::plans_save_verified_results_as_knowledge_and_use_it_later"
+      ],
+      "live": ["boss saved the verified result as knowledge"]
+    },
+    {
+      "id": "PB-1",
+      "area": "knowledge",
+      "claim": "Ready-made playbooks cover the lifecycle: bootstrap a fresh project, reverse-engineer an existing one into knowledge, take a change through design, independent verification, security, privacy and compliance gates, and learn from operations. Each renders into a valid plan where every claim is proven only by runtime checks or a sign-off.",
+      "tests": [
+        "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
+        "lib::playbooks::rendering_needs_required_values_and_rejects_bad_ones"
+      ]
+    },
+    {
+      "id": "OPS-1",
+      "area": "operations",
+      "claim": "Monitors run a folder owner's check on a schedule; every run is a metric sample, and the ops report shows availability against each SLO, latency, incidents and how they ended, peer task and evidence run statistics.",
+      "tests": [
+        "lib::ops::stats_and_reports_cover_slos_incidents_and_tasks",
+        "lib::ops::monitors_need_an_existing_folder_and_check"
+      ],
+      "live": ["monitors recorded metrics and the ops report shows them"]
+    },
+    {
+      "id": "OPS-2",
+      "area": "operations",
+      "claim": "Repeated monitor failures open an incident and alert the team; a matching troubleshooting guide's fix runs first, otherwise the debugging agent diagnoses read-only. A fix it names with high confidence runs and, if the monitor then passes, becomes a new active TSG; unsure or failed fixes leave a draft TSG and escalate to a person.",
+      "tests": [
+        "lib::knowledge::troubleshooting_guides_parse_and_match",
+        "lib::ops::a_matching_tsg_fixes_the_incident_without_the_model",
+        "lib::ops::a_confident_verified_diagnosis_becomes_a_new_tsg",
+        "lib::ops::unsure_or_failed_fixes_escalate_with_a_draft_tsg",
+        "lib::ops::assessments_are_parsed_leniently"
+      ],
+      "live": [
+        "a troubleshooting guide fixed the incident without the model",
+        "the debugging agent diagnosed an incident no guide covers",
+        "the team was alerted by chat"
+      ]
+    },
+    {
+      "id": "OPS-3",
+      "area": "web ui",
+      "claim": "The web UI shows health (monitors against SLOs, open incidents, the incident log, task statistics), the knowledge base with its TSGs, and fills in playbooks into the plan editor.",
+      "tests": ["ui::ui_shows_health_knowledge_and_fills_in_playbooks"]
+    },
+    {
+      "id": "LRN-1",
+      "area": "knowledge",
+      "claim": "The system keeps learning: the ops summary (health, incidents, usage) is written into the knowledge base (kb learn, and hourly by agents with monitors) for context=all and the learn playbook, and learned TSGs fix repeats without the model.",
+      "tests": [
+        "lib::ops::stats_and_reports_cover_slos_incidents_and_tasks",
+        "lib::ops::a_confident_verified_diagnosis_becomes_a_new_tsg"
+      ],
+      "live": ["kb learn wrote the ops summary into the knowledge base"]
+    },
+    {
       "id": "BRG-1",
       "area": "providers",
       "claim": "The Claude/Codex bridge passes task fields, runs requests concurrently, and surfaces provider errors and bridge exits.",

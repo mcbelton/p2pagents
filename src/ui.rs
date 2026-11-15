@@ -359,6 +359,10 @@ pub async fn start(
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/approvals/{id}", post(answer_approval))
+        .route("/api/ops", get(ops_state))
+        .route("/api/playbooks", get(list_playbooks))
+        .route("/api/playbooks/{name}", post(render_playbook))
+        .route("/api/kb/{topic}", get(kb_topic))
         .route("/api/squads", post(save_squad))
         .route("/api/squads/{name}", delete(remove_squad))
         .route("/api/trust", post(allow_peer))
@@ -679,6 +683,10 @@ async fn create_plan(
     Json(body): Json<PlanBody>,
 ) -> Result<Json<Value>, ApiError> {
     let plan = Plan::parse(&body.text).map_err(|e| bad_request(format!("{e:#}")))?;
+    let kb = s.info.profile.knowledge();
+    let ready = plan
+        .with_knowledge(&kb)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
     let plan_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
     let mut ids = HashMap::new();
     for step in &plan.steps {
@@ -715,7 +723,7 @@ async fn create_plan(
     let text = body.text.clone();
     let handle = tokio::spawn(async move {
         let started = crate::runs::unix_now();
-        let states = run_plan(&shared.agent.clone(), &squads, &plan, |step, state| {
+        let states = run_plan(&shared.agent.clone(), &squads, &ready, |step, state| {
             let id = step_ids[step];
             if !matches!(state, StepState::Waiting | StepState::Running { .. }) {
                 shared.running.lock().unwrap().remove(&id);
@@ -779,7 +787,12 @@ async fn create_plan(
             ),
             Err(e) => shared.system("warn", format!("Could not save the run: {e:#}")),
         }
+        let saved = crate::plan::save_knowledge(&kb, &plan, &states, &run.id);
+        if !saved.is_empty() {
+            shared.system("info", format!("Knowledge saved: {}", saved.join(", ")));
+        }
         shared.send(json!({ "type": "runs" }));
+        shared.send(json!({ "type": "ops" }));
     });
     {
         let mut running = s.running.lock().unwrap();
@@ -849,6 +862,87 @@ async fn remove_squad(
     })?;
     s.broadcast_peers();
     Ok(Json(json!({ "removed": name })))
+}
+
+fn internal(e: impl std::fmt::Display) -> ApiError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
+/// The health dashboard: monitors against their SLOs (last 24 hours), incident
+/// events, peer task statistics, evidence runs and the knowledge base topics.
+async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    use crate::ops::{MonitorStore, monitor_stats, open_incidents, task_stats};
+    let profile = &s.info.profile;
+    let since = crate::runs::unix_now().saturating_sub(24 * 3600);
+    let monitors = MonitorStore::load(&profile.monitors_path())
+        .map_err(internal)?
+        .monitors;
+    let store = profile.ops_store();
+    let incidents = store.incidents(since);
+    let stats = monitor_stats(&monitors, &store.samples(since), &incidents);
+    let audit: Vec<_> = AuditLog::read(&profile.audit_path(), 10_000)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.ts_ms >= since * 1000)
+        .collect();
+    let runs = RunRecord::list(&profile.runs_dir()).unwrap_or_default();
+    let recent: Vec<_> = incidents.iter().rev().take(30).cloned().collect();
+    Ok(Json(json!({
+        "monitors": stats,
+        "open_incidents": open_incidents(&incidents).len(),
+        "incidents": recent,
+        "tasks": task_stats(&audit),
+        "runs": { "total": runs.len(), "passed": runs.iter().filter(|r| r.passed).count() },
+        "knowledge": profile.knowledge().list(),
+    })))
+}
+
+async fn list_playbooks() -> Result<Json<Value>, ApiError> {
+    let mut list = Vec::new();
+    for (name, description) in crate::playbooks::list() {
+        let vars: Vec<Value> = crate::playbooks::variables(name)
+            .map_err(internal)?
+            .into_iter()
+            .map(|(v, d)| json!({ "name": v, "default": d }))
+            .collect();
+        list.push(json!({ "name": name, "description": description, "vars": vars }));
+    }
+    Ok(Json(json!({ "playbooks": list })))
+}
+
+#[derive(Deserialize)]
+struct PlaybookBody {
+    #[serde(default)]
+    vars: std::collections::BTreeMap<String, String>,
+}
+
+async fn render_playbook(
+    Path(name): Path<String>,
+    Json(body): Json<PlaybookBody>,
+) -> Result<Json<Value>, ApiError> {
+    let vars = body
+        .vars
+        .into_iter()
+        .filter(|(_, v)| !v.trim().is_empty())
+        .collect();
+    let text = crate::playbooks::render(&name, &vars).map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({ "text": text })))
+}
+
+async fn kb_topic(
+    State(s): State<AppState>,
+    Path(topic): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let text = s.info.profile.knowledge().read(&topic).map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    Ok(Json(json!({ "topic": topic, "text": text })))
 }
 
 #[derive(Deserialize)]

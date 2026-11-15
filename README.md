@@ -621,6 +621,80 @@ request them. Their environment has no inherited credential variables (`GH_TOKEN
 `ANTHROPIC_API_KEY`, ...). Each check may run for up to 15 minutes, and on a timeout or
 cancellation everything it started is killed.
 
+### The lifecycle: from a fresh project to operations
+
+**Playbooks** are ready-made plans for each stage. Fill one in, review it and run it:
+
+```powershell
+p2pagents playbook list
+p2pagents playbook show bootstrap --set peer=alice --set project=Shop > bootstrap.plan  # fresh project
+p2pagents playbook show discover  --set peer=alice --set folder=repo > discover.plan   # existing project
+p2pagents playbook show sdlc --set peer=alice --set change="Add CSV export" --set change_id=csv > csv.plan
+p2pagents playbook show learn --set peer=alice > learn.plan                           # learn from operations
+```
+
+In the web UI: **Plan** mode, pick a playbook, then **Use**.
+
+| Playbook | What it proves |
+| --- | --- |
+| `bootstrap` | Toolchain and dependencies set up, README, a test and CI, a first `evidence/claims.json`, lead sign-off. All checked by the owner's `build`/`test` checks |
+| `discover` | Architecture, components and data flows; how to build, test and run (the `test` check passes as documented); security, privacy and reliability hotspots; a glossary. Saved as knowledge and confirmed by someone who knows the system |
+| `sdlc` | Design, then implementation (`test`, `lint`), then independent verification by a reviewer squad applying the patch. Security scan plus accepted review, privacy review accepted by the privacy champion, license and secret scans (`licenses`, `secrets`), then release approval |
+| `learn` | Insights about usage, health and recurring failures, plus TSG drafts for failures without one, accepted by a person |
+
+Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
+your folder's checks (`share add --check ...`); rename them with `--set test=unit` etc.
+
+**Knowledge base.** Each profile has a private knowledge base of Markdown topics.
+
+- A step with `save=topic` stores its result there. Only verified results are stored, with
+  the run and peer they came from.
+- A step with `context=a,b` (or `context=all`) gets those topics in its prompt.
+
+So reverse-engineered architecture, risks, designs and insights build up across runs.
+
+```powershell
+p2pagents kb list | show <topic> | add <topic> <file.md> | remove <topic> | search <words> --profile boss
+```
+
+**Operations.** On the machine where a service runs, its owner adds monitors. A monitor
+runs one of the folder's checks on a schedule, while that profile's agent runs:
+
+```powershell
+p2pagents share add svc D:\svc --access full --check health="curl -fsS http://localhost:8080/health" `
+  --check restart="pwsh -File restart.ps1" --profile alice
+p2pagents monitor add api --share svc --check health --every 60 --fail-after 3 --slo 99.5 --profile alice
+```
+
+- Every run is a **metric** (ok, latency, exit code) in the profile's `ops/metrics.jsonl`.
+- `fail-after` failures in a row open an **incident** (`ops/incidents.jsonl`). The agent
+  **alerts** its terminal and its connected peers by chat.
+- **Auto-fix with TSGs.** A troubleshooting guide is a knowledge topic with front matter
+  (`tsg`, `monitor`, `match`, `fix`, `verify`, `status`). The fix check of every active
+  guide whose monitor matches, and whose `match` text appears in the failure, is run, then
+  the verify check.
+- **Debugging agent.** If no guide fixes it and the agent has a provider, its model
+  investigates read-only in the folder, using the knowledge base. It ends with
+  `Confidence: N%` and `Fix: <check>`.
+  - At 80% or more confidence, that check runs. If the monitor then passes, the diagnosis
+    is saved as a new **active TSG**, so a repeat is fixed without the model.
+  - Otherwise a **draft TSG** is written for a person to review, and the incident is
+    escalated.
+- Fixes can only be checks the owner defined: neither a model nor a peer can run anything
+  else.
+
+```powershell
+p2pagents ops report --hours 24 --profile alice    # availability vs SLO, p50/p95, incidents, tasks, runs
+p2pagents ops incidents --profile alice
+p2pagents kb learn --profile alice                 # ops report -> knowledge topic ops-summary
+```
+
+**Learning.** Agents with monitors refresh `ops-summary` in the knowledge base every hour.
+TSGs learned from incidents accumulate, and the `learn` playbook analyzes it all
+(`context=all`) into insights and new TSG drafts. In the web UI, the **Health** panel shows
+monitors against their SLOs, open incidents, the incident log and task statistics, and
+**Knowledge** lists the topics and TSGs.
+
 ### Options
 
 | Option | Default | Description |
@@ -641,7 +715,8 @@ cancellation everything it started is killed.
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
 `p2pagents share add|list|remove`, `p2pagents worker create|list`,
-`p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
+`p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
+`p2pagents playbook list|show`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
 (and uses a separate credential store namespace).
 
 ## Web UI
@@ -904,6 +979,9 @@ Workflow for a change:
 - [src/evidence.rs](src/evidence.rs): signed evidence records, owner-defined checks (run with a timeout, process tree killed) and retry prompts
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
+- [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
+- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc and learn plan templates
+- [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases

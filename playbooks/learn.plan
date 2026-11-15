@@ -1,0 +1,8 @@
+// Keep learning about the system from how it runs: usage, health, incidents and
+// which troubleshooting guides work. Run `p2pagents kb learn` first so the
+// knowledge base has the latest ops summary.
+// Vars: peer, folder, approver
+claim: LEARN-1 The knowledge base has an up-to-date analysis of how the system is used and how it behaves
+insights @{{peer}}:{{folder}} context=all save=insights Using the knowledge above (ops summary, incidents, troubleshooting guides, architecture), analyze how the system is used and how it behaves: usage, availability and latency trends, recurring failures, which troubleshooting guides work and which failures have none, and the 5 most valuable improvements with expected impact and evidence.
+tsg-gaps after insights @{{peer}}:{{folder}} context=all save=tsg-gaps For each recurring failure without a working troubleshooting guide, draft one: symptoms, likely causes, diagnosis steps, and the fix (name the owner's check that applies it, if any).
+accept after insights,tsg-gaps approve @{{approver}} claims=LEARN-1 Accept these insights and troubleshooting guide drafts into the knowledge base.
