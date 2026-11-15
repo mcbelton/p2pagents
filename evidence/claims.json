@@ -186,6 +186,12 @@
       "tests": ["ui::ui_requires_token_and_local_host_and_runs_tasks"]
     },
     {
+      "id": "UI-2",
+      "area": "web ui",
+      "claim": "Any agent, including a boss that only delegates, can allowlist peers from the web UI; folder grants are checked only for peers that may delegate.",
+      "tests": ["ui::delegate_only_agents_allowlist_chat_peers_from_the_ui"]
+    },
+    {
       "id": "AUD-1",
       "area": "audit",
       "claim": "Every task a peer asks an agent to run is recorded in the profile's audit log (peer, provider, access, outcome, duration) without the prompt text.",

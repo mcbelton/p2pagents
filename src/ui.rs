@@ -831,8 +831,11 @@ async fn allow_peer(
     let shares = body
         .shares
         .unwrap_or_else(|| vec![crate::shares::DATA_SHARE.to_owned()]);
+    // Folder grants only matter for peers that may delegate tasks.
     let known = s.agent.shares();
-    if let Some(missing) = shares.iter().find(|n| known.get(n).is_none()) {
+    if body.delegate
+        && let Some(missing) = shares.iter().find(|n| known.get(n).is_none())
+    {
         return Err(bad_request(format!(
             "this agent shares no folder named '{missing}'"
         )));

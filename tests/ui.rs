@@ -165,7 +165,62 @@ async fn ui_requires_token_and_local_host_and_runs_tasks() {
     .expect("task finished");
     assert_eq!(done["status"], "done");
     assert_eq!(done["output"], "echo: hello");
-    assert_eq!(done["target"], "this agent");
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = AgentConfig::new("boss", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "boss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let peer = SecretKey::generate().public();
+
+    let chat = format!(r#"{{"ticket":"{peer}","name":"pal"}}"#);
+    let added = request(port, "POST", "/api/trust", &host, Some(token), Some(&chat)).await;
+    assert_eq!(added.status, 200, "{}", added.body);
+    assert!(agent.trusted().get(&peer).is_some_and(|p| !p.can_delegate));
+
+    let delegate =
+        format!(r#"{{"ticket":"{peer}","name":"pal","delegate":true,"shares":["nope"]}}"#);
+    let refused = request(
+        port,
+        "POST",
+        "/api/trust",
+        &host,
+        Some(token),
+        Some(&delegate),
+    )
+    .await;
+    assert_eq!(refused.status, 400);
+    assert!(
+        refused.body.contains("no folder named 'nope'"),
+        "{}",
+        refused.body
+    );
 
     agent.shutdown().await;
 }

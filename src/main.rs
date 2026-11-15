@@ -851,13 +851,14 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.trust = profile.trust()?;
         config.owner = profile.config.owner.clone();
         config.role = profile.config.role.clone();
+        // Known for granting folders to peers; they're offered only while serving.
+        config.shares = shares.clone();
         if args.serve {
             let data = profile.data_folder();
             std::fs::create_dir_all(&data)
                 .with_context(|| format!("creating the shared data folder {}", data.display()))?;
             config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
             config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
-            config.shares = shares.clone();
         }
         Agent::bind(config).await?
     };
