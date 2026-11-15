@@ -182,6 +182,17 @@ try:
     denied = w1.wait_for(r"copilot: denied read .*outside-secret\.txt", 1)
     print(f"  (stopped by {'the p2pagents path policy' if denied else 'the model declining before any tool call'})")
 
+    print("== cancel: boss stops a long Copilot task running on worker1")
+    boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
+    boss.send("/delegate copilot@worker1 Read every file under src/ and write a detailed 2000-word review of the whole codebase.")
+    started = boss.wait_for(r"delegating to worker1 .* as task (\d+)", 30)
+    w1.wait_for(r"task #\d+ from boss \(copilot\) started", 60)
+    time.sleep(3)
+    if started:
+        boss.send(f"/cancel {re.search(r'as task (\d+)', started).group(1)}")
+    check("boss cancelled a running Copilot task on worker1",
+          boss.wait_for(r"=== copilot on worker1 cancelled", 15) and w1.wait_for(r"task #\d+ from boss cancelled", 30))
+
     print("== worker2 leaves")
     w2.stop()
     check("boss saw worker2 disconnect", boss.wait_for(r"^- worker2", 60))
@@ -195,6 +206,7 @@ try:
         return [json.loads(l) for l in out.splitlines() if l.startswith("{")]
     a1, a2 = audit("worker1"), audit("worker2")
     check("worker1 audited boss's tasks", sum(e["peer"] == "boss" and e["outcome"] == "done" for e in a1) >= 2, a1)
+    check("worker1 audited the task as cancelled", any(e["peer"] == "boss" and e["outcome"] == "cancelled" for e in a1), a1)
     check("worker2 audited boss's task with its grant",
           any(e["peer"] == "boss" and e["outcome"] == "done" and e["access"] == "workspace-write" for e in a2), a2)
     check("worker2 audited the refused request from worker1",

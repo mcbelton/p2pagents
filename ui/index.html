@@ -104,12 +104,22 @@
       </form>
     </main>
 
-    <section class="tasks-panel" aria-labelledby="tasks-h">
-      <div class="card-head panel-head">
-        <h2 id="tasks-h">Tasks</h2>
-        <span class="count" id="task-count">0</span>
-      </div>
-      <ol class="task-list" id="task-list"></ol>
+    <section class="tasks-panel" aria-label="Tasks and audit log">
+      <section aria-labelledby="tasks-h">
+        <div class="card-head panel-head">
+          <h2 id="tasks-h">Tasks</h2>
+          <span class="count" id="task-count">0</span>
+        </div>
+        <ol class="task-list" id="task-list"></ol>
+      </section>
+      <section id="audit-panel" class="audit-panel" aria-labelledby="audit-h" hidden>
+        <div class="card-head panel-head">
+          <h2 id="audit-h">Peer task log</h2>
+          <span class="count" id="audit-count">0</span>
+        </div>
+        <p class="muted small">Every task peers asked this agent to run. Prompts are not stored, only their fingerprint.</p>
+        <ol class="task-list" id="audit-list"></ol>
+      </section>
     </section>
   </div>
 

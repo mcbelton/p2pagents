@@ -54,6 +54,29 @@ async fn surfaces_provider_errors_and_bridge_exit() {
     assert_eq!(exit.unwrap_err().to_string(), "bridge process exited");
 }
 
+#[tokio::test]
+async fn cancelling_a_request_tells_the_bridge_to_abort() {
+    let bridge = fake_bridge();
+    let hang = LlmTask::new(Provider::Claude, "hang");
+    let dropped = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        bridge.run(&hang, Path::new("."), Access::ReadOnly),
+    )
+    .await;
+    assert!(dropped.is_err(), "the hanging request was dropped");
+    // The cancel line is written in the background; the bridge sees requests in order.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let seen = bridge
+        .run(
+            &LlmTask::new(Provider::Claude, "cancelled?"),
+            Path::new("."),
+            Access::ReadOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen, "1", "bridge received cancel for request 1");
+}
+
 #[test]
 fn claude_tool_policy_confines_paths_and_tools() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

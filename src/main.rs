@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use p2pagents::audit::AuditLog;
+use p2pagents::audit::{AuditLog, Outcome};
 use p2pagents::auth::{LoginMethod, ProviderTools};
 use p2pagents::profile::DEFAULT_GITHUB_HOST;
 use p2pagents::trust::DEFAULT_TASKS_PER_HOUR;
@@ -20,6 +20,8 @@ commands:
   <text>                                broadcast a chat message
   /ask <provider> <prompt>              run a task locally (provider: copilot|claude|codex)
   /delegate <provider>[@peer] <prompt>  run a task on a peer that serves <provider>
+  /tasks                                list your running tasks
+  /cancel <n>                           cancel your running task n (the peer stops it too)
   /peers                                list connected peers and the providers they serve
   /ticket                               print this agent's ticket (give it to peers)
   /help                                 show this help
@@ -650,16 +652,28 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 } => {
                     println!("> task #{task_id} from {from} ({provider}) started")
                 }
-                Event::TaskCompleted { from, task_id, ok } => {
-                    println!(
-                        "> task #{task_id} from {from} {}",
-                        if ok { "done" } else { "failed" }
-                    )
+                Event::TaskCompleted {
+                    from,
+                    task_id,
+                    outcome,
+                } => {
+                    let outcome = match outcome {
+                        Outcome::Done => "done",
+                        Outcome::Cancelled => "cancelled",
+                        _ => "failed",
+                    };
+                    println!("> task #{task_id} from {from} {outcome}")
                 }
+                Event::TaskRefused {
+                    from,
+                    task_id,
+                    reason,
+                } => println!("> task #{task_id} from {from} refused: {reason}"),
             }
         }
     });
 
+    let tasks = RunningTasks::default();
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = stdin.next_line().await? {
         let line = line.trim();
@@ -668,6 +682,22 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             "" => {}
             "/quit" => break,
             "/help" => println!("{COMMANDS}"),
+            "/tasks" => {
+                let running = tasks.list();
+                if running.is_empty() {
+                    println!("no running tasks");
+                }
+                for (n, label) in running {
+                    println!("  {n}: {label}");
+                }
+            }
+            "/cancel" => match rest.trim().parse::<u64>() {
+                Ok(n) => match tasks.cancel(n) {
+                    Some(label) => println!("=== {label} cancelled (task {n})"),
+                    None => eprintln!("no running task {n}; see /tasks"),
+                },
+                Err(_) => eprintln!("usage: /cancel <n> (see /tasks)"),
+            },
             "/ticket" => {
                 println!(
                     "{}",
@@ -693,8 +723,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 (Ok(_), None) => eprintln!("no local providers; start with --providers"),
                 (Ok((task, _)), Some(executor)) => {
                     let executor = executor.clone();
-                    tokio::spawn(async move {
-                        let label = format!("{} (local)", task.provider);
+                    let label = format!("{} (local)", task.provider);
+                    tasks.spawn(label.clone(), async move {
                         print_result(&label, executor.execute(&task, Access::Full).await);
                     });
                 }
@@ -704,11 +734,15 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     Err(e) => eprintln!("{e:#}"),
                     Ok((task, peer)) => {
                         let agent = agent.clone();
-                        println!("delegating to {} ({})", peer.name, peer.id.fmt_short());
-                        tokio::spawn(async move {
-                            let label = format!("{} on {}", task.provider, peer.name);
+                        let label = format!("{} on {}", task.provider, peer.name);
+                        let n = tasks.spawn(label.clone(), async move {
                             print_result(&label, agent.delegate(peer.id, task).await);
                         });
+                        println!(
+                            "delegating to {} ({}) as task {n} (/cancel {n} to stop it)",
+                            peer.name,
+                            peer.id.fmt_short()
+                        );
                     }
                 }
             }
@@ -752,6 +786,53 @@ fn pick_peer(
             .ok_or_else(|| anyhow!("no peer serves {}", task.provider))?,
     };
     Ok((task.clone(), peer))
+}
+
+/// Last task number, and running tasks by number with their label and abort handle.
+type TaskTable = (
+    u64,
+    std::collections::BTreeMap<u64, (String, tokio::task::AbortHandle)>,
+);
+
+/// Tasks started from the prompt, numbered so `/cancel <n>` can stop them.
+#[derive(Clone, Default)]
+struct RunningTasks {
+    inner: Arc<std::sync::Mutex<TaskTable>>,
+}
+
+impl RunningTasks {
+    fn spawn(
+        &self,
+        label: String,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> u64 {
+        let mut guard = self.inner.lock().unwrap();
+        guard.0 += 1;
+        let n = guard.0;
+        let this = self.clone();
+        let handle = tokio::spawn(async move {
+            task.await;
+            this.inner.lock().unwrap().1.remove(&n);
+        });
+        guard.1.insert(n, (label, handle.abort_handle()));
+        n
+    }
+
+    fn list(&self) -> Vec<(u64, String)> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .1
+            .iter()
+            .map(|(n, (label, _))| (*n, label.clone()))
+            .collect()
+    }
+
+    /// Aborts task `n`; dropping a delegation tells the peer to stop it.
+    fn cancel(&self, n: u64) -> Option<String> {
+        let (label, handle) = self.inner.lock().unwrap().1.remove(&n)?;
+        handle.abort();
+        Some(label)
+    }
 }
 
 fn print_result(label: &str, result: Result<String>) {

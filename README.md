@@ -414,6 +414,8 @@ In terminal 2, once `+ worker` appears:
 | `<text>` | Broadcast a chat message |
 | `/ask <provider> <prompt>` | Run a task locally (needs `--providers`) |
 | `/delegate <provider>[@peer] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer) |
+| `/tasks` | List your running tasks with their numbers |
+| `/cancel <n>` | Cancel your running task `n`; the peer stops the model run and frees the slot |
 | `/peers` | List connected peers and the providers they serve |
 | `/ticket` | Print this agent's ticket (endpoint id + current addresses) |
 | `/help`, `/quit` | Help, exit |
@@ -438,7 +440,7 @@ two tasks edit the same workspace at once, each lists both tasks' changes.
 
 An agent started with `--serve` records every task a peer asks it to run, accepted or
 refused, in the profile's `audit.jsonl`: peer name and key, provider, the access the task
-got, outcome (`done`, `failed`, `refused`), duration and any error. The prompt is **not**
+got, outcome (`done`, `failed`, `cancelled`, `refused`), duration and any error. The prompt is **not**
 stored, only its SHA-256 and length, so the log holds no peer content.
 
 ```text
@@ -448,6 +450,13 @@ time (UTC)           peer            task provider access           outcome   se
 ```
 
 `--limit N` shows more entries and `--json` prints the raw lines.
+
+### Cancelling tasks
+
+`/cancel <n>` (or **Cancel** in the web UI) stops a task you started. For a delegated task
+the peer is told to stop: it aborts the Copilot session (or the Claude/Codex run), frees the
+task slot and records the task as `cancelled` in its audit log. If you disconnect, the peer
+cancels your running tasks the same way, so nothing keeps spending its accounts for you.
 
 ### Options
 
@@ -491,8 +500,9 @@ p2pagents --name me --providers copilot --serve --ui
   tasks peers delegate to you.
 - **Run task**: pick a provider and where to run it (*This agent*, a named peer, or *Any peer*
   when several serve it).
-  The **Tasks** panel shows status and elapsed time, renders results as Markdown, and can copy
-  results and errors.
+  The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
+  results and errors, and has a **Cancel** button on running tasks.
+- **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
   windows, honours reduced motion.
@@ -667,7 +677,7 @@ Workflow for a change:
 
 ## Layout
 
-- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses and capabilities, `peers`, `chat`, `task_request`, `task_result`) and the `p2pagents/1` ALPN
+- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses and capabilities, `peers`, `chat`, `task_request`, `task_result`, `task_cancel`; unknown types are ignored) and the `p2pagents/1` ALPN
 - [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, shutdown
 - [src/trust.rs](src/trust.rs): allowlist (`peers.json`) and `p2pa1...` tickets
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`

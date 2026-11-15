@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::SandboxConfig;
+use github_copilot_sdk::session::Session;
 use github_copilot_sdk::types::{
     MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId, SessionConfig,
     SessionId,
@@ -201,14 +202,18 @@ impl CopilotBackend {
         if let Some(model) = &task.model {
             config = config.with_model(model.clone());
         }
-        let session = self
-            .client
-            .create_session(config)
-            .await
-            .context("creating Copilot session")?;
+        let session = Arc::new(
+            self.client
+                .create_session(config)
+                .await
+                .context("creating Copilot session")?,
+        );
+        // If this future is dropped (the task was cancelled), stop the model too.
+        let mut guard = AbortOnDrop(Some(session.clone()));
         let reply = session
             .send_and_wait(MessageOptions::new(task.prompt.clone()).with_wait_timeout(TASK_TIMEOUT))
             .await;
+        guard.0 = None;
         let _ = session.disconnect().await;
         let event = reply.context("Copilot task failed")?;
         event
@@ -217,6 +222,24 @@ impl CopilotBackend {
             .and_then(|c| c.as_str())
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("Copilot returned no assistant message"))
+    }
+}
+
+/// Aborts and disconnects a Copilot session whose task future was dropped.
+struct AbortOnDrop(Option<Arc<Session>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = session.abort().await;
+                let _ = session.disconnect().await;
+                eprintln!("  copilot: task cancelled, session aborted");
+            });
+        }
     }
 }
 

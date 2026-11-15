@@ -34,6 +34,7 @@ function icon(paths) {
 const ICONS = {
   trash: ["M4 7h16", "M10 11v6M14 11v6", "M6 7l1 13h10l1-13", "M9 7V4h6v3"],
   copy: ["M9 9h11v11H9z", "M5 15V5a2 2 0 0 1 2-2h10"],
+  stop: ["M6 6h12v12H6z"],
   peers: ["M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M16 11a3 3 0 1 0 0-6", "M2 20a6 6 0 0 1 12 0", "M15 14a6 6 0 0 1 7 6"],
 };
 
@@ -344,7 +345,7 @@ function appendFeed(item) {
 const openResults = new Map();
 
 function taskNode(t) {
-  const statusText = { running: "Running", done: "Done", failed: "Failed" }[t.status];
+  const statusText = { running: "Running", done: "Done", failed: "Failed", cancelled: "Cancelled" }[t.status];
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
     el("div", { class: "task-top" },
@@ -355,7 +356,13 @@ function taskNode(t) {
     el("div", { class: "task-meta" }, `Started ${clock(t.started_ms)} · `,
       el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
         t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`)));
-  if (t.output !== null && t.output !== undefined) {
+  if (t.status === "running") {
+    node.append(el("button", {
+      type: "button", class: "btn small", "aria-label": `Cancel task #${t.id}`,
+      onclick: (e) => cancelTask(t, e.currentTarget),
+    }, icon(ICONS.stop), "Cancel"));
+  }
+  if (t.output !== null && t.output !== undefined && t.status !== "cancelled") {
     const open = openResults.has(t.id) ? openResults.get(t.id) : true;
     const details = el("details", { open: open || undefined },
       el("summary", { text: t.status === "failed" ? "Error" : "Result" }),
@@ -387,7 +394,44 @@ function upsertTask(task) {
   else state.tasks[i] = task;
   renderTasks();
   if (!isNew && task.status !== "running") {
-    toast(`Task #${task.id} ${task.status === "done" ? "finished" : "failed"}`, task.status === "failed" ? "error" : "");
+    const verb = { done: "finished", failed: "failed", cancelled: "cancelled" }[task.status];
+    toast(`Task #${task.id} ${verb}`, task.status === "failed" ? "error" : "");
+  }
+}
+
+async function cancelTask(t, button) {
+  button.disabled = true;
+  try {
+    await api(`/api/tasks/${t.id}`, { method: "DELETE" });
+  } catch (err) {
+    button.disabled = false;
+    toast(err.message, "error");
+  }
+}
+
+// ---------- audit log ----------
+const OUTCOME_TEXT = { done: "Done", failed: "Failed", cancelled: "Cancelled", refused: "Refused" };
+const OUTCOME_CLASS = { done: "done", failed: "failed", cancelled: "cancelled", refused: "failed" };
+
+async function loadAudit() {
+  const res = await api("/api/audit?limit=50");
+  const panel = $("#audit-panel");
+  panel.hidden = !res.enabled;
+  if (!res.enabled) return;
+  const list = $("#audit-list");
+  list.replaceChildren();
+  $("#audit-count").textContent = res.entries.length;
+  if (!res.entries.length) {
+    list.append(el("li", { class: "empty", text: "No peer has run a task on this agent yet." }));
+  }
+  for (const e of res.entries) {
+    const access = e.access ? ACCESS_SHORT[e.access] ?? e.access : "no access";
+    list.append(el("li", { class: "audit-item" },
+      el("div", { class: "task-top" },
+        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${providerLabel(e.provider)}` }),
+        el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
+      el("div", { class: "task-meta", text: `${clock(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
+      e.error ? el("div", { class: e.outcome === "cancelled" ? "audit-note" : "audit-error", text: e.error }) : null));
   }
 }
 
@@ -536,6 +580,7 @@ async function loadState() {
   renderPeers();
   renderFeed();
   renderTasks();
+  await loadAudit();
 }
 
 let events = null;
@@ -547,6 +592,7 @@ function connectEvents() {
     const msg = JSON.parse(e.data);
     if (msg.type === "feed") appendFeed(msg.item);
     else if (msg.type === "task") upsertTask(msg.task);
+    else if (msg.type === "audit") loadAudit().catch((err) => toast(err.message, "error"));
     else if (msg.type === "peers") {
       state.peers = msg.peers;
       state.trusted = msg.trusted;

@@ -11,7 +11,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
-use crate::audit::{AuditEntry, AuditLog};
+use crate::audit::{AuditEntry, AuditLog, Outcome};
 use crate::llm::{Access, Executor, LlmTask, Provider};
 use crate::protocol::{ALPN, Message, write_message};
 use crate::trust::{TrustStore, TrustedPeer};
@@ -88,11 +88,19 @@ pub enum Event {
         task_id: u64,
         provider: Provider,
     },
-    /// A task received from a peer finished and its result was sent back.
+    /// A task received from a peer finished (done, failed or cancelled) and its
+    /// result was sent back.
     TaskCompleted {
         from: String,
         task_id: u64,
-        ok: bool,
+        outcome: Outcome,
+    },
+    /// A peer's task was not run (not allowed to delegate, over its hourly limit,
+    /// or a provider this agent doesn't serve).
+    TaskRefused {
+        from: String,
+        task_id: u64,
+        reason: String,
     },
 }
 
@@ -116,6 +124,29 @@ struct PeerHandle {
 struct PendingTask {
     conn_id: u64,
     reply: oneshot::Sender<Result<String, String>>,
+}
+
+/// Sends `TaskCancel` to the peer if a delegated task's future is dropped before
+/// the result arrives.
+struct CancelOnDrop<'a> {
+    inner: &'a Inner,
+    peer: EndpointId,
+    task_id: u64,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.inner.pending.lock().unwrap().remove(&self.task_id);
+        if let Some(handle) = self.inner.peers.lock().unwrap().get(&self.peer) {
+            let _ = handle.tx.send(Message::TaskCancel {
+                task_id: self.task_id,
+            });
+        }
+    }
 }
 
 struct Inner {
@@ -344,7 +375,16 @@ impl Agent {
                 bail!("connection to {} closed", handle.name);
             }
         }
-        match rx.await {
+        // Dropping this future (e.g. the user cancels) tells the peer to stop the task.
+        let mut guard = CancelOnDrop {
+            inner: &self.inner,
+            peer,
+            task_id,
+            armed: true,
+        };
+        let result = rx.await;
+        guard.armed = false;
+        match result {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(error)) => Err(anyhow!("{error}")),
             Err(_) => Err(anyhow!("delegated task was dropped")),
@@ -543,34 +583,64 @@ impl Inner {
         Ok(access)
     }
 
+    /// Runs a peer's task until it finishes or `cancel` fires (the peer sent
+    /// `TaskCancel` or disconnected), then audits it and reports the outcome.
     async fn serve_task(
         &self,
         id: &EndpointId,
         from: &str,
         task_id: u64,
         task: LlmTask,
+        cancel: oneshot::Receiver<()>,
     ) -> Result<String> {
         let clock = std::time::SystemTime::now();
         let mut granted = None;
+        let mut cancelled = false;
         let result = self
-            .run_peer_task(id, from, task_id, &task, &mut granted)
+            .run_peer_task(
+                id,
+                from,
+                task_id,
+                &task,
+                cancel,
+                &mut granted,
+                &mut cancelled,
+            )
             .await;
-        if let Some(audit) = &self.audit {
-            audit.record(&AuditEntry::new(
-                from, id, task_id, &task, granted, &result, clock,
-            ));
+        let mut entry = AuditEntry::new(from, id, task_id, &task, granted, &result, clock);
+        if cancelled {
+            entry.outcome = Outcome::Cancelled;
         }
+        if let Some(audit) = &self.audit {
+            audit.record(&entry);
+        }
+        let event = match (&result, entry.outcome) {
+            (Err(e), Outcome::Refused) => Event::TaskRefused {
+                from: from.to_owned(),
+                task_id,
+                reason: format!("{e:#}"),
+            },
+            (_, outcome) => Event::TaskCompleted {
+                from: from.to_owned(),
+                task_id,
+                outcome,
+            },
+        };
+        let _ = self.events.send(event);
         result
     }
 
     /// Checks and runs a peer's task; sets `granted` once it is admitted.
+    #[allow(clippy::too_many_arguments)]
     async fn run_peer_task(
         &self,
         id: &EndpointId,
         from: &str,
         task_id: u64,
         task: &LlmTask,
+        cancel: oneshot::Receiver<()>,
         granted: &mut Option<Access>,
+        cancelled: &mut bool,
     ) -> Result<String> {
         let executor = self
             .executor
@@ -586,14 +656,18 @@ impl Inner {
             task_id,
             provider: task.provider,
         });
-        let _slot = self.task_slots.acquire().await?;
-        let result = executor.execute(task, access).await;
-        let _ = self.events.send(Event::TaskCompleted {
-            from: from.to_owned(),
-            task_id,
-            ok: result.is_ok(),
-        });
-        result
+        let work = async {
+            let _slot = self.task_slots.acquire().await?;
+            executor.execute(task, access).await
+        };
+        // Dropping `work` stops the provider run (each backend aborts on drop).
+        tokio::select! {
+            result = work => result,
+            _ = cancel => {
+                *cancelled = true;
+                Err(anyhow!("task cancelled by {from}"))
+            }
+        }
     }
 }
 
@@ -674,6 +748,8 @@ async fn run_connection(
         }
     });
     let _ = tx.send(Message::Peers { addrs: known });
+    // Cancel senders of this peer's running tasks; dropping one cancels its task.
+    let running: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>> = Arc::default();
 
     let result = async {
         loop {
@@ -697,18 +773,29 @@ async fn run_connection(
                 }
                 Message::TaskRequest { task_id, task } => {
                     let (inner, tx, from) = (inner.clone(), tx.clone(), name.clone());
+                    let (cancel_tx, cancel_rx) = oneshot::channel();
+                    running.lock().unwrap().insert(task_id, cancel_tx);
+                    let running = running.clone();
                     tokio::spawn(async move {
-                        let (ok, output) =
-                            match inner.serve_task(&peer_id, &from, task_id, task).await {
-                                Ok(output) => (true, output),
-                                Err(e) => (false, format!("{e:#}")),
-                            };
+                        let result = inner
+                            .serve_task(&peer_id, &from, task_id, task, cancel_rx)
+                            .await;
+                        running.lock().unwrap().remove(&task_id);
+                        let (ok, output) = match result {
+                            Ok(output) => (true, output),
+                            Err(e) => (false, format!("{e:#}")),
+                        };
                         let _ = tx.send(Message::TaskResult {
                             task_id,
                             ok,
                             output,
                         });
                     });
+                }
+                Message::TaskCancel { task_id } => {
+                    if let Some(cancel) = running.lock().unwrap().remove(&task_id) {
+                        let _ = cancel.send(());
+                    }
                 }
                 Message::TaskResult {
                     task_id,
@@ -722,12 +809,15 @@ async fn run_connection(
                     );
                 }
                 Message::Hello { .. } => bail!("unexpected second hello"),
+                Message::Unknown => {}
             }
         }
         Ok(())
     }
     .await;
 
+    // Nobody is left to receive the results: stop the peer's running tasks.
+    running.lock().unwrap().clear();
     writer_task.abort();
     conn.close(0u32.into(), b"bye");
     inner.fail_pending(conn_id);

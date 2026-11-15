@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,19 +15,35 @@ use p2pagents::{
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
-/// Echoes the prompt; "hang" never completes, "fail" errors and "access" returns
-/// the access the agent granted the task.
-struct FakeExecutor(Vec<Provider>);
+/// Echoes the prompt; "hang" never completes (and counts in `dropped` when its run
+/// is dropped, i.e. stopped), "fail" errors and "access" returns the access the
+/// agent granted the task.
+struct FakeExecutor {
+    providers: Vec<Provider>,
+    dropped: Arc<AtomicUsize>,
+}
+
+/// Increments the counter when dropped.
+struct CountDrop(Arc<AtomicUsize>);
+
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[async_trait]
 impl Executor for FakeExecutor {
     fn providers(&self) -> Vec<Provider> {
-        self.0.clone()
+        self.providers.clone()
     }
 
     async fn execute(&self, task: &LlmTask, grant: Access) -> anyhow::Result<String> {
         match task.prompt.as_str() {
-            "hang" => std::future::pending().await,
+            "hang" => {
+                let _count = CountDrop(self.dropped.clone());
+                std::future::pending().await
+            }
             "fail" => anyhow::bail!("model error"),
             "access" => Ok(grant.to_string()),
             prompt => Ok(format!("{} did: {prompt}", task.provider)),
@@ -40,6 +57,8 @@ struct Node {
     trust: TrustStore,
     executor: Option<Arc<dyn Executor>>,
     audit: Option<Arc<AuditLog>>,
+    /// Hanging task runs that were stopped (see [`FakeExecutor`]).
+    stopped: Arc<AtomicUsize>,
 }
 
 impl Node {
@@ -50,6 +69,7 @@ impl Node {
             trust: TrustStore::default(),
             executor: None,
             audit: None,
+            stopped: Arc::default(),
         }
     }
 
@@ -58,7 +78,10 @@ impl Node {
     }
 
     fn serving(mut self, providers: Vec<Provider>) -> Self {
-        self.executor = Some(Arc::new(FakeExecutor(providers)));
+        self.executor = Some(Arc::new(FakeExecutor {
+            providers,
+            dropped: self.stopped.clone(),
+        }));
         self
     }
 
@@ -430,4 +453,124 @@ async fn delegated_task_fails_when_peer_disconnects() {
         .unwrap()
         .unwrap_err();
     assert!(err.to_string().contains("disconnected"), "{err}");
+}
+
+/// Waits until `count` hanging runs on the worker have been stopped.
+async fn wait_stopped(stopped: &AtomicUsize, count: usize) {
+    timeout(Duration::from_secs(10), async {
+        while stopped.load(Ordering::SeqCst) < count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "only {} of {count} runs stopped",
+            stopped.load(Ordering::SeqCst)
+        )
+    });
+}
+
+#[tokio::test]
+async fn cancelling_a_delegated_task_stops_it_on_the_worker() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    worker.audit = Some(Arc::new(AuditLog::new(audit_path.clone())));
+    let stopped = worker.stopped.clone();
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // Fill both task slots with hanging tasks, then cancel them from the requester.
+    let mut hanging = Vec::new();
+    for _ in 0..2 {
+        let (boss, id) = (boss.clone(), worker.id());
+        hanging.push(tokio::spawn(async move {
+            boss.delegate(id, LlmTask::new(Provider::Copilot, "hang"))
+                .await
+        }));
+        next_matching(&mut worker_events, |e| {
+            matches!(e, Event::TaskReceived { .. })
+        })
+        .await;
+    }
+    for task in &hanging {
+        task.abort();
+    }
+    wait_stopped(&stopped, 2).await;
+    for _ in 0..2 {
+        let completed = next_matching(&mut worker_events, |e| {
+            matches!(e, Event::TaskCompleted { .. })
+        })
+        .await;
+        assert!(
+            matches!(completed, Event::TaskCompleted { outcome: Outcome::Cancelled, ref from, .. } if from == "boss"),
+            "{completed:?}"
+        );
+    }
+
+    // The slots are free again: a new task runs right away.
+    let out = timeout(
+        Duration::from_secs(10),
+        boss.delegate(worker.id(), LlmTask::new(Provider::Copilot, "after")),
+    )
+    .await
+    .expect("slots were freed")
+    .unwrap();
+    assert_eq!(out, "copilot did: after");
+
+    let outcomes: Vec<Outcome> = AuditLog::read(&audit_path, 10)
+        .unwrap()
+        .iter()
+        .map(|e| e.outcome)
+        .collect();
+    assert_eq!(
+        outcomes,
+        [Outcome::Cancelled, Outcome::Cancelled, Outcome::Done]
+    );
+}
+
+#[tokio::test]
+async fn worker_cancels_tasks_when_the_requester_disconnects() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let stopped = worker.stopped.clone();
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let _pending = tokio::spawn({
+        let (boss, id) = (boss.clone(), worker.id());
+        async move {
+            boss.delegate(id, LlmTask::new(Provider::Copilot, "hang"))
+                .await
+        }
+    });
+    next_matching(&mut worker_events, |e| {
+        matches!(e, Event::TaskReceived { .. })
+    })
+    .await;
+    boss.shutdown().await;
+
+    wait_stopped(&stopped, 1).await;
+    let completed = next_matching(&mut worker_events, |e| {
+        matches!(e, Event::TaskCompleted { .. })
+    })
+    .await;
+    assert!(
+        matches!(
+            completed,
+            Event::TaskCompleted {
+                outcome: Outcome::Cancelled,
+                ..
+            }
+        ),
+        "{completed:?}"
+    );
 }

@@ -239,6 +239,13 @@ textarea { resize: vertical; }
 .status.running { background: var(--accent-soft); color: var(--accent); }
 .status.done { background: var(--success-soft); color: var(--success); }
 .status.failed { background: var(--danger-soft); color: var(--danger); }
+.status.cancelled { background: var(--warn-soft); color: var(--warn); }
+.audit-panel { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
+.audit-panel > p { margin: 0 0 8px; }
+.audit-item { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; background: var(--surface); }
+.audit-item .task-meta { margin-top: 4px; overflow-wrap: anywhere; }
+.audit-error { margin-top: 4px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
+.audit-note { margin-top: 4px; font-size: 12px; color: var(--muted); }
 .spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .task details { margin-top: 6px; }

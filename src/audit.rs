@@ -23,6 +23,8 @@ pub enum Outcome {
     Done,
     /// Ran and failed.
     Failed,
+    /// Stopped because the requesting peer cancelled it or disconnected.
+    Cancelled,
     /// Not run: not allowed to delegate, over the hourly limit, or provider not served.
     Refused,
 }

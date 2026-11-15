@@ -181,6 +181,30 @@
       "live": ["boss sees the files worker2's task changed"]
     },
     {
+      "id": "CAN-1",
+      "area": "delegation",
+      "claim": "A requester can cancel a delegated task: the worker stops the provider run, frees the task slot and audits it as cancelled. Tasks of a requester that disconnects are cancelled too.",
+      "tests": [
+        "agents::cancelling_a_delegated_task_stops_it_on_the_worker",
+        "agents::worker_cancels_tasks_when_the_requester_disconnects",
+        "lib::protocol::task_cancel_round_trips_and_unknown_messages_are_ignored",
+        "bridge::cancelling_a_request_tells_the_bridge_to_abort"
+      ],
+      "live": ["boss cancelled a running Copilot task on worker1", "worker1 audited the task as cancelled"]
+    },
+    {
+      "id": "CAN-2",
+      "area": "web ui",
+      "claim": "Running tasks can be cancelled from the web UI and show as cancelled.",
+      "tests": ["ui::ui_cancels_running_tasks_and_shows_the_audit_log"]
+    },
+    {
+      "id": "AUD-2",
+      "area": "web ui",
+      "claim": "The agent's owner sees the audit log in the web UI (token-protected, no prompt text).",
+      "tests": ["ui::ui_cancels_running_tasks_and_shows_the_audit_log"]
+    },
+    {
       "id": "BRG-1",
       "area": "providers",
       "claim": "The Claude/Codex bridge passes task fields, runs requests concurrently, and surfaces provider errors and bridge exits.",

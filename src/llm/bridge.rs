@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{Access, LlmTask, Provider};
 use crate::profile::INHERITED_CREDENTIAL_VARS;
@@ -40,9 +40,11 @@ struct Response {
 /// with the official Claude Agent SDK and OpenAI Codex SDK. Requests are
 /// multiplexed by id, so several tasks can run concurrently.
 pub struct Bridge {
-    stdin: tokio::sync::Mutex<ChildStdin>,
+    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     pending: Pending,
     next_id: AtomicU64,
+    /// Cancel lines, written by a background task (`Drop` can't await the stdin lock).
+    cancels: mpsc::UnboundedSender<Vec<u8>>,
     _child: Child,
 }
 
@@ -102,10 +104,23 @@ impl Bridge {
             reader_pending.lock().unwrap().take();
         });
 
+        let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (cancels, mut cancel_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let cancel_stdin = stdin.clone();
+        tokio::spawn(async move {
+            while let Some(line) = cancel_rx.recv().await {
+                let mut stdin = cancel_stdin.lock().await;
+                if stdin.write_all(&line).await.is_err() || stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
-            stdin: tokio::sync::Mutex::new(stdin),
+            stdin,
             pending,
             next_id: AtomicU64::new(1),
+            cancels,
             _child: child,
         })
     }
@@ -144,10 +159,42 @@ impl Bridge {
             return Err(e).context("writing to bridge");
         }
 
-        match rx.await {
+        let mut guard = CancelOnDrop {
+            bridge: self,
+            id,
+            armed: true,
+        };
+        let result = rx.await;
+        guard.armed = false;
+        match result {
             Ok(Ok(text)) => Ok(text),
             Ok(Err(error)) => Err(anyhow!(error)),
             Err(_) => Err(anyhow!("bridge process exited")),
+        }
+    }
+
+    /// Tells the bridge to abort request `id` (best effort; never blocks).
+    fn cancel(&self, id: u64) {
+        if let Some(p) = self.pending.lock().unwrap().as_mut() {
+            p.remove(&id);
+        }
+        let mut line = serde_json::to_vec(&serde_json::json!({ "cancel": id })).unwrap();
+        line.push(b'\n');
+        let _ = self.cancels.send(line);
+    }
+}
+
+/// Cancels a bridge request whose future was dropped before the reply arrived.
+struct CancelOnDrop<'a> {
+    bridge: &'a Bridge,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.bridge.cancel(self.id);
         }
     }
 }

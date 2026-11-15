@@ -38,6 +38,13 @@ pub enum Message {
         ok: bool,
         output: String,
     },
+    /// The requester no longer wants the result of `task_id`; the worker stops it.
+    TaskCancel {
+        task_id: u64,
+    },
+    /// A message type from a newer version; ignored so mixed versions keep working.
+    #[serde(other)]
+    Unknown,
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(writer: &mut W, msg: &Message) -> Result<()> {
@@ -75,6 +82,19 @@ mod tests {
             r#"{"type":"task_request","task_id":7,"task":{"provider":"codex","prompt":"fix it"}}"#
         );
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn task_cancel_round_trips_and_unknown_messages_are_ignored() {
+        let msg = Message::TaskCancel { task_id: 3 };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"type":"task_cancel","task_id":3}"#);
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+        let future = r#"{"type":"task_progress","task_id":3,"text":"half way"}"#;
+        assert_eq!(
+            serde_json::from_str::<Message>(future).unwrap(),
+            Message::Unknown
+        );
     }
 
     #[test]

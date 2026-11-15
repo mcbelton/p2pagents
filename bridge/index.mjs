@@ -160,7 +160,7 @@ export function claudeSandbox(access) {
   };
 }
 
-async function runClaude({ prompt, cwd, model, access }) {
+async function runClaude({ prompt, cwd, model, access }, abortController) {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
   const guard = async (input) => {
     const reason = toolRefusal(cwd, access, input.tool_name, input.tool_input);
@@ -186,6 +186,7 @@ async function runClaude({ prompt, cwd, model, access }) {
       disallowedTools: ["WebFetch", "WebSearch", "Task"],
       settingSources: [],
       sandbox: claudeSandbox(access),
+      abortController,
       // Checks every tool call's paths, including pre-approved tools.
       hooks: { PreToolUse: [{ hooks: [guard] }] },
     },
@@ -201,7 +202,7 @@ async function runClaude({ prompt, cwd, model, access }) {
 }
 
 let codex;
-async function runCodex({ prompt, cwd, model, access }) {
+async function runCodex({ prompt, cwd, model, access }, abortController) {
   const { Codex } = await import("@openai/codex-sdk");
   codex ??= new Codex({
     // Credentials live in this agent's own CODEX_HOME (set by p2pagents), never the OS keyring.
@@ -216,11 +217,13 @@ async function runCodex({ prompt, cwd, model, access }) {
     webSearchMode: "disabled",
     skipGitRepoCheck: true,
   });
-  const turn = await thread.run(prompt);
+  const turn = await thread.run(prompt, { signal: abortController.signal });
   return turn.finalResponse;
 }
 
 const PROVIDERS = { claude: runClaude, codex: runCodex };
+/** Abort controllers of running requests, by id. */
+const running = new Map();
 
 function reply(message) {
   process.stdout.write(JSON.stringify(message) + "\n");
@@ -234,14 +237,23 @@ async function handle(line) {
     console.error(`bridge: ignoring malformed line: ${line}`);
     return;
   }
+  if (request.cancel !== undefined) {
+    // {"cancel": id}: the agent dropped the task; stop the model run.
+    running.get(request.cancel)?.abort();
+    return;
+  }
   const { id, provider, access } = request;
+  const controller = new AbortController();
+  running.set(id, controller);
   try {
     const run = PROVIDERS[provider];
     if (!run) throw new Error(`unknown provider: ${provider}`);
     if (!CLAUDE_TOOLS[access]) throw new Error(`unknown access: ${access}`);
-    reply({ id, ok: true, text: await run(request) });
+    reply({ id, ok: true, text: await run(request, controller) });
   } catch (err) {
-    reply({ id, ok: false, error: String(err?.message ?? err) });
+    reply({ id, ok: false, error: controller.signal.aborted ? "cancelled" : String(err?.message ?? err) });
+  } finally {
+    running.delete(id);
   }
 }
 

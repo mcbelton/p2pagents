@@ -2,7 +2,7 @@
 //! 127.0.0.1 only, guarded by a random access token and a Host check, with live
 //! updates over Server-Sent Events.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,10 +22,12 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{Agent, Event, Network};
+use crate::audit::{AuditLog, Outcome};
 use crate::llm::{Access, Executor, LlmTask, Provider};
 use crate::profile::{Profile, validate_name};
 use crate::trust::{Ticket, TrustedPeer};
@@ -67,6 +69,8 @@ struct Shared {
     feed: Mutex<VecDeque<Value>>,
     next_feed_id: AtomicU64,
     tasks: Mutex<Vec<TaskView>>,
+    /// Abort handles of running tasks, for `DELETE /api/tasks/{id}`.
+    running: Mutex<HashMap<u64, AbortHandle>>,
     next_task_id: AtomicU64,
     tx: broadcast::Sender<String>,
 }
@@ -227,6 +231,7 @@ pub async fn start(
         feed: Mutex::new(VecDeque::new()),
         next_feed_id: AtomicU64::new(1),
         tasks: Mutex::new(Vec::new()),
+        running: Mutex::new(HashMap::new()),
         next_task_id: AtomicU64::new(1),
         tx,
     });
@@ -261,13 +266,30 @@ pub async fn start(
                     "task",
                     format!("{from} delegated task #{task_id} ({provider}) to this agent"),
                 ),
-                Event::TaskCompleted { from, task_id, ok } => pump.system(
-                    if ok { "task" } else { "warn" },
-                    format!(
-                        "Task #{task_id} from {from} {}",
-                        if ok { "finished" } else { "failed" }
-                    ),
-                ),
+                Event::TaskCompleted {
+                    from,
+                    task_id,
+                    outcome,
+                } => {
+                    let (level, verb) = match outcome {
+                        Outcome::Done => ("task", "finished"),
+                        Outcome::Cancelled => ("warn", "was cancelled"),
+                        _ => ("warn", "failed"),
+                    };
+                    pump.system(level, format!("Task #{task_id} from {from} {verb}"));
+                    pump.send(json!({ "type": "audit" }));
+                }
+                Event::TaskRefused {
+                    from,
+                    task_id,
+                    reason,
+                } => {
+                    pump.system(
+                        "warn",
+                        format!("Refused task #{task_id} from {from}: {reason}"),
+                    );
+                    pump.send(json!({ "type": "audit" }));
+                }
             }
         }
     });
@@ -277,6 +299,8 @@ pub async fn start(
         .route("/api/events", get(events_stream))
         .route("/api/chat", post(chat))
         .route("/api/tasks", post(create_task))
+        .route("/api/tasks/{id}", delete(cancel_task))
+        .route("/api/audit", get(audit))
         .route("/api/trust", post(allow_peer))
         .route("/api/trust/{id}", delete(remove_peer))
         .route_layer(middleware::from_fn_with_state(
@@ -477,11 +501,12 @@ async fn create_task(
     s.send(json!({ "type": "task", "task": view }));
 
     let shared = s.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let result = match route {
             Route::Local(executor) => executor.execute(&task, Access::Full).await,
             Route::Peer(peer, _) => shared.agent.delegate(peer, task).await,
         };
+        shared.running.lock().unwrap().remove(&id);
         shared.update_task(id, |t| {
             t.finished_ms = Some(now_ms());
             match result {
@@ -496,7 +521,59 @@ async fn create_task(
             }
         });
     });
+    {
+        // The task removes itself when done; insert only if it's still running.
+        let mut running = s.running.lock().unwrap();
+        if !handle.is_finished() {
+            running.insert(id, handle.abort_handle());
+        }
+    }
     Ok(Json(json!(view)))
+}
+
+/// Cancels a running task. Dropping a delegation tells the peer to stop it; a
+/// local task's provider run is aborted.
+async fn cancel_task(
+    State(s): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<Json<Value>, ApiError> {
+    let handle = s.running.lock().unwrap().remove(&id).ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "that task is not running" })),
+        )
+    })?;
+    handle.abort();
+    s.update_task(id, |t| {
+        t.finished_ms = Some(now_ms());
+        t.status = "cancelled";
+        t.output = Some("Cancelled by you.".into());
+    });
+    Ok(Json(json!({ "cancelled": id })))
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+/// The audit log of tasks peers ran on this agent, newest first.
+async fn audit(
+    State(s): State<AppState>,
+    Query(q): Query<AuditQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !s.info.serving {
+        return Ok(Json(json!({ "enabled": false, "entries": [] })));
+    }
+    let path = s.info.profile.audit_path();
+    let mut entries = AuditLog::read(&path, q.limit.unwrap_or(100).min(1000)).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("reading the audit log: {e}") })),
+        )
+    })?;
+    entries.reverse();
+    Ok(Json(json!({ "enabled": true, "entries": entries })))
 }
 
 #[derive(Deserialize)]

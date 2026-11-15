@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use p2pagents::audit::{AuditEntry, AuditLog};
 use p2pagents::ui::{self, UiInfo};
 use p2pagents::{
     Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, SecretKey,
@@ -21,6 +22,9 @@ impl Executor for Echo {
     }
 
     async fn execute(&self, task: &LlmTask, _grant: Access) -> anyhow::Result<String> {
+        if task.prompt == "hang" {
+            std::future::pending::<()>().await;
+        }
         Ok(format!("echo: {}", task.prompt))
     }
 }
@@ -160,6 +164,101 @@ async fn ui_requires_token_and_local_host_and_runs_tasks() {
     assert_eq!(done["status"], "done");
     assert_eq!(done["output"], "echo: hello");
     assert_eq!(done["target"], "this agent");
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn ui_cancels_running_tasks_and_shows_the_audit_log() {
+    let home = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "solo").unwrap();
+    // Two entries a peer left in this profile's audit log.
+    let log = AuditLog::new(profile.audit_path());
+    let peer = SecretKey::generate().public();
+    let task = LlmTask::new(Provider::Copilot, "private prompt text");
+    let started = std::time::SystemTime::now();
+    log.record(&AuditEntry::new(
+        "bob",
+        &peer,
+        1,
+        &task,
+        Some(Access::ReadOnly),
+        &Ok("x".into()),
+        started,
+    ));
+    log.record(&AuditEntry::new(
+        "bob",
+        &peer,
+        2,
+        &task,
+        None,
+        &Err(anyhow::anyhow!("not allowed")),
+        started,
+    ));
+
+    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let executor: Arc<dyn Executor> = Arc::new(Echo);
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile,
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: vec![Provider::Copilot],
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        Some(executor),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+
+    // Cancel a running task.
+    let hang = r#"{"provider":"copilot","prompt":"hang","target":"local"}"#;
+    let created = request(port, "POST", "/api/tasks", &host, Some(token), Some(hang)).await;
+    assert_eq!(created.status, 200, "{}", created.body);
+    let id = created.json()["id"].as_u64().unwrap();
+    let path = format!("/api/tasks/{id}");
+    assert_eq!(
+        request(port, "DELETE", &path, &host, None, None)
+            .await
+            .status,
+        401
+    );
+    let cancelled = request(port, "DELETE", &path, &host, Some(token), None).await;
+    assert_eq!(cancelled.status, 200, "{}", cancelled.body);
+    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(state["tasks"][0]["status"], "cancelled");
+    let again = request(port, "DELETE", &path, &host, Some(token), None).await;
+    assert_eq!(again.status, 409, "a finished task can't be cancelled");
+
+    // The audit log, newest first, only with the token, never with prompts.
+    assert_eq!(
+        request(port, "GET", "/api/audit", &host, None, None)
+            .await
+            .status,
+        401
+    );
+    let audit = request(port, "GET", "/api/audit", &host, Some(token), None).await;
+    assert_eq!(audit.status, 200);
+    let body = audit.json();
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["entries"][0]["outcome"], "refused");
+    assert_eq!(body["entries"][1]["outcome"], "done");
+    assert!(!audit.body.contains("private prompt text"));
 
     agent.shutdown().await;
 }
