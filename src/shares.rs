@@ -5,6 +5,7 @@
 //! Other folders (e.g. a repository for coding tasks) are shared explicitly with
 //! `p2pagents share add`, each with the most access any peer's task may get there.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -23,14 +24,42 @@ pub struct Share {
     pub path: PathBuf,
     /// Most a peer's task may do here, whatever the peer was granted.
     pub max_access: Access,
+    /// Owner-defined commands (name -> shell command) a task may ask the runtime to
+    /// run after the model, as evidence (e.g. `test` -> `cargo test`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checks: BTreeMap<String, String>,
+    /// Run each editing task in its own git worktree and branch, and commit its work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktrees: bool,
 }
 
-/// What a peer learns about a share: its name and the access it would get.
-/// Local paths are never sent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a peer learns about a share: its name, the access it would get and the
+/// names of its checks. Local paths and commands are never sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareInfo {
     pub name: String,
     pub access: Access,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktrees: bool,
+}
+
+/// Parses `name=command` check definitions.
+pub fn parse_checks(defs: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut checks = BTreeMap::new();
+    for def in defs {
+        let (name, command) = def
+            .split_once('=')
+            .with_context(|| format!("check {def:?} must look like name=command"))?;
+        let (name, command) = (name.trim(), command.trim());
+        validate_name(name).with_context(|| format!("invalid check name {name:?}"))?;
+        if command.is_empty() {
+            bail!("check '{name}' has no command");
+        }
+        checks.insert(name.to_owned(), command.to_owned());
+    }
+    Ok(checks)
 }
 
 /// The access a peer's task gets in a share.
@@ -52,6 +81,8 @@ impl ShareStore {
                 name: DATA_SHARE.into(),
                 path: data,
                 max_access: Access::ReadOnly,
+                checks: BTreeMap::new(),
+                worktrees: false,
             }],
         }
     }
@@ -90,6 +121,18 @@ impl ShareStore {
 
     /// Shares `path` (an existing folder) as `name`, replacing a share of that name.
     pub fn add(&mut self, name: &str, path: &Path, max_access: Access) -> Result<&Share> {
+        self.add_with(name, path, max_access, BTreeMap::new(), false)
+    }
+
+    /// [`ShareStore::add`] with checks and per-task git worktrees (needs a git repository).
+    pub fn add_with(
+        &mut self,
+        name: &str,
+        path: &Path,
+        max_access: Access,
+        checks: BTreeMap<String, String>,
+        worktrees: bool,
+    ) -> Result<&Share> {
         validate_name(name).context("invalid share name")?;
         if name == DATA_SHARE {
             bail!("'{DATA_SHARE}' is the built-in share (the profile's .p2pdata folder)");
@@ -100,11 +143,19 @@ impl ShareStore {
             bail!("{} is not a folder", path.display());
         }
         let path = plain_path(path);
+        if worktrees && !path.join(".git").exists() {
+            bail!(
+                "--worktrees needs a git repository; {} has no .git",
+                path.display()
+            );
+        }
         self.shares.retain(|s| s.name != name);
         self.shares.push(Share {
             name: name.to_owned(),
             path,
             max_access,
+            checks,
+            worktrees,
         });
         Ok(self.shares.last().expect("just pushed"))
     }
@@ -130,6 +181,8 @@ impl ShareStore {
             .map(|s| ShareInfo {
                 name: s.name.clone(),
                 access: effective_access(grant, s.max_access),
+                checks: s.checks.keys().cloned().collect(),
+                worktrees: s.worktrees,
             })
             .collect()
     }
@@ -160,6 +213,9 @@ mod tests {
                 .ends_with(Path::new(".p2pdata").join("worker"))
         );
         assert!(!worker.data_folder().starts_with(&worker.dir));
+        // Providers deny tasks the profiles folder, so task worktrees live outside it.
+        assert!(!worker.worktrees_dir().starts_with(&root));
+        assert_ne!(worker.worktrees_dir(), other.worktrees_dir());
 
         let store = ShareStore::load(&dir.path().join("none.json"), worker.data_folder()).unwrap();
         assert_eq!(store.shares.len(), 1);
@@ -229,11 +285,13 @@ mod tests {
             [
                 ShareInfo {
                     name: DATA_SHARE.into(),
-                    access: Access::ReadOnly
+                    access: Access::ReadOnly,
+                    ..Default::default()
                 },
                 ShareInfo {
                     name: "repo".into(),
-                    access: Access::WorkspaceWrite
+                    access: Access::WorkspaceWrite,
+                    ..Default::default()
                 },
             ]
         );

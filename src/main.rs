@@ -24,6 +24,9 @@ commands:
   /tasks                                list your running tasks
   /cancel <n>                           cancel your running task n (the peer stops it too)
   /plan <file>                          run a plan: steps on peers (@name) or squads (#squad), in dependency order
+  /runs                                 list saved evidence runs (p2pagents runs show <id> for a report)
+  /approvals                            list approval requests waiting for you
+  /approve <n> [note], /reject <n> <why>  answer approval request n (signed with your key)
   /squads                               list your squads and which members are online
   /peers                                list connected peers and the providers they serve
   /ticket                               print this agent's ticket (give it to peers)
@@ -62,6 +65,9 @@ enum Command {
     /// Group peers into squads that plans can assign steps to.
     #[command(subcommand)]
     Squad(SquadCommand),
+    /// Evidence runs: saved plan runs with a verdict per claim and signed evidence.
+    #[command(subcommand)]
+    Runs(RunsCommand),
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
@@ -156,14 +162,47 @@ In a plan, `#qa` runs a step on the least busy online member of squad qa.")]
 }
 
 #[derive(Subcommand)]
+enum RunsCommand {
+    /// List saved runs, newest first.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Print a run's evidence report (Markdown).
+    Show {
+        id: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Re-check every signature in a run, from its run.json alone; exits 1 if any fails.
+    #[command(after_help = "\
+Works on a run folder copied from someone else too:  p2pagents runs verify --dir <folder>")]
+    Verify {
+        /// Run id (in the profile's runs folder).
+        #[arg(required_unless_present = "dir")]
+        id: Option<String>,
+        /// A run folder (with run.json) from anywhere.
+        #[arg(long, conflicts_with = "id")]
+        dir: Option<PathBuf>,
+        /// Profile whose runs folder holds the run (with a run id).
+        #[arg(long = "profile", required_unless_present = "dir")]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ShareCommand {
     /// Share a folder with peers (grant it per peer with `peers allow --share`).
     #[command(after_help = "\
 examples:
   p2pagents share add myrepo D:\\src\\myrepo --access workspace-write --profile alice
+  p2pagents share add app D:\\src\\app --access full --worktrees --check test=\"cargo test\" --check lint=\"cargo clippy -- -D warnings\"
   p2pagents peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
 Every profile also shares its own .p2pdata folder as 'data' (read-only); peers'
-tasks run there unless they name another folder shared with them.")]
+tasks run there unless they name another folder shared with them.
+Checks are commands you define; a peer's task can ask your agent to run them after the
+model (verify=test in a plan) as signed evidence. They run your folder's code with your
+rights, so only peers with full access may request them.")]
     Add {
         /// Name peers use for the folder (e.g. `/delegate copilot@alice:myrepo ...`).
         name: String,
@@ -172,6 +211,13 @@ tasks run there unless they name another folder shared with them.")]
         /// Most any peer's task may do in this folder.
         #[arg(long, value_enum, default_value_t = Access::ReadOnly)]
         access: Access,
+        /// A check peers' tasks may ask for: NAME=COMMAND (repeatable).
+        #[arg(long = "check", value_name = "NAME=COMMAND")]
+        checks: Vec<String>,
+        /// Run each editing task in its own git worktree and branch, and commit its work
+        /// (the folder must be a git repository).
+        #[arg(long)]
+        worktrees: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -388,6 +434,7 @@ async fn main() -> Result<()> {
         Some(Command::Share(command)) => run_share(command),
         Some(Command::Worker(command)) => run_worker(command),
         Some(Command::Squad(command)) => run_squad(command),
+        Some(Command::Runs(command)) => run_runs(command),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
             let name = profile.name.clone();
@@ -537,6 +584,95 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
     Ok(())
 }
 
+/// `; checks: test, lint; worktrees` for a share listing.
+fn share_extras(share: &p2pagents::shares::Share) -> String {
+    let mut extras = String::new();
+    if !share.checks.is_empty() {
+        extras += &format!(
+            "; checks: {}",
+            share
+                .checks
+                .iter()
+                .map(|(name, cmd)| format!("{name} ({cmd})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if share.worktrees {
+        extras += "; a git worktree per editing task";
+    }
+    extras
+}
+
+fn run_runs(command: RunsCommand) -> Result<()> {
+    use p2pagents::runs::{RunRecord, utc};
+    match command {
+        RunsCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let runs = RunRecord::list(&profile.runs_dir())?;
+            if runs.is_empty() {
+                println!(
+                    "profile '{}' has no evidence runs yet (run a plan)",
+                    profile.name
+                );
+            }
+            for run in runs {
+                println!(
+                    "  {}  {} UTC  {}  {}/{} claims proven, {}/{} steps done",
+                    run.id,
+                    utc(run.started_unix),
+                    if run.passed { "PASS" } else { "FAIL" },
+                    run.proven,
+                    run.claims,
+                    run.steps_done,
+                    run.steps
+                );
+            }
+        }
+        RunsCommand::Show { id, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            print!(
+                "{}",
+                RunRecord::load(&profile.runs_dir(), &id)?.render_markdown()
+            );
+        }
+        RunsCommand::Verify { id, dir, profile } => {
+            let dir = match (dir, id, profile) {
+                (Some(dir), _, _) => dir,
+                (None, Some(id), Some(profile)) => Profile::open(&profile)?.runs_dir().join(id),
+                _ => unreachable!("clap requires a run id with --profile, or --dir"),
+            };
+            let path = dir.join("run.json");
+            let run: RunRecord = serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            )
+            .with_context(|| format!("parsing {}", path.display()))?;
+            let mut failed = false;
+            let (run, checks) = run.reverified(Some(&dir));
+            for (step, result) in &checks {
+                match result {
+                    Ok(text) => println!("  ok      {step}: {text}"),
+                    Err(e) => {
+                        failed = true;
+                        println!("  FAILED  {step}: {e:#}");
+                    }
+                }
+            }
+            println!("run {}: {}", run.id, run.verdict_line());
+            if failed {
+                bail!("some evidence doesn't verify");
+            }
+            println!("all {} signed records verify", checks.len());
+            println!("signers (check these keys are the people you expect):");
+            for (name, id) in &run.peer_ids {
+                println!("  {name:<12} {id}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_squad(command: SquadCommand) -> Result<()> {
     match command {
         SquadCommand::Create {
@@ -588,16 +724,22 @@ fn run_share(command: ShareCommand) -> Result<()> {
             name,
             path,
             access,
+            checks,
+            worktrees,
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
             let mut shares = profile.shares()?;
-            let share = shares.add(&name, &path, access)?.clone();
+            let checks = p2pagents::shares::parse_checks(&checks)?;
+            let share = shares
+                .add_with(&name, &path, access, checks, worktrees)?
+                .clone();
             shares.save(&profile.shares_path())?;
             println!(
-                "profile '{}': sharing {} as '{name}' (at most {access}). Grant it to a peer with: p2pagents peers allow <peer> --profile {} --delegate --share data,{name}",
+                "profile '{}': sharing {} as '{name}' (at most {access}){}. Grant it to a peer with: p2pagents peers allow <peer> --profile {} --delegate --share data,{name}",
                 profile.name,
                 share.path.display(),
+                share_extras(&share),
                 profile.name
             );
         }
@@ -605,10 +747,11 @@ fn run_share(command: ShareCommand) -> Result<()> {
             let profile = Profile::open(&profile.name)?;
             for share in profile.shares()?.shares {
                 println!(
-                    "  {:<12} at most {:<16} {}",
+                    "  {:<12} at most {:<16} {}{}",
                     share.name,
                     share.max_access.to_string(),
-                    share.path.display()
+                    share.path.display(),
+                    share_extras(&share)
                 );
             }
         }
@@ -851,6 +994,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.trust = profile.trust()?;
         config.owner = profile.config.owner.clone();
         config.role = profile.config.role.clone();
+        config.worktrees_dir = profile.worktrees_dir();
         // Known for granting folders to peers; they're offered only while serving.
         config.shares = shares.clone();
         if args.serve {
@@ -910,10 +1054,11 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             println!("folders shared with peers (each peer sees only those you granted it):");
             for share in &shares.shares {
                 println!(
-                    "  {:<12} at most {:<16} {}",
+                    "  {:<12} at most {:<16} {}{}",
                     share.name,
                     share.max_access.to_string(),
-                    share.path.display()
+                    share.path.display(),
+                    share_extras(share)
                 );
             }
         }
@@ -989,6 +1134,10 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     task_id,
                     reason,
                 } => println!("> task #{task_id} from {from} refused: {reason}"),
+                Event::ApprovalRequested { id, from, title } => println!(
+                    "? {from} asks you to approve: {title}\n  see it with /approvals, then /approve {id} [note] or /reject {id} <why>"
+                ),
+                Event::ApprovalClosed { .. } => {}
             }
         }
     });
@@ -1076,25 +1225,89 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             }
             "/plan" => {
                 let file = rest.trim();
-                let plan = std::fs::read_to_string(file)
-                    .with_context(|| format!("reading plan file {file:?}"))
-                    .and_then(|text| Plan::parse(&text));
-                match plan {
+                let text = std::fs::read_to_string(file)
+                    .with_context(|| format!("reading plan file {file:?}"));
+                match text.and_then(|text| Plan::parse(&text).map(|plan| (text, plan))) {
                     Err(e) => eprintln!("{e:#}"),
-                    Ok(plan) => {
+                    Ok((text, plan)) => {
                         let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                         let agent = agent.clone();
-                        let steps = plan.steps.len();
-                        let n = tasks.spawn(format!("plan {file} ({steps} steps)"), async move {
-                            let states = run_plan(&agent, &squads, &plan, print_step).await;
-                            let done = states
-                                .values()
-                                .filter(|s| matches!(s, StepState::Done { .. }))
-                                .count();
-                            println!("=== plan finished: {done}/{steps} steps done ===");
-                        });
+                        let runs_dir = profile.runs_dir();
+                        let n = tasks.spawn(
+                            format!("plan {file} ({} steps)", plan.steps.len()),
+                            async move {
+                                let started = p2pagents::runs::unix_now();
+                                let states = run_plan(&agent, &squads, &plan, print_step).await;
+                                let mut run = p2pagents::runs::RunRecord::new(
+                                    agent.name(),
+                                    &agent.id().to_string(),
+                                    &text,
+                                    &plan,
+                                    &states,
+                                    started,
+                                );
+                                run.peer_ids = p2pagents::runs::peer_ids(&agent);
+                                println!("=== plan finished: {} ===", run.verdict_line());
+                                for claim in run.claim_results() {
+                                    println!(
+                                        "  {} {}: {}",
+                                        claim.verdict.label(),
+                                        claim.claim.id,
+                                        claim.claim.text
+                                    );
+                                }
+                                match run.save(&runs_dir) {
+                                    Ok(report) => println!("  report: {}", report.display()),
+                                    Err(e) => eprintln!("could not save the run: {e:#}"),
+                                }
+                            },
+                        );
                         println!("running plan {file} as task {n} (/cancel {n} to stop it)");
                     }
+                }
+            }
+            "/runs" => match p2pagents::runs::RunRecord::list(&profile.runs_dir()) {
+                Ok(runs) if runs.is_empty() => println!("no evidence runs yet"),
+                Ok(runs) => {
+                    for run in runs.iter().take(10) {
+                        println!(
+                            "  {}  {}  {}/{} claims proven",
+                            run.id,
+                            if run.passed { "PASS" } else { "FAIL" },
+                            run.proven,
+                            run.claims
+                        );
+                    }
+                }
+                Err(e) => eprintln!("{e:#}"),
+            },
+            "/approvals" => {
+                let open = agent.approvals();
+                if open.is_empty() {
+                    println!("no approval requests");
+                }
+                for a in open {
+                    println!(
+                        "=== #{} from {}: {} ===\n{}\n=== /approve {} [note] or /reject {} <why> ===",
+                        a.id, a.from, a.title, a.text, a.id, a.id
+                    );
+                }
+            }
+            "/approve" | "/reject" => {
+                let (n, note) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+                let approved = command == "/approve";
+                match n.parse::<u64>() {
+                    Err(_) => eprintln!("usage: {command} <n> [note] (see /approvals)"),
+                    Ok(_) if !approved && note.trim().is_empty() => {
+                        eprintln!("say why: /reject {n} <why>")
+                    }
+                    Ok(id) => match agent.answer_approval(id, approved, note).await {
+                        Ok(()) => println!(
+                            "{} request {id}",
+                            if approved { "approved" } else { "rejected" }
+                        ),
+                        Err(e) => eprintln!("{e:#}"),
+                    },
                 }
             }
             "/ask" => match (parse_task(rest), &executor) {
@@ -1237,16 +1450,46 @@ fn print_step(id: &str, state: &StepState) {
     match state {
         StepState::Waiting => println!("  step {id}: waiting"),
         StepState::Running { peer } => println!("  step {id}: running on {peer}"),
-        StepState::Done { peer, output } => {
-            println!("=== step {id} on {peer} ===\n{output}\n=== end ===")
+        StepState::Done {
+            peer,
+            output,
+            evidence,
+            verified,
+            ..
+        } => {
+            println!("=== step {id} on {peer} ===\n{output}\n=== end ===");
+            print_evidence(evidence.as_ref(), *verified);
         }
-        StepState::Failed { peer, error } => println!(
-            "=== step {id}{} failed: {error}",
-            peer.as_deref()
-                .map(|p| format!(" on {p}"))
-                .unwrap_or_default()
-        ),
+        StepState::Failed {
+            peer,
+            error,
+            evidence,
+            verified,
+        } => {
+            println!(
+                "=== step {id}{} failed: {error}",
+                peer.as_deref()
+                    .map(|p| format!(" on {p}"))
+                    .unwrap_or_default()
+            );
+            print_evidence(evidence.as_ref(), *verified);
+        }
         StepState::Skipped { reason } => println!("  step {id}: skipped ({reason})"),
+    }
+}
+
+fn print_evidence(evidence: Option<&p2pagents::evidence::Evidence>, verified: bool) {
+    if let Some(e) = evidence {
+        println!(
+            "  evidence: signed by {} ({}) {}",
+            e.signer,
+            e.signer_id.chars().take(10).collect::<String>(),
+            if verified {
+                "✓ verified"
+            } else {
+                "✗ NOT valid"
+            }
+        );
     }
 }
 
@@ -1265,6 +1508,21 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn runs_verify_takes_a_folder_alone_or_an_id_with_a_profile() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["p2pagents"], args].concat()).is_ok();
+        assert!(parse(&["runs", "verify", "--dir", "some/run"]));
+        assert!(parse(&[
+            "runs",
+            "verify",
+            "20261115-1",
+            "--profile",
+            "boss"
+        ]));
+        assert!(!parse(&["runs", "verify", "20261115-1"]));
+        assert!(!parse(&["runs", "verify"]));
     }
 
     #[test]

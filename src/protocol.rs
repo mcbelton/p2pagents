@@ -3,6 +3,7 @@ use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::evidence::Evidence;
 use crate::llm::{LlmTask, Provider};
 use crate::shares::ShareInfo;
 
@@ -47,6 +48,19 @@ pub enum Message {
         task_id: u64,
         ok: bool,
         output: String,
+        /// What the worker's runtime observed, signed with its key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<Box<Evidence>>,
+        /// The task's commit as a patch (folders shared with `--worktrees`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        patch: Option<String>,
+    },
+    /// Asks a team member to approve a plan step; answered with `TaskResult`
+    /// (`ok` = approved) and withdrawn with `TaskCancel`.
+    ApprovalRequest {
+        task_id: u64,
+        title: String,
+        text: String,
     },
     /// The requester no longer wants the result of `task_id`; the worker stops it.
     TaskCancel {

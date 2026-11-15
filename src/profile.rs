@@ -388,21 +388,37 @@ impl Profile {
         self.dir.join("squads.json")
     }
 
+    /// Saved evidence runs (plan runs with their reports).
+    pub fn runs_dir(&self) -> PathBuf {
+        self.dir.join("runs")
+    }
+
+    /// Where per-task git worktrees are created: outside the profiles folder (like
+    /// the data folder), since providers deny tasks access to profiles.
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.outside_base().join(".p2pworktrees").join(&self.name)
+    }
+
     /// The profile's `.p2pdata` folder: the built-in read-only `data` share.
     /// `~/.p2pdata/<profile>`, or `$P2PAGENTS_HOME/.p2pdata/<profile>`.
     pub fn data_folder(&self) -> PathBuf {
+        self.outside_base().join(".p2pdata").join(&self.name)
+    }
+
+    /// Next to the profiles folder, never inside it: `~/.p2pagents` -> `~`, so peers'
+    /// tasks can work there while the credential-holding profiles stay denied.
+    fn outside_base(&self) -> &Path {
         let root = self
             .dir
             .parent()
             .and_then(Path::parent)
             .unwrap_or(&self.dir);
         // ~/.p2pagents -> ~/.p2pdata; a custom P2PAGENTS_HOME keeps it inside.
-        let base = if root.file_name().is_some_and(|n| n == ".p2pagents") {
+        if root.file_name().is_some_and(|n| n == ".p2pagents") {
             root.parent().unwrap_or(root)
         } else {
             root
-        };
-        base.join(".p2pdata").join(&self.name)
+        }
     }
 
     /// The folders this profile shares (always including `data`).

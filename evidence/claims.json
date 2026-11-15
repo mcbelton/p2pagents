@@ -288,6 +288,64 @@
       "tests": ["ui::ui_runs_plans_and_shows_squads"]
     },
     {
+      "id": "EDD-1",
+      "area": "evidence",
+      "claim": "A task can ask the worker's runtime (not the model) to run the folder owner's checks after the model; the result carries their exit codes and output, failures are retried with the failure output, timed-out or cancelled checks are killed with everything they started, and only peers with full access may request them (peers see check names, never commands).",
+      "tests": [
+        "lib::evidence::checks_report_exit_codes_and_output",
+        "lib::evidence::checks_time_out",
+        "agents::checks_run_by_the_worker_prove_results_and_failures_are_retried"
+      ],
+      "live": ["worker's runtime ran the owner's check after the model"]
+    },
+    {
+      "id": "EDD-2",
+      "area": "evidence",
+      "claim": "Every delegated result carries evidence signed with the worker's identity key and bound to the exact output; the requester trusts it only if it is signed by the peer it sent the task to, and any change to the record or output is detected.",
+      "tests": [
+        "lib::evidence::signed_evidence_verifies_and_detects_tampering",
+        "agents::checks_run_by_the_worker_prove_results_and_failures_are_retried"
+      ],
+      "live": ["boss verified the worker's signature on the evidence"]
+    },
+    {
+      "id": "EDD-3",
+      "area": "evidence",
+      "claim": "In a folder shared with --worktrees, each editing task works on its own git branch with hooks disabled; its work is committed and returned as a patch whose hash is signed, the shared folder itself stays untouched, and another peer can apply the patch in its own worktree to check the work independently; a patch can't create symlinks or files the model itself may not write.",
+      "tests": [
+        "lib::worktree::tasks_commit_on_their_own_branch_and_patches_apply_elsewhere",
+        "lib::shares::data_folder_is_built_in_read_only_and_per_profile",
+        "agents::worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch"
+      ],
+      "live": ["worker committed the task on its own branch and returned the patch"]
+    },
+    {
+      "id": "EDD-4",
+      "area": "evidence",
+      "claim": "Plans declare claims; a claim is proven only by finished steps backed by verified runtime evidence (passing checks or a sign-off), never by a model's word, failed checks or a bad signature. Every plan run is saved with a report, and re-verifying it from run.json alone checks each signature, that each record was requested by the run's boss, signed by the step's peer, produced during the run and not reused, and recomputes the verdict from that.",
+      "tests": [
+        "lib::plan::parses_claims_checks_patches_and_approvals",
+        "lib::runs::claims_are_proven_only_by_verified_runtime_evidence",
+        "lib::runs::runs_are_saved_listed_reported_and_reverified",
+        "lib::runs::utc_formats_dates",
+        "agents::plans_prove_claims_with_checks_and_a_team_members_approval"
+      ],
+      "live": ["boss's evidence run proved its claims", "the saved run's signatures re-verify offline"]
+    },
+    {
+      "id": "EDD-5",
+      "area": "evidence",
+      "claim": "A plan step can ask a team member (or the boss's own user) to approve: the request shows the work it is about, the answer is signed with the approver's key, a rejection fails its claim, and cancelling the plan withdraws the request.",
+      "tests": ["agents::plans_prove_claims_with_checks_and_a_team_members_approval"],
+      "live": ["teammate's signed approval came back"]
+    },
+    {
+      "id": "EDD-6",
+      "area": "web ui",
+      "claim": "The web UI marks results that carry valid signed evidence, lists evidence runs with their report and a fresh signature check, and lets the user answer approval requests (a rejection needs a reason).",
+      "tests": ["ui::ui_runs_plans_and_shows_squads"]
+    },
+    {
       "id": "BRG-1",
       "area": "providers",
       "claim": "The Claude/Codex bridge passes task fields, runs requests concurrently, and surfaces provider errors and bridge exits.",
@@ -301,7 +359,7 @@
       "id": "CLI-1",
       "area": "cli",
       "claim": "The command line definition is valid (no conflicting flags or subcommands).",
-      "tests": ["bin::cli_definition_is_valid"]
+      "tests": ["bin::cli_definition_is_valid", "bin::runs_verify_takes_a_folder_alone_or_an_id_with_a_profile"]
     }
   ]
 }

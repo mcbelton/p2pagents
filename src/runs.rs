@@ -1,0 +1,744 @@
+//! Evidence runs: the durable record of a plan run. Each run is saved in the boss's
+//! profile (`runs/<id>/run.json`, a Markdown `report.md` and the patch of each
+//! step that committed work) with a verdict for every claim:
+//!
+//! - **proven**: every step that claims it finished, each backed by runtime
+//!   evidence signed by the peer that did the work: checks that all passed, or a
+//!   team member's approval;
+//! - **failed**: a step that claims it failed or was skipped;
+//! - **unverified**: it rests on a model's word only (no checks or approval), or
+//!   no step claims it;
+//! - **pending**: the run stopped before its steps finished.
+//!
+//! The run passes only if every claim is proven. Anyone with `run.json` can
+//! re-check every signature (`p2pagents runs verify`), without trusting the boss.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::evidence::{Evidence, EvidenceKind, sha256_hex};
+use crate::plan::{ClaimDef, Plan, Step, StepState};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Proven,
+    Failed,
+    Unverified,
+    Pending,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Proven => "✅ proven",
+            Verdict::Failed => "❌ failed",
+            Verdict::Unverified => "⚠️ unverified",
+            Verdict::Pending => "⏳ pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRecord {
+    pub step: Step,
+    pub state: StepState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub id: String,
+    /// The agent that ran the plan, and its endpoint id.
+    pub boss: String,
+    pub boss_id: String,
+    pub started_unix: u64,
+    pub finished_unix: u64,
+    /// The plan as written.
+    pub plan_text: String,
+    pub claims: Vec<ClaimDef>,
+    pub steps: Vec<StepRecord>,
+    /// Endpoint id of each peer (by the boss's allowlist name; `you` is the boss) the
+    /// steps ran on, so re-verification knows whose key must have signed each step.
+    #[serde(default)]
+    pub peer_ids: BTreeMap<String, String>,
+}
+
+/// How far (seconds) evidence timestamps may lie outside the run, for clock skew.
+const CLOCK_SKEW: u64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimResult {
+    pub claim: ClaimDef,
+    pub verdict: Verdict,
+    pub steps: Vec<String>,
+}
+
+/// Short summary of a saved run, for listings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunSummary {
+    pub id: String,
+    pub started_unix: u64,
+    pub passed: bool,
+    pub proven: usize,
+    pub claims: usize,
+    pub steps: usize,
+    pub steps_done: usize,
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The endpoint id of every peer a plan can name (`you` is the agent itself), for
+/// [`RunRecord::peer_ids`].
+pub fn peer_ids(agent: &crate::Agent) -> BTreeMap<String, String> {
+    let mut ids: BTreeMap<String, String> = agent
+        .trusted()
+        .peers
+        .iter()
+        .map(|p| (p.name.clone(), p.id.to_string()))
+        .collect();
+    ids.insert("you".into(), agent.id().to_string());
+    ids
+}
+
+/// `YYYY-MM-DD HH:MM:SS` (UTC) for `secs` since the Unix epoch.
+pub fn utc(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// What a finished step proves on its own.
+fn step_verdict(record: &StepRecord) -> Verdict {
+    match &record.state {
+        StepState::Waiting | StepState::Running { .. } => Verdict::Pending,
+        StepState::Failed { .. } | StepState::Skipped { .. } => Verdict::Failed,
+        StepState::Done {
+            evidence, verified, ..
+        } => match evidence {
+            Some(e)
+                if *verified && e.kind == EvidenceKind::Approval && e.approved == Some(true) =>
+            {
+                Verdict::Proven
+            }
+            Some(e) if *verified && !e.checks.is_empty() && e.checks_passed() => Verdict::Proven,
+            _ => Verdict::Unverified,
+        },
+    }
+}
+
+impl RunRecord {
+    pub fn new(
+        boss: &str,
+        boss_id: &str,
+        plan_text: &str,
+        plan: &Plan,
+        states: &std::collections::BTreeMap<String, StepState>,
+        started_unix: u64,
+    ) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let rand = data_encoding::HEXLOWER.encode(&iroh::SecretKey::generate().to_bytes()[..1]);
+        let stamp: String = utc(now / 1000)
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        Self {
+            // Sorts by when the run was recorded, to the millisecond.
+            id: format!("{}-{}-{:03}{rand}", &stamp[..8], &stamp[8..], now % 1000),
+            boss: boss.to_owned(),
+            boss_id: boss_id.to_owned(),
+            started_unix,
+            finished_unix: now / 1000,
+            plan_text: plan_text.to_owned(),
+            claims: plan.claims.clone(),
+            peer_ids: BTreeMap::new(),
+            steps: plan
+                .steps
+                .iter()
+                .map(|s| StepRecord {
+                    step: s.clone(),
+                    state: states.get(&s.id).cloned().unwrap_or(StepState::Waiting),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn claim_results(&self) -> Vec<ClaimResult> {
+        self.claims
+            .iter()
+            .map(|claim| {
+                let steps: Vec<&StepRecord> = self
+                    .steps
+                    .iter()
+                    .filter(|s| s.step.claims.contains(&claim.id))
+                    .collect();
+                let verdicts: Vec<Verdict> = steps.iter().map(|s| step_verdict(s)).collect();
+                let verdict = if verdicts.is_empty() {
+                    Verdict::Unverified
+                } else if verdicts.contains(&Verdict::Failed) {
+                    Verdict::Failed
+                } else if verdicts.contains(&Verdict::Pending) {
+                    Verdict::Pending
+                } else if verdicts.contains(&Verdict::Unverified) {
+                    Verdict::Unverified
+                } else {
+                    Verdict::Proven
+                };
+                ClaimResult {
+                    claim: claim.clone(),
+                    verdict,
+                    steps: steps.iter().map(|s| s.step.id.clone()).collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// A run passes when it has claims and every one is proven.
+    pub fn passed(&self) -> bool {
+        let results = self.claim_results();
+        !results.is_empty() && results.iter().all(|r| r.verdict == Verdict::Proven)
+    }
+
+    pub fn summary(&self) -> RunSummary {
+        let results = self.claim_results();
+        RunSummary {
+            id: self.id.clone(),
+            started_unix: self.started_unix,
+            passed: self.passed(),
+            proven: results
+                .iter()
+                .filter(|r| r.verdict == Verdict::Proven)
+                .count(),
+            claims: results.len(),
+            steps: self.steps.len(),
+            steps_done: self
+                .steps
+                .iter()
+                .filter(|s| matches!(s.state, StepState::Done { .. }))
+                .count(),
+        }
+    }
+
+    pub fn verdict_line(&self) -> String {
+        let s = self.summary();
+        if s.claims == 0 {
+            format!(
+                "NO CLAIMS: {}/{} steps done (add claim: lines to prove something)",
+                s.steps_done, s.steps
+            )
+        } else {
+            format!(
+                "{}: {}/{} claims proven, {}/{} steps done",
+                if s.passed { "PASS" } else { "FAIL" },
+                s.proven,
+                s.claims,
+                s.steps_done,
+                s.steps
+            )
+        }
+    }
+
+    /// Re-checks every step's signed evidence: the signature and output (and patch
+    /// file), and that it belongs to this run: requested by the boss, signed by the
+    /// key of the peer the step ran on, of the right kind, produced during the run,
+    /// and not reused by another step.
+    pub fn verify(&self, dir: Option<&Path>) -> Vec<(String, Result<String>)> {
+        let mut seen = std::collections::HashSet::new();
+        self.steps
+            .iter()
+            .filter_map(|s| {
+                let (evidence, output, peer) = match &s.state {
+                    StepState::Done {
+                        evidence: Some(e),
+                        output,
+                        peer,
+                        ..
+                    } => (e, output, Some(peer)),
+                    StepState::Failed {
+                        evidence: Some(e),
+                        error,
+                        peer,
+                        ..
+                    } => (e, error, peer.as_ref()),
+                    _ => return None,
+                };
+                let check = self
+                    .belongs(s, evidence, peer)
+                    .and_then(|()| {
+                        if seen.insert(evidence.signature.clone()) {
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!("the same evidence is used by another step"))
+                        }
+                    })
+                    .and_then(|()| verify_step(evidence, output, &s.step.id, dir));
+                Some((s.step.id.clone(), check))
+            })
+            .collect()
+    }
+
+    fn belongs(&self, s: &StepRecord, e: &Evidence, peer: Option<&String>) -> Result<()> {
+        if e.requester_id != self.boss_id {
+            bail!(
+                "requested by {}, not by this run's boss",
+                short(&e.requester_id)
+            );
+        }
+        let kind = if s.step.approve {
+            EvidenceKind::Approval
+        } else {
+            EvidenceKind::Task
+        };
+        if e.kind != kind {
+            bail!("the evidence is for {:?}, not {kind:?}", e.kind);
+        }
+        if let Some(expected) = peer.and_then(|p| self.peer_ids.get(p))
+            && &e.signer_id != expected
+        {
+            bail!(
+                "signed by {}, but {} is {}",
+                short(&e.signer_id),
+                peer.map(String::as_str).unwrap_or_default(),
+                short(expected)
+            );
+        }
+        if e.finished_unix + CLOCK_SKEW < self.started_unix
+            || e.finished_unix > self.finished_unix + CLOCK_SKEW
+        {
+            bail!("produced at {} UTC, outside this run", utc(e.finished_unix));
+        }
+        Ok(())
+    }
+
+    /// A copy whose `verified` flags come from re-checking the evidence now (not from
+    /// what was stored), with the check results; verdicts of the copy are trustworthy.
+    pub fn reverified(&self, dir: Option<&Path>) -> (Self, Vec<(String, Result<String>)>) {
+        let checks = self.verify(dir);
+        let mut copy = self.clone();
+        for s in &mut copy.steps {
+            let ok = checks.iter().any(|(id, r)| id == &s.step.id && r.is_ok());
+            match &mut s.state {
+                StepState::Done { verified, .. } | StepState::Failed { verified, .. } => {
+                    *verified = ok
+                }
+                _ => {}
+            }
+        }
+        (copy, checks)
+    }
+
+    pub fn render_markdown(&self) -> String {
+        let mut md = format!("# Evidence run {}\n\n", self.id);
+        md += &format!(
+            "- **Verdict: {}**\n- Run by {} (`{}`)\n- Started {} UTC, finished {} UTC\n\n",
+            self.verdict_line(),
+            self.boss,
+            short(&self.boss_id),
+            utc(self.started_unix),
+            utc(self.finished_unix)
+        );
+        md += "## Claims\n\n";
+        let results = self.claim_results();
+        if results.is_empty() {
+            md += "No claims. Add `claim: ID what must be true` lines and `claims=ID` on the steps that prove them.\n\n";
+        } else {
+            md += "| Claim | Statement | Verdict | Steps |\n| --- | --- | --- | --- |\n";
+            for r in &results {
+                md += &format!(
+                    "| {} | {} | {} | {} |\n",
+                    r.claim.id,
+                    r.claim.text.replace('|', "\\|"),
+                    r.verdict.label(),
+                    if r.steps.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        r.steps.join(", ")
+                    }
+                );
+            }
+            md += "\n";
+        }
+        md += "## Steps\n";
+        for s in &self.steps {
+            md += &self.render_step(s);
+        }
+        md += &format!("\n## Plan\n\n```text\n{}\n```\n", self.plan_text.trim_end());
+        md
+    }
+
+    fn render_step(&self, s: &StepRecord) -> String {
+        let step = &s.step;
+        let kind = if step.approve {
+            "approval".to_owned()
+        } else {
+            step.provider.to_string()
+        };
+        let (status, peer) = match &s.state {
+            StepState::Waiting => ("waiting", None),
+            StepState::Running { peer } => ("running", Some(peer.clone())),
+            StepState::Done { peer, .. } => ("done", Some(peer.clone())),
+            StepState::Failed { peer, .. } => ("failed", peer.clone()),
+            StepState::Skipped { .. } => ("skipped", None),
+        };
+        let mut md = format!(
+            "\n### {} ({kind} → {}{}) {}: {status}\n\n",
+            step.id,
+            step.target,
+            step.share
+                .as_ref()
+                .map(|f| format!(":{f}"))
+                .unwrap_or_default(),
+            peer.map(|p| format!("on {p}")).unwrap_or_default()
+        );
+        if !step.after.is_empty() {
+            md += &format!("- After: {}\n", step.after.join(", "));
+        }
+        if !step.claims.is_empty() {
+            md += &format!(
+                "- Claims: {} ({})\n",
+                step.claims.join(", "),
+                step_verdict(s).label()
+            );
+        }
+        if let Some(apply) = &step.apply {
+            md += &format!("- Applied the commit of step {apply}\n");
+        }
+        md += &format!("- Task: {}\n", step.prompt);
+        let (evidence, verified, text) = match &s.state {
+            StepState::Done {
+                evidence,
+                verified,
+                output,
+                ..
+            } => (evidence.as_ref(), *verified, Some(output.as_str())),
+            StepState::Failed {
+                evidence,
+                verified,
+                error,
+                ..
+            } => (evidence.as_ref(), *verified, Some(error.as_str())),
+            StepState::Skipped { reason } => {
+                md += &format!("- Skipped: {reason}\n");
+                (None, false, None)
+            }
+            _ => (None, false, None),
+        };
+        if let Some(e) = evidence {
+            md += &format!(
+                "- Evidence signed by {} (`{}`): {}\n",
+                e.signer,
+                short(&e.signer_id),
+                if verified {
+                    "signature ✓ verified"
+                } else {
+                    "signature ✗ NOT valid"
+                }
+            );
+            if e.kind == EvidenceKind::Task {
+                md += &format!(
+                    "- Model attempts: {}; checks run by the worker's runtime:\n",
+                    e.attempts
+                );
+                if e.checks.is_empty() {
+                    md += "  - none requested (the result rests on the model's word)\n";
+                }
+                for c in &e.checks {
+                    md += &format!(
+                        "  - {} `{}` (`{}`): {} in {:.1}s\n",
+                        if c.passed { "✅" } else { "❌" },
+                        c.name,
+                        c.command,
+                        c.exit_code
+                            .map(|code| format!("exit {code}"))
+                            .unwrap_or_else(|| "no exit code".into()),
+                        c.millis as f64 / 1000.0
+                    );
+                }
+            }
+            if let Some(git) = &e.git {
+                match &git.commit {
+                    Some(commit) => {
+                        md += &format!(
+                            "- Commit `{commit}` on branch `{}` (from `{}`), files: {}; patch: `{}.patch`\n",
+                            git.branch,
+                            short(&git.base),
+                            git.files.join(", "),
+                            step.id
+                        )
+                    }
+                    None => md += &format!("- No changes committed (branch `{}`)\n", git.branch),
+                }
+            }
+            for c in e.checks.iter().filter(|c| !c.passed) {
+                md += &format!(
+                    "\n<details><summary>Output of failed check {}</summary>\n\n```text\n{}\n```\n</details>\n",
+                    c.name,
+                    c.output.trim_end()
+                );
+            }
+        } else if matches!(s.state, StepState::Done { .. }) {
+            md += "- No evidence (the peer runs an older version)\n";
+        }
+        if let Some(text) = text {
+            md += &format!(
+                "\n<details><summary>Result</summary>\n\n{}\n\n</details>\n",
+                text.trim_end()
+            );
+        }
+        md
+    }
+
+    /// Saves `run.json`, `report.md` and step patches in `runs_dir/<id>/`.
+    pub fn save(&self, runs_dir: &Path) -> Result<PathBuf> {
+        let dir = runs_dir.join(&self.id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        for s in &self.steps {
+            if let StepState::Done {
+                patch: Some(patch), ..
+            } = &s.state
+            {
+                std::fs::write(dir.join(format!("{}.patch", s.step.id)), patch)?;
+            }
+        }
+        std::fs::write(dir.join("run.json"), serde_json::to_vec_pretty(self)?)?;
+        let report = dir.join("report.md");
+        std::fs::write(&report, self.render_markdown())?;
+        Ok(report)
+    }
+
+    pub fn load(runs_dir: &Path, id: &str) -> Result<Self> {
+        crate::profile::validate_name(id).context("invalid run id")?;
+        let path = runs_dir.join(id).join("run.json");
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("there is no run {id} ({})", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Saved runs, newest first.
+    pub fn list(runs_dir: &Path) -> Result<Vec<RunSummary>> {
+        let mut runs = Vec::new();
+        let Ok(entries) = std::fs::read_dir(runs_dir) else {
+            return Ok(runs);
+        };
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if let Ok(run) = Self::load(runs_dir, &id) {
+                runs.push(run.summary());
+            }
+        }
+        runs.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(runs)
+    }
+}
+
+fn verify_step(
+    evidence: &Evidence,
+    output: &str,
+    step: &str,
+    dir: Option<&Path>,
+) -> Result<String> {
+    evidence.verify_self(output)?;
+    if let (Some(dir), Some(hash)) = (
+        dir,
+        evidence.git.as_ref().and_then(|g| g.patch_sha256.as_ref()),
+    ) {
+        let path = dir.join(format!("{step}.patch"));
+        if let Ok(patch) = std::fs::read(&path) {
+            if &sha256_hex(&patch) != hash {
+                bail!("{} doesn't match the signed patch hash", path.display());
+            }
+            return Ok(format!(
+                "signed by {} ({}), output and patch intact",
+                evidence.signer,
+                short(&evidence.signer_id)
+            ));
+        }
+    }
+    Ok(format!(
+        "signed by {} ({}), output intact",
+        evidence.signer,
+        short(&evidence.signer_id)
+    ))
+}
+
+/// The first 10 characters (never splits a character).
+fn short(id: &str) -> String {
+    id.chars().take(10).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evidence::CheckResult;
+    use iroh::SecretKey;
+    use std::collections::BTreeMap;
+
+    fn task_evidence(key: &SecretKey, output: &str, passed: bool) -> Evidence {
+        let mut e = Evidence::new(EvidenceKind::Task, "worker", key.public(), key.public(), 1);
+        e.attempts = 1;
+        e.checks.push(CheckResult {
+            name: "test".into(),
+            command: "cargo test".into(),
+            exit_code: Some(if passed { 0 } else { 101 }),
+            passed,
+            millis: 1500,
+            output: if passed { "ok" } else { "boom" }.into(),
+        });
+        e.sign(output, key)
+    }
+
+    fn done(output: &str, evidence: Option<Evidence>, verified: bool) -> StepState {
+        StepState::Done {
+            peer: "worker".into(),
+            output: output.into(),
+            evidence,
+            verified,
+            patch: None,
+        }
+    }
+
+    #[test]
+    fn claims_are_proven_only_by_verified_runtime_evidence() {
+        let text = "claim: C-1 the parser handles empty input\n\
+                    claim: C-2 the docs describe it\n\
+                    claim: C-3 nobody signs it off\n\
+                    impl @worker:repo verify=test attempts=2 claims=C-1 Fix the parser\n\
+                    docs after impl @worker claims=C-2 Write the docs\n\
+                    signoff after impl approve @me claims=C-3 Review the change";
+        let plan = Plan::parse(text).unwrap();
+        let key = SecretKey::generate();
+        let mut states = BTreeMap::new();
+        states.insert(
+            "impl".to_owned(),
+            done("fixed", Some(task_evidence(&key, "fixed", true)), true),
+        );
+        // A model-only result proves nothing.
+        states.insert("docs".to_owned(), done("written", None, false));
+        states.insert(
+            "signoff".to_owned(),
+            StepState::failed(Some("you".into()), "Rejected by boss".into()),
+        );
+        let run = RunRecord::new("boss", &key.public().to_string(), text, &plan, &states, 0);
+        let verdicts: Vec<Verdict> = run.claim_results().iter().map(|r| r.verdict).collect();
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Proven, Verdict::Unverified, Verdict::Failed]
+        );
+        assert!(!run.passed());
+        assert!(run.verdict_line().starts_with("FAIL: 1/3 claims proven"));
+
+        // Failing checks or an unverified signature don't prove a claim either.
+        states.insert(
+            "impl".to_owned(),
+            done("fixed", Some(task_evidence(&key, "fixed", false)), true),
+        );
+        let run = RunRecord::new("boss", "x", text, &plan, &states, 0);
+        assert_eq!(run.claim_results()[0].verdict, Verdict::Unverified);
+        states.insert(
+            "impl".to_owned(),
+            done("fixed", Some(task_evidence(&key, "fixed", true)), false),
+        );
+        let run = RunRecord::new("boss", "x", text, &plan, &states, 0);
+        assert_eq!(run.claim_results()[0].verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn runs_are_saved_listed_reported_and_reverified() {
+        let text = "claim: C-1 tests pass\nimpl @worker verify=test claims=C-1 Fix it";
+        let plan = Plan::parse(text).unwrap();
+        let key = SecretKey::generate();
+        let mut states = BTreeMap::new();
+        states.insert(
+            "impl".to_owned(),
+            done("fixed", Some(task_evidence(&key, "fixed", true)), true),
+        );
+        let mut run = RunRecord::new("boss", &key.public().to_string(), text, &plan, &states, 0);
+        run.peer_ids
+            .insert("worker".into(), key.public().to_string());
+        assert!(run.passed());
+        let dir = tempfile::tempdir().unwrap();
+        let report = run.save(dir.path()).unwrap();
+        let md = std::fs::read_to_string(&report).unwrap();
+        assert!(md.contains("PASS: 1/1 claims proven"), "{md}");
+        assert!(
+            md.contains("| C-1 | tests pass | ✅ proven | impl |"),
+            "{md}"
+        );
+        assert!(md.contains("signature ✓ verified"));
+        assert!(
+            md.contains("✅ `test` (`cargo test`): exit 0 in 1.5s"),
+            "{md}"
+        );
+
+        let listed = RunRecord::list(dir.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].passed && listed[0].id == run.id);
+        let loaded = RunRecord::load(dir.path(), &run.id).unwrap();
+        assert_eq!(loaded, run);
+        let checks = loaded.verify(Some(&dir.path().join(&run.id)));
+        assert!(checks[0].1.is_ok(), "{checks:?}");
+
+        // Someone edits the stored result: re-verification catches it.
+        let mut tampered = loaded.clone();
+        if let StepState::Done { output, .. } = &mut tampered.steps[0].state {
+            *output = "fixed (trust me)".into();
+        }
+        assert!(tampered.verify(None)[0].1.is_err());
+
+        // A boss can't vouch with evidence that isn't the step's: a key it made up
+        // signing as "worker", evidence requested by someone else, or old evidence.
+        let forger = SecretKey::generate();
+        let mut forged = loaded.clone();
+        if let StepState::Done { evidence, .. } = &mut forged.steps[0].state {
+            *evidence = Some(task_evidence(&forger, "fixed", true));
+        }
+        forged.boss_id = forger.public().to_string();
+        let err = forged.verify(None)[0].1.as_ref().unwrap_err().to_string();
+        assert!(err.contains("but worker is"), "{err}");
+        let (rechecked, _) = forged.reverified(None);
+        assert!(forged.passed(), "the stored flags claim a pass");
+        assert!(!rechecked.passed(), "re-verification decides the verdict");
+
+        let mut foreign = loaded.clone();
+        foreign.boss_id = forger.public().to_string();
+        let err = foreign.verify(None)[0].1.as_ref().unwrap_err().to_string();
+        assert!(err.contains("not by this run's boss"), "{err}");
+        let mut later = loaded.clone();
+        later.started_unix = later.finished_unix + 3_600;
+        later.finished_unix += 3_600;
+        let err = later.verify(None)[0].1.as_ref().unwrap_err().to_string();
+        assert!(err.contains("outside this run"), "{err}");
+    }
+
+    #[test]
+    fn utc_formats_dates() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00");
+        assert_eq!(utc(951_782_400), "2000-02-29 00:00:00");
+        assert_eq!(utc(1_794_786_000), "2026-11-15 23:40:00");
+    }
+}

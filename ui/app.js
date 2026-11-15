@@ -92,6 +92,16 @@ function inlineMd(text) {
   return nodes;
 }
 
+function mdTable(rows) {
+  const cells = (row) => row.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+  const [head, ...body] = rows.filter((r) => !/^\s*\|?\s*:?-{3,}/.test(r));
+  // Not a real table (e.g. only a separator line): show the text as is.
+  if (head === undefined) return el("p", { text: rows.join("\n") });
+  return el("div", { class: "table-wrap" }, el("table", {},
+    el("thead", {}, el("tr", {}, ...cells(head).map((c) => el("th", { scope: "col" }, inlineMd(c))))),
+    el("tbody", {}, ...body.map((r) => el("tr", {}, ...cells(r).map((c) => el("td", {}, inlineMd(c))))))));
+}
+
 function renderMarkdown(text) {
   const root = el("div", { class: "md" });
   const lines = text.replace(/\r\n/g, "\n").split("\n");
@@ -105,6 +115,23 @@ function renderMarkdown(text) {
   const endList = () => { list = null; listType = null; };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    // Collapsible sections in evidence reports: rendered as <details>, content as Markdown.
+    const details = line.match(/^<details><summary>(.*)<\/summary>$/);
+    if (details) {
+      flushPara(); endList();
+      const inner = [];
+      for (i++; i < lines.length && lines[i].trim() !== "</details>"; i++) inner.push(lines[i]);
+      root.append(el("details", {}, el("summary", { text: details[1] }), renderMarkdown(inner.join("\n"))));
+      continue;
+    }
+    if (/^\s*\|/.test(line)) {
+      flushPara(); endList();
+      const rows = [];
+      for (; i < lines.length && /^\s*\|/.test(lines[i]); i++) rows.push(lines[i]);
+      i--;
+      root.append(mdTable(rows));
+      continue;
+    }
     if (/^\s*```/.test(line)) {
       flushPara(); endList();
       const code = [];
@@ -359,7 +386,7 @@ function taskNode(t) {
   }[t.status];
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
   const title = t.step
-    ? `Step ${t.step} · ${providerLabel(t.provider)} → ${t.target}`
+    ? `Step ${t.step} · ${t.approval ? "Approval" : providerLabel(t.provider)} → ${t.target}`
     : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
   const meta = t.status === "waiting"
     ? el("div", { class: "task-meta", text: t.after?.length ? `Waits for: ${t.after.join(", ")}` : "Starting…" })
@@ -370,6 +397,13 @@ function taskNode(t) {
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
     el("div", { class: "task-top" },
       el("span", { class: "task-title", text: title }),
+      t.evidence ? el("span", {
+        class: `badge evidence ${t.evidence}`,
+        title: t.evidence === "verified"
+          ? "The result carries evidence signed by the peer that did the work"
+          : "The evidence is NOT validly signed by that peer",
+        text: t.evidence === "verified" ? "Signed ✓" : "Unverified ✗",
+      }) : null,
       el("span", { class: `status ${t.status}` },
         t.status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, statusText)),
     el("p", { class: "task-prompt", text: t.prompt }),
@@ -499,6 +533,80 @@ async function cancelTask(t, button) {
   }
 }
 
+// ---------- approvals ----------
+function renderApprovals() {
+  const list = $("#approvals-list");
+  const approvals = state.approvals ?? [];
+  $("#approvals-panel").hidden = !approvals.length;
+  $("#approvals-count").textContent = approvals.length;
+  list.replaceChildren(...approvals.map((a) => {
+    const note = el("input", { type: "text", class: "approval-note", maxlength: "500", "aria-label": `Note for request ${a.id}`, placeholder: "Note (required to reject)" });
+    const error = el("p", { class: "form-error", role: "alert" });
+    const answer = async (approved, button) => {
+      if (!approved && !note.value.trim()) {
+        error.textContent = "Say why you reject it.";
+        note.focus();
+        return;
+      }
+      button.disabled = true;
+      try {
+        await api(`/api/approvals/${a.id}`, { method: "POST", body: JSON.stringify({ approved, note: note.value }) });
+        toast(approved ? "Approved" : "Rejected");
+      } catch (err) {
+        button.disabled = false;
+        error.textContent = err.message;
+      }
+    };
+    return el("li", { class: "task approval" },
+      el("div", { class: "task-top" },
+        el("span", { class: "task-title", text: `${a.title} · from ${a.from}` }),
+        el("span", { class: "status waiting", text: "Needs you" })),
+      el("details", {}, el("summary", { text: "What you're approving" }),
+        el("div", { class: "result", tabindex: "0" }, renderMarkdown(a.text))),
+      note,
+      error,
+      el("div", { class: "approval-actions" },
+        el("button", { type: "button", class: "btn primary small", onclick: (e) => answer(true, e.currentTarget) }, "Approve"),
+        el("button", { type: "button", class: "btn small danger", onclick: (e) => answer(false, e.currentTarget) }, "Reject")));
+  }));
+}
+
+// ---------- evidence runs ----------
+async function loadRuns() {
+  const res = await api("/api/runs");
+  const list = $("#runs-list");
+  $("#runs-count").textContent = res.runs.length;
+  list.replaceChildren();
+  if (!res.runs.length) {
+    list.append(el("li", { class: "empty" }, "No runs yet. Run a ", el("strong", { text: "Plan" }),
+      " with claim: lines and verify= checks to collect evidence."));
+  }
+  for (const r of res.runs.slice(0, 20)) {
+    const verdict = r.claims ? (r.passed ? "Pass" : "Fail") : "No claims";
+    list.append(el("li", { class: "run-item" },
+      el("button", { type: "button", class: "run-open", onclick: () => openRun(r.id), "aria-label": `Open evidence run ${r.id}` },
+        el("span", { class: "task-title", text: r.id }),
+        el("span", { class: `status ${r.passed ? "done" : r.claims ? "failed" : "skipped"}`, text: verdict })),
+      el("div", { class: "task-meta", text: `${clock(r.started_unix * 1000)} · ${r.proven}/${r.claims} claims proven · ${r.steps_done}/${r.steps} steps done` })));
+  }
+}
+
+async function openRun(id) {
+  try {
+    const run = await api(`/api/runs/${encodeURIComponent(id)}`);
+    $("#run-h").textContent = `Evidence run ${id}`;
+    $("#run-verdict").textContent = run.verdict;
+    $("#run-verdict").dataset.pass = String(run.summary.passed);
+    $("#run-signatures").replaceChildren(...run.signatures.map((s) => el("li", { class: s.ok ? "ok" : "bad" },
+      el("strong", { text: `${s.ok ? "✓" : "✗"} ${s.step}: ` }), s.text)));
+    $("#run-report").replaceChildren(renderMarkdown(run.report));
+    $("#run-dialog").showModal();
+    $("#run-close").focus();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
 // ---------- audit log ----------
 const OUTCOME_TEXT = { done: "Done", failed: "Failed", cancelled: "Cancelled", refused: "Refused" };
 const OUTCOME_CLASS = { done: "done", failed: "failed", cancelled: "cancelled", refused: "failed" };
@@ -565,7 +673,7 @@ function renderShareOptions() {
   if (shares.some((s) => s.name === prev)) sel.value = prev;
 }
 
-const PLAN_EXAMPLE = "api @alice:repo Summarize the public API\ntests after api #qa Write test ideas for it\nreport after api,tests @bob Write a short status report";
+const PLAN_EXAMPLE = "claim: C-1 The parser handles empty input\nfix @alice:repo verify=test attempts=3 claims=C-1 Make the parser accept empty input\nreview after fix #qa:repo apply=fix verify=test claims=C-1 Check the fix\nsignoff after review approve @me claims=C-1 Approve the change";
 
 function updateComposer() {
   const task = state.mode === "task";
@@ -573,9 +681,9 @@ function updateComposer() {
   const input = $("#composer-input");
   const noProviders = task && !availableProviders().length;
   $("#task-opts").hidden = !task;
-  input.rows = plan ? 5 : 2;
+  input.rows = plan ? 6 : 2;
   input.placeholder = plan
-    ? `One step per line: id [after a,b] @peer[:folder] or #squad [using claude] prompt\n${PLAN_EXAMPLE}`
+    ? `claim: ID statement, then one step per line: id [after a,b] [approve] @peer[:folder]|#squad [using claude] [verify=a,b attempts=N claims=ID apply=step] prompt\n${PLAN_EXAMPLE}`
     : task
       ? noProviders
         ? "No provider available: enable one with --providers, or connect a peer that serves one"
@@ -585,7 +693,7 @@ function updateComposer() {
   $("#send-btn").querySelector("span").textContent = plan ? "Run plan" : task ? "Run" : "Send";
   $("#send-btn").disabled = noProviders || (task && !$("#target").value);
   $("#composer-hint").textContent = plan
-    ? "Ctrl+Enter to run · steps wait for the steps after “after” and get their results"
+    ? "Ctrl+Enter to run · claims are proven only by checks peers run (verify=) or a sign-off (approve) · the run is saved under Evidence runs"
     : "Enter to send · Shift+Enter for a new line";
 }
 
@@ -701,12 +809,13 @@ async function removePeer(t) {
 // ---------- live updates ----------
 async function loadState() {
   const s = await api("/api/state");
-  Object.assign(state, { me: s.me, peers: s.peers, trusted: s.trusted, squads: s.squads, feed: s.feed, tasks: s.tasks });
+  Object.assign(state, { me: s.me, peers: s.peers, trusted: s.trusted, squads: s.squads, feed: s.feed, tasks: s.tasks, approvals: s.approvals });
   renderMe();
   renderPeers();
   renderFeed();
   renderTasks();
-  await loadAudit();
+  renderApprovals();
+  await Promise.all([loadAudit(), loadRuns()]);
 }
 
 let events = null;
@@ -719,6 +828,13 @@ function connectEvents() {
     if (msg.type === "feed") appendFeed(msg.item);
     else if (msg.type === "task") upsertTask(msg.task);
     else if (msg.type === "audit") loadAudit().catch((err) => toast(err.message, "error"));
+    else if (msg.type === "runs") loadRuns().catch((err) => toast(err.message, "error"));
+    else if (msg.type === "approvals") {
+      const before = state.approvals?.length ?? 0;
+      state.approvals = msg.approvals;
+      renderApprovals();
+      if (msg.approvals.length > before) toast("A teammate asks for your approval");
+    }
     else if (msg.type === "peers") {
       state.peers = msg.peers;
       state.trusted = msg.trusted;
@@ -765,6 +881,10 @@ function init() {
     if (state.mode === "plan" ? e.ctrlKey || e.metaKey : !e.shiftKey) submitComposer(e);
   });
   $("#add-squad-btn").addEventListener("click", openSquadDialog);
+  $("#run-close").addEventListener("click", () => $("#run-dialog").close());
+  $("#run-dialog").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) $("#run-dialog").close();
+  });
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
   $("#squad-dialog").addEventListener("keydown", (e) => {
     if (e.key === "Escape") {

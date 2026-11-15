@@ -120,12 +120,28 @@
     </main>
 
     <section class="tasks-panel" aria-label="Tasks and audit log">
+      <section id="approvals-panel" class="approvals-panel" aria-labelledby="approvals-h" hidden>
+        <div class="card-head panel-head">
+          <h2 id="approvals-h">Waiting for your approval</h2>
+          <span class="count" id="approvals-count">0</span>
+        </div>
+        <p class="muted small">Your answer is signed with this agent's key and becomes evidence in the requester's run.</p>
+        <ol class="task-list" id="approvals-list"></ol>
+      </section>
       <section aria-labelledby="tasks-h">
         <div class="card-head panel-head">
           <h2 id="tasks-h">Tasks</h2>
           <span class="count" id="task-count">0</span>
         </div>
         <ol class="task-list" id="task-list"></ol>
+      </section>
+      <section class="runs-panel" aria-labelledby="runs-h">
+        <div class="card-head panel-head">
+          <h2 id="runs-h">Evidence runs</h2>
+          <span class="count" id="runs-count">0</span>
+        </div>
+        <p class="muted small">Every plan run is saved with a verdict per claim. A claim is proven only by checks the peers' runtimes ran (or a sign-off), signed with their keys.</p>
+        <ol class="task-list" id="runs-list"></ol>
       </section>
       <section id="audit-panel" class="audit-panel" aria-labelledby="audit-h" hidden>
         <div class="card-head panel-head">
@@ -198,6 +214,18 @@
         <button type="submit" class="btn primary">Save squad</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="run-dialog" class="wide" aria-labelledby="run-h">
+    <div class="dialog-body">
+      <div class="card-head">
+        <h2 id="run-h">Evidence run</h2>
+        <button type="button" class="btn small" id="run-close">Close</button>
+      </div>
+      <p id="run-verdict" class="run-verdict"></p>
+      <ul id="run-signatures" class="signature-list"></ul>
+      <div id="run-report" class="result" tabindex="0"></div>
+    </div>
   </dialog>
 
   <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>

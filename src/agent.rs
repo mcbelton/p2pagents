@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,10 +13,14 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::audit::{AuditEntry, AuditLog, Outcome};
+use crate::evidence::{
+    CHECK_TIMEOUT, Evidence, EvidenceKind, MAX_ATTEMPTS, retry_prompt, run_check, sha256_hex,
+};
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 use crate::protocol::{ALPN, Message, write_message};
-use crate::shares::{DATA_SHARE, ShareInfo, ShareStore, effective_access};
+use crate::shares::{DATA_SHARE, Share, ShareInfo, ShareStore, effective_access};
 use crate::trust::{TrustStore, TrustedPeer};
+use crate::worktree::{Worktree, branch_part};
 
 /// Maximum number of peer-delegated tasks an agent runs at once; more are queued.
 pub const MAX_CONCURRENT_TASKS: usize = 2;
@@ -54,6 +59,8 @@ pub struct AgentConfig {
     pub owner: Option<String>,
     /// What this agent is for, shown to peers.
     pub role: Option<String>,
+    /// Where per-task git worktrees are created (folders shared with `--worktrees`).
+    pub worktrees_dir: PathBuf,
 }
 
 impl AgentConfig {
@@ -69,6 +76,7 @@ impl AgentConfig {
             shares: ShareStore::default(),
             owner: None,
             role: None,
+            worktrees_dir: std::env::temp_dir().join("p2pagents-worktrees"),
         }
     }
 }
@@ -112,7 +120,50 @@ pub enum Event {
         task_id: u64,
         reason: String,
     },
+    /// Someone (a peer, or this agent's own plan) asks this agent's user to approve
+    /// a step; answer with [`Agent::answer_approval`].
+    ApprovalRequested {
+        id: u64,
+        from: String,
+        title: String,
+    },
+    /// An approval request was answered or withdrawn.
+    ApprovalClosed {
+        id: u64,
+    },
 }
+
+/// A peer's result for a delegated task or approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivered {
+    /// Done (and every check passed), or approved.
+    pub ok: bool,
+    pub output: String,
+    pub evidence: Option<Evidence>,
+    /// The task's commit as a patch, if it ran in a worktree and changed files.
+    pub patch: Option<String>,
+    /// The evidence is signed by the peer the task was sent to, for exactly this
+    /// output (and patch).
+    pub verified: bool,
+}
+
+/// An approval request waiting for this agent's user.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ApprovalInfo {
+    pub id: u64,
+    pub from: String,
+    pub title: String,
+    pub text: String,
+}
+
+struct IncomingApproval {
+    info: ApprovalInfo,
+    requester: EndpointId,
+    task_id: u64,
+}
+
+/// Most open approval requests one peer may have with this agent.
+const MAX_OPEN_APPROVALS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -144,11 +195,18 @@ struct PeerHandle {
 /// a connection, so it survives a duplicate connection being replaced.
 struct PendingTask {
     peer: EndpointId,
-    reply: oneshot::Sender<Result<String, String>>,
+    reply: oneshot::Sender<Result<Delivered, String>>,
+}
+
+/// What serving a peer's task produced.
+struct Served {
+    output: String,
+    evidence: Evidence,
+    patch: Option<String>,
 }
 
 /// Sends `TaskCancel` to the peer if a delegated task's future is dropped before
-/// the result arrives.
+/// the result arrives (and withdraws a local approval request).
 struct CancelOnDrop<'a> {
     inner: &'a Inner,
     peer: EndpointId,
@@ -162,7 +220,9 @@ impl Drop for CancelOnDrop<'_> {
             return;
         }
         self.inner.pending.lock().unwrap().remove(&self.task_id);
-        if let Some(handle) = self.inner.peers.lock().unwrap().get(&self.peer) {
+        if self.peer == self.inner.endpoint.id() {
+            self.inner.withdraw_approval(&self.peer, self.task_id);
+        } else if let Some(handle) = self.inner.peers.lock().unwrap().get(&self.peer) {
             let _ = handle.tx.send(Message::TaskCancel {
                 task_id: self.task_id,
             });
@@ -193,6 +253,9 @@ struct Inner {
     /// Peers reported via `PeerConnected` and not yet via `PeerDisconnected`.
     announced: Mutex<HashSet<EndpointId>>,
     next_task_id: AtomicU64,
+    worktrees_dir: PathBuf,
+    /// Approval requests waiting for this agent's user, by local id.
+    approvals: Mutex<BTreeMap<u64, IncomingApproval>>,
 }
 
 /// A peer-to-peer agent on an iroh QUIC endpoint. Cheap to clone; all clones
@@ -240,6 +303,8 @@ impl Agent {
             serving: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashSet::new()),
             next_task_id: AtomicU64::new(1),
+            worktrees_dir: config.worktrees_dir,
+            approvals: Mutex::new(BTreeMap::new()),
         });
         tokio::spawn(accept_loop(inner.clone()));
         Ok((Self { inner }, rx))
@@ -405,8 +470,21 @@ impl Agent {
     }
 
     /// Delegates an LLM task to a connected peer and waits for its result.
-    /// Fails if the peer doesn't serve the provider, refuses the task, or disconnects.
+    /// Fails if the peer doesn't serve the provider, refuses the task, its checks
+    /// fail, or it disconnects.
     pub async fn delegate(&self, peer: EndpointId, task: LlmTask) -> Result<String> {
+        let delivered = self.delegate_verified(peer, task).await?;
+        if delivered.ok {
+            Ok(delivered.output)
+        } else {
+            Err(anyhow!("{}", delivered.output))
+        }
+    }
+
+    /// Delegates a task and returns everything the peer sent back, including its
+    /// signed evidence, whether the task succeeded or not. Errs only if there is no
+    /// result (not connected, refused before running, disconnected).
+    pub async fn delegate_verified(&self, peer: EndpointId, task: LlmTask) -> Result<Delivered> {
         let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         {
@@ -431,6 +509,16 @@ impl Agent {
                 bail!("connection to {} closed", handle.name);
             }
         }
+        self.await_reply(peer, task_id, rx).await
+    }
+
+    /// Waits for the reply to `task_id`; dropping this future withdraws the request.
+    async fn await_reply(
+        &self,
+        peer: EndpointId,
+        task_id: u64,
+        rx: oneshot::Receiver<Result<Delivered, String>>,
+    ) -> Result<Delivered> {
         // Dropping this future (e.g. the user cancels) tells the peer to stop the task.
         let mut guard = CancelOnDrop {
             inner: &self.inner,
@@ -441,10 +529,116 @@ impl Agent {
         let result = rx.await;
         guard.armed = false;
         match result {
-            Ok(Ok(output)) => Ok(output),
+            Ok(Ok(delivered)) => Ok(delivered),
             Ok(Err(error)) => Err(anyhow!("{error}")),
             Err(_) => Err(anyhow!("delegated task was dropped")),
         }
+    }
+
+    /// Asks a team member (a connected peer, or with `None` this agent's own user) to
+    /// approve something, and waits for the signed answer (`ok` = approved).
+    pub async fn request_approval(
+        &self,
+        peer: Option<EndpointId>,
+        title: &str,
+        text: &str,
+    ) -> Result<Delivered> {
+        let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let (reply, rx) = oneshot::channel();
+        let me = self.id();
+        let target = peer.unwrap_or(me);
+        self.inner.pending.lock().unwrap().insert(
+            task_id,
+            PendingTask {
+                peer: target,
+                reply,
+            },
+        );
+        if target == me {
+            self.inner
+                .add_approval(me, self.inner.name.clone(), task_id, title, text);
+        } else {
+            let sent = self.inner.peers.lock().unwrap().get(&target).map(|h| {
+                h.tx.send(Message::ApprovalRequest {
+                    task_id,
+                    title: title.to_owned(),
+                    text: text.to_owned(),
+                })
+                .is_ok()
+            });
+            if sent != Some(true) {
+                self.inner.pending.lock().unwrap().remove(&task_id);
+                bail!("not connected to {}", target.fmt_short());
+            }
+        }
+        self.await_reply(target, task_id, rx).await
+    }
+
+    /// Approval requests waiting for this agent's user.
+    pub fn approvals(&self) -> Vec<ApprovalInfo> {
+        self.inner
+            .approvals
+            .lock()
+            .unwrap()
+            .values()
+            .map(|a| a.info.clone())
+            .collect()
+    }
+
+    /// Approves or rejects request `id`; the answer is signed with this agent's key.
+    pub async fn answer_approval(&self, id: u64, approved: bool, note: &str) -> Result<()> {
+        let request = self
+            .inner
+            .approvals
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .ok_or_else(|| anyhow!("there is no open approval request {id}"))?;
+        let _ = self.inner.events.send(Event::ApprovalClosed { id });
+        let note = note.trim();
+        let output = format!(
+            "{} by {}{}",
+            if approved { "Approved" } else { "Rejected" },
+            self.inner.name,
+            if note.is_empty() {
+                String::new()
+            } else {
+                format!(": {note}")
+            }
+        );
+        let mut evidence = Evidence::new(
+            EvidenceKind::Approval,
+            &self.inner.name,
+            self.id(),
+            request.requester,
+            request.task_id,
+        );
+        evidence.prompt_sha256 = sha256_hex(request.info.text.as_bytes());
+        evidence.approved = Some(approved);
+        let evidence = evidence.sign(&output, self.inner.endpoint.secret_key());
+        if request.requester == self.id() {
+            self.inner.complete_pending(
+                &request.requester,
+                request.task_id,
+                Ok(Delivered {
+                    ok: approved,
+                    output,
+                    evidence: Some(evidence),
+                    patch: None,
+                    verified: true,
+                }),
+            );
+        } else {
+            let msg = Message::TaskResult {
+                task_id: request.task_id,
+                ok: approved,
+                output,
+                evidence: Some(Box::new(evidence)),
+                patch: None,
+            };
+            self.inner.deliver(request.requester, msg).await;
+        }
+        Ok(())
     }
 
     /// Stops accepting peers, closes every connection and the endpoint.
@@ -612,7 +806,7 @@ impl Inner {
         }
     }
 
-    fn complete_pending(&self, peer: &EndpointId, task_id: u64, result: Result<String, String>) {
+    fn complete_pending(&self, peer: &EndpointId, task_id: u64, result: Result<Delivered, String>) {
         let mut pending = self.pending.lock().unwrap();
         // Only the peer the task was sent to may answer it.
         if pending.get(&task_id).is_some_and(|p| &p.peer == peer)
@@ -625,6 +819,68 @@ impl Inner {
     /// Stops the tasks `peer` asked this agent to run (it left for good).
     fn cancel_served(&self, peer: &EndpointId) {
         self.serving.lock().unwrap().retain(|(p, _), _| p != peer);
+    }
+
+    /// Queues an approval request for this agent's user; false if `requester` has
+    /// too many open requests.
+    fn add_approval(
+        &self,
+        requester: EndpointId,
+        from: String,
+        task_id: u64,
+        title: &str,
+        text: &str,
+    ) -> bool {
+        let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut approvals = self.approvals.lock().unwrap();
+            if approvals
+                .values()
+                .filter(|a| a.requester == requester)
+                .count()
+                >= MAX_OPEN_APPROVALS
+            {
+                return false;
+            }
+            approvals.insert(
+                id,
+                IncomingApproval {
+                    info: ApprovalInfo {
+                        id,
+                        from: from.clone(),
+                        title: title.chars().take(200).collect(),
+                        text: text.chars().take(20_000).collect(),
+                    },
+                    requester,
+                    task_id,
+                },
+            );
+        }
+        let _ = self.events.send(Event::ApprovalRequested {
+            id,
+            from,
+            title: title.chars().take(200).collect(),
+        });
+        true
+    }
+
+    /// Drops `requester`'s approval request for its `task_id` (withdrawn).
+    fn withdraw_approval(&self, requester: &EndpointId, task_id: u64) {
+        let ids: Vec<u64> = {
+            let mut approvals = self.approvals.lock().unwrap();
+            let ids: Vec<u64> = approvals
+                .iter()
+                .filter(|(_, a)| &a.requester == requester && a.task_id == task_id)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &ids {
+                approvals.remove(id);
+            }
+            ids
+        };
+        for id in ids {
+            let _ = self.events.send(Event::ApprovalClosed { id });
+        }
     }
 
     /// Sends `msg` to `peer` over its current connection, waiting out a brief
@@ -647,7 +903,7 @@ impl Inner {
 
     /// Checks the allowlist permission, the shared folder and the hourly quota for
     /// a task from `id`; returns where and with what access it may run.
-    fn admit_task(&self, id: &EndpointId, task: &LlmTask) -> Result<TaskContext> {
+    fn admit_task(&self, id: &EndpointId, task: &LlmTask) -> Result<(TaskContext, Share)> {
         let (name, can_delegate, per_hour, grant, granted_shares) = {
             let trust = self.trust.lock().unwrap();
             let peer = trust
@@ -681,6 +937,35 @@ impl Inner {
                     self.name
                 )
             })?;
+        let access = effective_access(grant, share.max_access);
+        for check in &task.checks {
+            if !share.checks.contains_key(check) {
+                bail!(
+                    "folder '{}' on {} has no check named '{check}' (it has: {})",
+                    share.name,
+                    self.name,
+                    if share.checks.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        share.checks.keys().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                );
+            }
+        }
+        if !task.checks.is_empty() && access < Access::Full {
+            bail!(
+                "checks run the folder's code with {}'s rights, so they need full access; {name} has {access} in '{}'",
+                self.name,
+                share.name
+            );
+        }
+        if task.patch.is_some() && !(share.worktrees && access >= Access::WorkspaceWrite) {
+            bail!(
+                "applying a patch needs edit access in a folder shared with --worktrees; '{}' on {} isn't",
+                share.name,
+                self.name
+            );
+        }
         let now = Instant::now();
         let mut log = self.task_log.lock().unwrap();
         let recent = log.entry(*id).or_default();
@@ -697,10 +982,11 @@ impl Inner {
             );
         }
         recent.push_back(now);
-        Ok(TaskContext {
-            access: effective_access(grant, share.max_access),
-            workspace: share.path,
-        })
+        let ctx = TaskContext {
+            access,
+            workspace: share.path.clone(),
+        };
+        Ok((ctx, share))
     }
 
     /// Runs a peer's task until it finishes or `cancel` fires (the peer sent
@@ -712,7 +998,7 @@ impl Inner {
         task_id: u64,
         task: LlmTask,
         cancel: oneshot::Receiver<()>,
-    ) -> Result<String> {
+    ) -> Result<Served> {
         let clock = std::time::SystemTime::now();
         let mut granted = None;
         let mut cancelled = false;
@@ -727,14 +1013,29 @@ impl Inner {
                 &mut cancelled,
             )
             .await;
-        let mut entry = AuditEntry::new(from, id, task_id, &task, granted, &result, clock);
+        let audited = match &result {
+            Ok(served) if served.evidence.checks_passed() => Ok(String::new()),
+            Ok(served) => Err(anyhow!(
+                "checks failed: {}",
+                served
+                    .evidence
+                    .checks
+                    .iter()
+                    .filter(|c| !c.passed)
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Err(e) => Err(anyhow!("{e:#}")),
+        };
+        let mut entry = AuditEntry::new(from, id, task_id, &task, granted, &audited, clock);
         if cancelled {
             entry.outcome = Outcome::Cancelled;
         }
         if let Some(audit) = &self.audit {
             audit.record(&entry);
         }
-        let event = match (&result, entry.outcome) {
+        let event = match (&audited, entry.outcome) {
             (Err(e), Outcome::Refused) => Event::TaskRefused {
                 from: from.to_owned(),
                 task_id,
@@ -761,7 +1062,7 @@ impl Inner {
         cancel: oneshot::Receiver<()>,
         granted: &mut Option<Access>,
         cancelled: &mut bool,
-    ) -> Result<String> {
+    ) -> Result<Served> {
         let executor = self
             .executor
             .as_ref()
@@ -769,7 +1070,7 @@ impl Inner {
         if !executor.providers().contains(&task.provider) {
             bail!("{} does not serve {}", self.name, task.provider);
         }
-        let ctx = self.admit_task(id, task)?;
+        let (ctx, share) = self.admit_task(id, task)?;
         *granted = Some(ctx.access);
         let _ = self.events.send(Event::TaskReceived {
             from: from.to_owned(),
@@ -778,9 +1079,11 @@ impl Inner {
         });
         let work = async {
             let _slot = self.task_slots.acquire().await?;
-            executor.execute(task, &ctx).await
+            self.attempt_task(executor.as_ref(), id, from, task_id, task, ctx, &share)
+                .await
         };
-        // Dropping `work` stops the provider run (each backend aborts on drop).
+        // Dropping `work` stops the provider run (each backend aborts on drop) and
+        // any check, and removes the task's worktree.
         tokio::select! {
             result = work => result,
             _ = cancel => {
@@ -788,6 +1091,92 @@ impl Inner {
                 Err(anyhow!("task cancelled by {from}"))
             }
         }
+    }
+
+    /// Runs an admitted task: in its own worktree if the folder uses them, applying
+    /// the requester's patch, then the model and the requested checks, retrying
+    /// with the failures while attempts are left. Returns the signed evidence.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_task(
+        &self,
+        executor: &dyn Executor,
+        id: &EndpointId,
+        from: &str,
+        task_id: u64,
+        task: &LlmTask,
+        mut ctx: TaskContext,
+        share: &Share,
+    ) -> Result<Served> {
+        let worktree = if share.worktrees && ctx.access >= Access::WorkspaceWrite {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let branch = format!("p2p/{}/{task_id}-{stamp}", branch_part(from));
+            let wt = Worktree::create(&share.path, &self.worktrees_dir, &branch)
+                .await
+                .context("creating the task's worktree")?;
+            ctx.workspace = wt.path.clone();
+            Some(wt)
+        } else {
+            None
+        };
+        if let (Some(patch), Some(wt)) = (&task.patch, &worktree) {
+            wt.apply(patch).await?;
+        }
+        let checks: Vec<(&String, &String)> = task
+            .checks
+            .iter()
+            .filter_map(|name| share.checks.get_key_value(name))
+            .collect();
+        let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
+        let mut prompt = task.clone();
+        let (mut output, mut results, mut used) = (String::new(), Vec::new(), 0);
+        while used < attempts {
+            used += 1;
+            output = executor.execute(&prompt, &ctx).await?;
+            results.clear();
+            for (name, command) in &checks {
+                results.push(run_check(name, command, &ctx.workspace, CHECK_TIMEOUT).await);
+            }
+            if results.iter().all(|r| r.passed) {
+                break;
+            }
+            prompt.prompt = retry_prompt(&task.prompt, &results);
+        }
+        let mut evidence = Evidence::new(
+            EvidenceKind::Task,
+            &self.name,
+            self.endpoint.id(),
+            *id,
+            task_id,
+        );
+        evidence.provider = Some(task.provider);
+        evidence.share = Some(share.name.clone());
+        evidence.prompt_sha256 = sha256_hex(task.prompt.as_bytes());
+        evidence.attempts = used;
+        evidence.checks = results;
+        let mut patch = None;
+        if let Some(wt) = &worktree {
+            let first = task.prompt.lines().next().unwrap_or_default();
+            let message = format!(
+                "p2pagents: task {task_id} from {from}\n\n{}",
+                first.chars().take(200).collect::<String>()
+            );
+            let (commit, text) = wt.commit(&message).await?;
+            evidence.git = Some(commit);
+            patch = text;
+        }
+        let summary = evidence.summary();
+        if !summary.is_empty() {
+            output = format!("{}\n\n---\n{summary}", output.trim_end());
+        }
+        let evidence = evidence.sign(&output, self.endpoint.secret_key());
+        Ok(Served {
+            output,
+            evidence,
+            patch,
+        })
     }
 }
 
@@ -911,19 +1300,46 @@ async fn run_connection(
                             .serve_task(&peer_id, &from, task_id, task, cancel_rx)
                             .await;
                         inner.serving.lock().unwrap().remove(&(peer_id, task_id));
-                        let (ok, output) = match result {
-                            Ok(output) => (true, output),
-                            Err(e) => (false, format!("{e:#}")),
-                        };
-                        let msg = Message::TaskResult {
-                            task_id,
-                            ok,
-                            output,
+                        let msg = match result {
+                            Ok(served) => Message::TaskResult {
+                                task_id,
+                                ok: served.evidence.checks_passed(),
+                                output: served.output,
+                                evidence: Some(Box::new(served.evidence)),
+                                patch: served.patch,
+                            },
+                            Err(e) => Message::TaskResult {
+                                task_id,
+                                ok: false,
+                                output: format!("{e:#}"),
+                                evidence: None,
+                                patch: None,
+                            },
                         };
                         inner.deliver(peer_id, msg).await;
                     });
                 }
+                Message::ApprovalRequest {
+                    task_id,
+                    title,
+                    text,
+                } => {
+                    if !inner.add_approval(peer_id, name.clone(), task_id, &title, &text) {
+                        let msg = Message::TaskResult {
+                            task_id,
+                            ok: false,
+                            output: format!(
+                                "{} has too many open approval requests from you",
+                                inner.name
+                            ),
+                            evidence: None,
+                            patch: None,
+                        };
+                        let _ = tx.send(msg);
+                    }
+                }
                 Message::TaskCancel { task_id } => {
+                    inner.withdraw_approval(&peer_id, task_id);
                     let cancel = inner.serving.lock().unwrap().remove(&(peer_id, task_id));
                     if let Some(cancel) = cancel {
                         let _ = cancel.send(());
@@ -933,11 +1349,30 @@ async fn run_connection(
                     task_id,
                     ok,
                     output,
+                    evidence,
+                    patch,
                 } => {
+                    let verified = evidence.as_ref().is_some_and(|e| {
+                        e.verify(&peer_id, &output).is_ok()
+                            && e.git
+                                .as_ref()
+                                .and_then(|g| g.patch_sha256.as_deref())
+                                .is_none_or(|hash| {
+                                    patch
+                                        .as_ref()
+                                        .is_none_or(|p| sha256_hex(p.as_bytes()) == hash)
+                                })
+                    });
                     inner.complete_pending(
                         &peer_id,
                         task_id,
-                        if ok { Ok(output) } else { Err(output) },
+                        Ok(Delivered {
+                            ok,
+                            output,
+                            evidence: evidence.map(|e| *e),
+                            patch,
+                            verified,
+                        }),
                     );
                 }
                 Message::Shares { shares } => {
@@ -970,6 +1405,17 @@ async fn run_connection(
             }
             inner.fail_pending(&peer_id);
             inner.cancel_served(&peer_id);
+            let gone_requests: Vec<(EndpointId, u64)> = inner
+                .approvals
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|a| a.requester == peer_id)
+                .map(|a| (a.requester, a.task_id))
+                .collect();
+            for (requester, task_id) in gone_requests {
+                inner.withdraw_approval(&requester, task_id);
+            }
             if inner.announced.lock().unwrap().remove(&peer_id) {
                 let _ = inner
                     .events

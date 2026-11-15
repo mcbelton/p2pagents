@@ -31,6 +31,7 @@ use crate::audit::{AuditLog, Outcome};
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 use crate::plan::{Plan, SquadStore, StepState, run_plan};
 use crate::profile::{Profile, validate_name};
+use crate::runs::RunRecord;
 use crate::trust::{Ticket, TrustedPeer};
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -66,6 +67,12 @@ struct TaskView {
     step: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     after: Vec<String>,
+    /// An approval step (a person signs off) rather than an LLM task.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    approval: bool,
+    /// For peers' results: "verified" (signed by the peer for this output) or "unverified".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<&'static str>,
 }
 
 impl TaskView {
@@ -327,6 +334,16 @@ pub async fn start(
                     );
                     pump.send(json!({ "type": "audit" }));
                 }
+                Event::ApprovalRequested { id, from, title } => {
+                    pump.system(
+                        "task",
+                        format!("{from} asks you to approve: {title} (#{id})"),
+                    );
+                    pump.send(json!({ "type": "approvals", "approvals": approvals_json(&pump) }));
+                }
+                Event::ApprovalClosed { .. } => {
+                    pump.send(json!({ "type": "approvals", "approvals": approvals_json(&pump) }));
+                }
             }
         }
     });
@@ -339,6 +356,9 @@ pub async fn start(
         .route("/api/tasks/{id}", delete(cancel_task))
         .route("/api/audit", get(audit))
         .route("/api/plans", post(create_plan))
+        .route("/api/runs", get(list_runs))
+        .route("/api/runs/{id}", get(get_run))
+        .route("/api/approvals/{id}", post(answer_approval))
         .route("/api/squads", post(save_squad))
         .route("/api/squads/{name}", delete(remove_squad))
         .route("/api/trust", post(allow_peer))
@@ -445,6 +465,7 @@ async fn state(State(s): State<AppState>) -> Json<Value> {
     v["me"] = s.me_json();
     v["feed"] = json!(s.feed.lock().unwrap().iter().cloned().collect::<Vec<_>>());
     v["tasks"] = json!(s.tasks.lock().unwrap().clone());
+    v["approvals"] = approvals_json(&s);
     Json(v)
 }
 
@@ -547,12 +568,15 @@ async fn create_task(
         plan: None,
         step: None,
         after: Vec::new(),
+        approval: false,
+        evidence: None,
     };
     s.tasks.lock().unwrap().push(view.clone());
     s.send(json!({ "type": "task", "task": view }));
 
     let shared = s.clone();
     let handle = tokio::spawn(async move {
+        let mut evidence = None;
         let result = match route {
             Route::Local(executor) => {
                 let ctx = TaskContext {
@@ -561,11 +585,24 @@ async fn create_task(
                 };
                 executor.execute(&task, &ctx).await
             }
-            Route::Peer(peer, _) => shared.agent.delegate(peer, task).await,
+            Route::Peer(peer, _) => match shared.agent.delegate_verified(peer, task).await {
+                Ok(d) => {
+                    if d.evidence.is_some() {
+                        evidence = Some(if d.verified { "verified" } else { "unverified" });
+                    }
+                    if d.ok {
+                        Ok(d.output)
+                    } else {
+                        Err(anyhow::anyhow!("{}", d.output))
+                    }
+                }
+                Err(e) => Err(e),
+            },
         };
         shared.running.lock().unwrap().remove(&id);
         shared.update_task(id, |t| {
             t.finished_ms = Some(now_ms());
+            t.evidence = evidence;
             match result {
                 Ok(out) => {
                     t.status = "done";
@@ -636,6 +673,7 @@ struct PlanBody {
 }
 
 /// Runs a plan (see [`crate::plan`]); each step shows up as a task, updated live.
+/// When it ends, the run and its evidence report are saved in the profile.
 async fn create_plan(
     State(s): State<AppState>,
     Json(body): Json<PlanBody>,
@@ -665,6 +703,8 @@ async fn create_plan(
             plan: Some(plan_id),
             step: Some(step.id.clone()),
             after: step.after.clone(),
+            approval: step.approve,
+            evidence: None,
         };
         s.tasks.lock().unwrap().push(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -672,8 +712,10 @@ async fn create_plan(
     let squads = s.squads.lock().unwrap().clone();
     let shared = s.clone();
     let step_ids = ids.clone();
+    let text = body.text.clone();
     let handle = tokio::spawn(async move {
-        run_plan(&shared.agent.clone(), &squads, &plan, |step, state| {
+        let started = crate::runs::unix_now();
+        let states = run_plan(&shared.agent.clone(), &squads, &plan, |step, state| {
             let id = step_ids[step];
             if !matches!(state, StepState::Waiting | StepState::Running { .. }) {
                 shared.running.lock().unwrap().remove(&id);
@@ -685,16 +727,33 @@ async fn create_plan(
                     t.target = peer.clone();
                     t.started_ms = now_ms();
                 }
-                StepState::Done { peer, output } => {
+                StepState::Done {
+                    peer,
+                    output,
+                    evidence,
+                    verified,
+                    ..
+                } => {
                     t.status = "done";
                     t.target = peer.clone();
                     t.output = Some(output.clone());
                     t.finished_ms = Some(now_ms());
+                    t.evidence = evidence
+                        .as_ref()
+                        .map(|_| if *verified { "verified" } else { "unverified" });
                 }
-                StepState::Failed { error, .. } => {
+                StepState::Failed {
+                    error,
+                    evidence,
+                    verified,
+                    ..
+                } => {
                     t.status = "failed";
                     t.output = Some(error.clone());
                     t.finished_ms = Some(now_ms());
+                    t.evidence = evidence
+                        .as_ref()
+                        .map(|_| if *verified { "verified" } else { "unverified" });
                 }
                 StepState::Skipped { reason } => {
                     t.status = "skipped";
@@ -704,6 +763,23 @@ async fn create_plan(
             });
         })
         .await;
+        let mut run = RunRecord::new(
+            shared.agent.name(),
+            &shared.agent.id().to_string(),
+            &text,
+            &plan,
+            &states,
+            started,
+        );
+        run.peer_ids = crate::runs::peer_ids(&shared.agent);
+        match run.save(&shared.info.profile.runs_dir()) {
+            Ok(_) => shared.system(
+                if run.passed() { "info" } else { "warn" },
+                format!("Evidence run {}: {}", run.id, run.verdict_line()),
+            ),
+            Err(e) => shared.system("warn", format!("Could not save the run: {e:#}")),
+        }
+        shared.send(json!({ "type": "runs" }));
     });
     {
         let mut running = s.running.lock().unwrap();
@@ -778,6 +854,82 @@ async fn remove_squad(
 #[derive(Deserialize)]
 struct AuditQuery {
     limit: Option<usize>,
+}
+
+/// Saved evidence runs, newest first.
+async fn list_runs(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let runs = RunRecord::list(&s.info.profile.runs_dir()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+/// One run: its summary, the Markdown report and a fresh signature check.
+async fn get_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let dir = s.info.profile.runs_dir();
+    let run = RunRecord::load(&dir, &id).map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    let (run, checks) = run.reverified(Some(&dir.join(&run.id)));
+    let checks: Vec<Value> = checks
+        .into_iter()
+        .map(|(step, r)| match r {
+            Ok(text) => json!({ "step": step, "ok": true, "text": text }),
+            Err(e) => json!({ "step": step, "ok": false, "text": format!("{e:#}") }),
+        })
+        .collect();
+    Ok(Json(json!({
+        "summary": run.summary(),
+        "verdict": run.verdict_line(),
+        "report": run.render_markdown(),
+        "signatures": checks,
+    })))
+}
+
+fn approvals_json(s: &Shared) -> Value {
+    json!(s.agent.approvals())
+}
+
+#[derive(Deserialize)]
+struct ApprovalBody {
+    approved: bool,
+    #[serde(default)]
+    note: String,
+}
+
+async fn answer_approval(
+    State(s): State<AppState>,
+    Path(id): Path<u64>,
+    Json(body): Json<ApprovalBody>,
+) -> Result<Json<Value>, ApiError> {
+    if !body.approved && body.note.trim().is_empty() {
+        return Err(bad_request("say why you reject it"));
+    }
+    s.agent
+        .answer_approval(id, body.approved, &body.note)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.system(
+        "info",
+        format!(
+            "You {} request #{id}",
+            if body.approved {
+                "approved"
+            } else {
+                "rejected"
+            }
+        ),
+    );
+    Ok(Json(json!({ "answered": id })))
 }
 
 /// The audit log of tasks peers ran on this agent, newest first.

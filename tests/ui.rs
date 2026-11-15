@@ -439,6 +439,98 @@ async fn ui_runs_plans_and_shows_squads() {
         sum.contains("### Step find (done by worker)\necho: find the facts"),
         "{sum}"
     );
+    assert_eq!(step("find")["evidence"], "verified", "signed by the worker");
+
+    // An evidence run with a sign-off by this agent's own user (@me).
+    let runs = || {
+        let host = host.clone();
+        let token = token.to_owned();
+        async move {
+            request(port, "GET", "/api/runs", &host, Some(&token), None)
+                .await
+                .json()["runs"]
+                .as_array()
+                .unwrap()
+                .clone()
+        }
+    };
+    assert_eq!(runs().await.len(), 1, "the first plan was saved as a run");
+    let text = serde_json::json!({
+        "text": "claim: C-1 the facts are reviewed\nfind @worker find the facts\nok after find approve @me claims=C-1 Approve the facts"
+    });
+    assert_eq!(post("/api/plans", text.to_string()).await.status, 200);
+    let approval = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            if let Some(a) = state["approvals"].as_array().and_then(|a| a.first()) {
+                return a.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("approval requested");
+    assert!(
+        approval["text"]
+            .as_str()
+            .unwrap()
+            .contains("echo: find the facts")
+    );
+    let path: &'static str =
+        Box::leak(format!("/api/approvals/{}", approval["id"]).into_boxed_str());
+    let no_reason = post(path, r#"{"approved":false,"note":" "}"#.into()).await;
+    assert_eq!(no_reason.status, 400, "a rejection needs a reason");
+    let approved = post(path, r#"{"approved":true,"note":"checked"}"#.into()).await;
+    assert_eq!(approved.status, 200, "{}", approved.body);
+    let run = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let runs = runs().await;
+            if runs.len() == 2 {
+                return runs[0].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("run saved");
+    assert_eq!(run["passed"], true, "{run}");
+    let id = run["id"].as_str().unwrap();
+    let detail = request(
+        port,
+        "GET",
+        &format!("/api/runs/{id}"),
+        &host,
+        Some(token),
+        None,
+    )
+    .await
+    .json();
+    assert!(
+        detail["verdict"]
+            .as_str()
+            .unwrap()
+            .starts_with("PASS: 1/1 claims proven")
+    );
+    assert!(
+        detail["report"]
+            .as_str()
+            .unwrap()
+            .contains("Approved by boss: checked")
+    );
+    let signatures = detail["signatures"].as_array().unwrap();
+    assert_eq!(signatures.len(), 2);
+    assert!(signatures.iter().all(|s| s["ok"] == true), "{signatures:?}");
+    assert!(
+        home.path()
+            .join("boss/runs")
+            .join(id)
+            .join("report.md")
+            .is_file()
+    );
+    let missing = request(port, "GET", "/api/runs/nope", &host, Some(token), None).await;
+    assert_eq!(missing.status, 404);
 
     let removed = request(port, "DELETE", "/api/squads/qa", &host, Some(token), None).await;
     assert_eq!(removed.status, 200);

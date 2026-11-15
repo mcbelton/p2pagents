@@ -98,6 +98,18 @@ pub struct LlmTask {
     /// For delegated tasks: the peer's shared folder to run in (default: its `data` share).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub share: Option<String>,
+    /// Names of the folder's owner-defined checks the worker's runtime runs after the
+    /// model, as evidence (see [`crate::evidence`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    /// How many model attempts to make while checks fail (default 1, at most
+    /// [`crate::evidence::MAX_ATTEMPTS`]); each retry gets the failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// A patch (e.g. from another peer's step) applied in the task's own worktree
+    /// before the model starts, so the work can be checked independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
 }
 
 impl LlmTask {
@@ -107,11 +119,20 @@ impl LlmTask {
             prompt: prompt.into(),
             model: None,
             share: None,
+            checks: Vec::new(),
+            attempts: None,
+            patch: None,
         }
     }
 
     pub fn in_share(mut self, share: impl Into<String>) -> Self {
         self.share = Some(share.into());
+        self
+    }
+
+    pub fn with_checks(mut self, checks: Vec<String>, attempts: Option<u32>) -> Self {
+        self.checks = checks;
+        self.attempts = attempts;
         self
     }
 }

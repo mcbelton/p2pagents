@@ -11,6 +11,9 @@ Run: .\\scripts\\p2p.ps1 live-test
 """
 import json, os, re, shutil, subprocess, sys, tempfile, threading, time
 
+# Agents print UTF-8 (e.g. check marks); keep logs readable on any console or file.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(REPO, "target", "debug", "p2pagents.exe" if os.name == "nt" else "p2pagents")
 HOME = tempfile.mkdtemp(prefix="p2p-live-home-")
@@ -32,7 +35,8 @@ class Agent:
     def __init__(self, name, args):
         self.name, self.lines, self.cursor = name, [], 0
         self.p = subprocess.Popen([EXE, "--name", name, *args], cwd=REPO, env=ENV, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                  encoding="utf-8", errors="replace")
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -68,7 +72,8 @@ def check(name, ok, detail=""):
 
 
 def cli(*args):
-    out = subprocess.run([EXE, *args], env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+    out = subprocess.run([EXE, *args], env=ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120,
+                         encoding="utf-8", errors="replace")
     return out.returncode, out.stdout + out.stderr
 
 
@@ -109,9 +114,21 @@ try:
     _, out1 = cli("share", "add", "repo", REPO, "--profile", "worker1")
     _, out2 = cli("share", "add", "code", ws, "--access", "workspace-write", "--profile", "worker2")
     print(f"  {out1.strip()}\n  {out2.strip()}")
+    print("== EDD: worker2 shares a git repo as 'app' (a worktree per task) with a check it defines")
+    app = tempfile.mkdtemp(prefix="p2p-live-app-")
+    for args in (["init", "-q"], ["config", "core.autocrlf", "false"]):
+        subprocess.run(["git", "-C", app, *args], check=True)
+    with open(os.path.join(app, "README.md"), "w") as f:
+        f.write("live evidence demo\n")
+    subprocess.run(["git", "-C", app, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", app, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"], check=True)
+    has_file = "type evidence.txt" if os.name == "nt" else "cat evidence.txt"
+    _, out3 = cli("share", "add", "app", app, "--access", "full", "--worktrees", "--check", f"has-file={has_file}",
+                  "--profile", "worker2")
+    print(f"  {out3.strip()}")
     ok = all([
         allow("worker1", "boss", delegate=True, shares="data,repo"), allow("worker1", "worker2"),
-        allow("worker2", "boss", delegate=True, access="workspace-write", shares="data,code"), allow("worker2", "worker1"),
+        allow("worker2", "boss", delegate=True, access="full", shares="data,code,app"), allow("worker2", "worker1"),
         allow("boss", "worker1"), allow("boss", "worker2"),
         allow("intruder", "worker1"),  # worker1 does NOT allow intruder
     ])
@@ -152,10 +169,15 @@ try:
     agents.append(helper)
     helper_acct = helper.wait_for(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'helper'\]", 90)
     boss.wait_for(r"^\+ helper", 120)
-    boss.cursor = len(boss.lines)
-    boss.send("/peers")
-    check("boss sees the digital worker's owner and role",
-          boss.wait_for(r"helper \([0-9a-f]+\) \[digital worker of worker1: release note writer\]", 30))
+    # Simultaneous dials may still be converging on one connection: ask a few times.
+    seen = None
+    for _ in range(5):
+        boss.cursor = len(boss.lines)
+        boss.send("/peers")
+        seen = boss.wait_for(r"helper \([0-9a-f]+\) \[digital worker of worker1: release note writer\]", 6)
+        if seen:
+            break
+    check("boss sees the digital worker's owner and role", seen)
     boss.send("/delegate copilot@helper Reply with exactly: HELPER-OK")
     check("digital worker ran boss's task on its owner's account",
           helper_acct and boss.wait_for(r"HELPER-OK", 300) and boss.wait_for(r"=== copilot on helper ===", 5))
@@ -246,6 +268,40 @@ try:
     check("boss's plan ran a dependent step with its prerequisite's result",
           relay_at is not None and any("p2pdata-token-7731" in l for l in lines[relay_at:relay_at + 6]),
           lines[-12:])
+
+    print("== EDD plan: claims proven by a check worker2's runtime runs, and worker1's signed approval")
+    with open(plan_file, "w") as f:
+        f.write("claim: LIVE-1 worker2 adds evidence.txt and its owner's check passes\n"
+                "claim: LIVE-2 a teammate signs off the change\n"
+                "make @worker2:app verify=has-file attempts=2 claims=LIVE-1 Create a file named evidence.txt "
+                "in the current folder containing exactly: proven by p2p. Reply DONE.\n"
+                "signoff after make approve @worker1 claims=LIVE-2 Approve if the change looks right.\n")
+    boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
+    boss.send(f"/plan {plan_file}")
+    asked = w1.wait_for(r"/approve (\d+)", 400)
+    if asked:
+        w1.send(f"/approve {re.search(r'/approve (\d+)', asked).group(1)} reviewed live")
+    finished = boss.wait_for(r"=== plan finished", 120)
+    lines = boss.lines[boss.cursor:]
+    text = "\n".join(lines)
+    check("worker's runtime ran the owner's check after the model", "✅ `has-file`: passed" in text, lines[-30:])
+    check("boss verified the worker's signature on the evidence",
+          re.search(r"evidence: signed by worker2 \([0-9a-f]+\) ✓ verified", text))
+    check("worker committed the task on its own branch and returned the patch",
+          re.search(r"\*\*Commit\*\* `[0-9a-f]+` on branch `p2p/boss/", text)
+          and not os.path.exists(os.path.join(app, "evidence.txt"))
+          and "p2p/boss/" in subprocess.run(["git", "-C", app, "branch", "--list", "p2p/*"],
+                                             capture_output=True, text=True).stdout)
+    check("teammate's signed approval came back",
+          "Approved by worker1: reviewed live" in text and re.search(r"evidence: signed by worker1 \([0-9a-f]+\) ✓ verified", text))
+    check("boss's evidence run proved its claims", finished and "PASS: 2/2 claims proven" in finished, finished)
+    report = boss.wait_for(r"^  report: ", 5)
+    run_dir = os.path.dirname(report.split("report: ", 1)[1].strip()) if report else None
+    code, out = cli("runs", "verify", "--dir", run_dir) if run_dir else (1, "no report")
+    print(f"  {out.strip()}")
+    check("the saved run's signatures re-verify offline",
+          code == 0 and "all 2 signed records verify" in out and os.path.exists(os.path.join(run_dir, "make.patch")))
+    shutil.rmtree(app, ignore_errors=True)
 
     print("== worker2 leaves")
     w2.stop()

@@ -7,16 +7,19 @@
 pub mod agent;
 pub mod audit;
 pub mod auth;
+pub mod evidence;
 pub mod llm;
 pub mod plan;
 pub mod profile;
 pub mod protocol;
+pub mod runs;
 pub mod setup;
 pub mod shares;
 pub mod trust;
 pub mod ui;
+pub mod worktree;
 
-pub use agent::{Agent, AgentConfig, Event, Network, PeerInfo};
+pub use agent::{Agent, AgentConfig, ApprovalInfo, Delivered, Event, Network, PeerInfo};
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};
 pub use llm::{Access, Executor, ExecutorConfig, LlmTask, Provider, SdkExecutor, TaskContext};
 pub use profile::Profile;

@@ -280,6 +280,35 @@ fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; font-s
 .md pre { margin: 8px 0; padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: auto; }
 .md pre code { background: none; padding: 0; }
 .task .btn.small { margin-top: 6px; }
+.md details { margin: 6px 0; }
+.md summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 12.5px; }
+.table-wrap { overflow-x: auto; margin: 8px 0; }
+.md table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.md th { background: var(--surface-3); }
+.badge.evidence.verified { background: var(--success-soft); color: var(--success); }
+.badge.evidence.unverified { background: var(--danger-soft); color: var(--danger); }
+.task-top .badge.evidence { margin-left: auto; }
+.approvals-panel { border: 1px solid var(--warn); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 12px; background: var(--warn-soft); }
+.approvals-panel > p { margin: 0 0 8px; }
+.task.approval .approval-note { width: 100%; margin-top: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; }
+.approval-actions { display: flex; gap: 8px; }
+.btn.danger { color: var(--danger); border-color: var(--danger); }
+.runs-panel { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px; }
+.runs-panel > p { margin: 0 0 8px; }
+.run-item { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; background: var(--surface); }
+.run-open { all: unset; display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 8px; cursor: pointer; }
+.run-open:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+.run-open .task-title { font-family: var(--mono); color: var(--accent); }
+dialog.wide { width: min(920px, calc(100vw - 32px)); }
+dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap: 10px; max-height: calc(100vh - 64px); }
+#run-report { overflow: auto; padding: 2px 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.run-verdict { margin: 0; font-weight: 700; }
+.run-verdict[data-pass="true"] { color: var(--success); }
+.run-verdict[data-pass="false"] { color: var(--danger); }
+.signature-list { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
+.signature-list .ok strong { color: var(--success); }
+.signature-list .bad strong { color: var(--danger); }
 
 /* Dialog */
 dialog {

@@ -380,7 +380,7 @@ with `/ticket`.
 | --- | --- |
 | `p2pagents peers id --profile P` | Show P's endpoint id and ticket |
 | `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
-| `p2pagents share add <name> <folder> --profile P [--access LEVEL]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)) |
+| `p2pagents share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
 | `p2pagents peers list --profile P` | List allowlisted peers and their rights |
 | `p2pagents peers remove <name-or-id> --profile P` | Remove a peer |
 
@@ -444,6 +444,9 @@ In terminal 2, once `+ worker` appears:
 | `/delegate <provider>[@peer[:folder]] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder) |
 | `/plan <file>` | Run a [plan](#squads-and-plans): steps on peers (`@name`) or squads (`#squad`), in dependency order |
 | `/squads` | List your squads and which members are online |
+| `/runs` | List saved evidence runs ([EDD with agents](#evidence-driven-development-with-agents)) |
+| `/approvals` | Show approval requests waiting for you |
+| `/approve <n> [note]`, `/reject <n> <why>` | Answer approval request `n` (signed with your key) |
 | `/tasks` | List your running tasks with their numbers |
 | `/cancel <n>` | Cancel your running task `n`; the peer stops the model run and frees the slot |
 | `/peers` | List connected peers and the providers they serve |
@@ -527,6 +530,97 @@ report after api,tests @helper Write a one-paragraph status report
 Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. Each step appears as a task
 that waits, runs, finishes or is skipped, and cancelling any step cancels the whole plan.
 
+### Evidence-driven development with agents
+
+Plans can do evidence-driven development (EDD) across a team: you write down what must be
+true (**claims**), agents do the work, and a claim counts as proven only by **evidence that
+doesn't rest on a model's word**. That means checks the worker's runtime ran, or a
+teammate's sign-off, each signed with the key of the agent that produced it.
+
+**1. Each owner defines the checks for their folder.** Checks are commands such as tests and
+linters. Peers see only the check names, never the commands.
+
+```powershell
+p2pagents share add app D:\src\app --access full --worktrees `
+  --check test="cargo test --locked" --check lint="cargo clippy --all-targets -- -D warnings" --profile alice
+p2pagents peers allow <boss-ticket> --profile alice --delegate --access full --share data,app
+```
+
+**2. The boss writes a plan with claims.**
+
+```text
+claim: PARSE-1 The parser accepts empty input
+claim: PARSE-2 A reviewer signed off the change
+fix @alice:app verify=test,lint attempts=3 claims=PARSE-1 Make the parser accept empty input, with a test
+review after fix #qa:app apply=fix verify=test claims=PARSE-1 Review the change and check it independently
+signoff after review approve @carol claims=PARSE-2 Approve the parser change for release
+```
+
+| Step option | What it does |
+| --- | --- |
+| `verify=a,b` | After the model finishes, the **worker's runtime** (not the model) runs those checks in the task's folder. It records exit codes, durations and the end of their output. The step fails if any check fails. |
+| `attempts=N` | While checks fail, the model tries again (up to 5 times), each time given the failing output. |
+| `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
+| `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
+| `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
+
+**3. Agents do the work, and each result comes back with signed evidence.**
+
+- Every delegated result carries an evidence record: the checks and their results, the
+  number of attempts, the commit, and hashes of the prompt and output. The worker **signs**
+  it with its identity key. The boss accepts it only if it is signed by the peer the task
+  was sent to, for exactly the output received. Results show `Signed ✓` in the web UI.
+- An `apply=` patch may not create symlinks or touch files the model itself may not write
+  (credentials, git and editor config, agent settings).
+- **Worktrees** (`share add --worktrees`, for a git repository): each editing task runs on
+  its own branch `p2p/<peer>/<task>-<time>` in its own worktree under
+  `~/.p2pworktrees/<profile>`, with git hooks disabled. The work is committed there and
+  returned as a patch whose hash is signed. Your checkout is never touched and parallel
+  tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
+  happy. Removed worktrees keep their branch.
+- **Approvals**: the approver sees the request in their web UI (**Waiting for your
+  approval**) or terminal (`/approvals`, then `/approve <n> [note]` or `/reject <n> <why>`).
+  The answer is signed with their key. Approvers only need to be allowlisted; they need no
+  providers and no delegation rights.
+
+**4. Every run is saved with a verdict per claim.**
+
+| Verdict | When |
+| --- | --- |
+| ✅ proven | Every step that claims it finished, each with verified evidence: all its checks passed, or the approver approved |
+| ❌ failed | A step that claims it failed or was skipped (failed checks, rejected, unreachable) |
+| ⚠️ unverified | It rests on a model's word only (no checks or sign-off), or no step claims it |
+| ⏳ pending | The run was cancelled before its steps finished |
+
+A run **passes** only if every claim is proven. Runs are saved in the boss's profile under
+`runs/<id>/`: `run.json`, a Markdown `report.md`, and `<step>.patch` for each commit.
+
+```powershell
+p2pagents runs list --profile boss
+p2pagents runs show <id> --profile boss       # the report
+p2pagents runs verify <id> --profile boss     # re-check every signature and patch hash
+p2pagents runs verify --dir \\share\runs\<id> # ... from a run folder anyone sent you
+```
+
+Share a run folder with your team as the evidence for a change. `runs verify` doesn't take
+the boss's word for anything. It recomputes the verdict from the evidence and checks that
+each record:
+
+- is validly signed for exactly its output and patch;
+- was requested by the run's boss;
+- is signed by the key of the peer the step ran on;
+- was produced during the run;
+- isn't reused by another step.
+
+It prints the signers' endpoint ids: check them against the keys you know for those people. The
+web UI lists runs under **Evidence runs** and opens each report with a fresh signature check.
+
+Checks run your folder's code (tests, builds) with **your** rights and without the OS
+sandbox, like a CI job on your machine. So only peers with `full` access to that folder may
+request them. Their environment has no inherited credential variables (`GH_TOKEN`,
+`ANTHROPIC_API_KEY`, ...). Each check may run for up to 15 minutes, and on a timeout or
+cancellation everything it started is killed.
+
 ### Options
 
 | Option | Default | Description |
@@ -547,7 +641,7 @@ that waits, runs, finishes or is skipped, and cancelling any step cancels the wh
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
 `p2pagents share add|list|remove`, `p2pagents worker create|list`,
-`p2pagents squad create|list|remove`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
+`p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
 (and uses a separate credential store namespace).
 
 ## Web UI
@@ -576,6 +670,11 @@ p2pagents --name me --providers copilot --serve --ui
   Ctrl+Enter runs it). Steps show which steps they wait for, and skipped steps are flagged.
 - **Squads**: create, view (members, who is online, running tasks) and remove squads.
   Digital workers show their owner and role in the peer list.
+- **Waiting for your approval**: approval requests from plans (yours or teammates'), with
+  what you're approving and Approve / Reject (a rejection needs a reason).
+- **Evidence runs**: every plan run with its verdict. Open one to read its report (claims,
+  checks, commits, signatures) and a fresh signature check. Results that carry valid
+  signed evidence show **Signed ✓**.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
@@ -602,6 +701,9 @@ Press Ctrl+C in the terminal to stop the agent.
   raise its access: each task gets the **lower** of the peer's grant
   (`peers allow ... --delegate --access <level>`, default `read-only`) and the folder's
   maximum (`share add ... --access <level>`). Your own tasks get `--access` in `--workspace`.
+- Results are signed by the agent that produced them, and checks a peer asks for run only
+  with `full` access ([EDD with agents](#evidence-driven-development-with-agents)).
+  Approval requests need only the allowlist, and each peer may have at most 20 open.
 
 ### Shared folders
 
@@ -723,6 +825,9 @@ endpoints on localhost in local mode, so they need no internet.
 
 ## Evidence-driven development
 
+This section is about how p2pagents itself is built. To run EDD on your own projects with
+a team of agents, see [Evidence-driven development with agents](#evidence-driven-development-with-agents).
+
 Every behavior p2pagents promises is written down as a **claim** in
 [evidence/claims.json](evidence/claims.json), with the evidence that proves it: unit and
 integration tests, and checks from the live internet test. For example:
@@ -795,7 +900,10 @@ Workflow for a change:
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access)
-- [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation, and the dependency-ordered plan runner
+- [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation (claims, checks, approvals), and the dependency-ordered plan runner
+- [src/evidence.rs](src/evidence.rs): signed evidence records, owner-defined checks (run with a timeout, process tree killed) and retry prompts
+- [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
+- [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases

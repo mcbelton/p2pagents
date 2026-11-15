@@ -3,17 +3,24 @@
 //! where possible. Each step gets the results of the steps it depends on, and steps
 //! whose prerequisites failed are skipped.
 //!
-//! Plan text, one step per line (`//` starts a comment):
+//! Plan text, one claim or step per line (`//` starts a comment):
 //!
 //! ```text
+//! claim: C-1 The parser handles empty input
 //! api @alice:repo Summarize the public API of src/agent.rs
-//! tests after api #qa:code using claude Write test ideas for this API
-//! report after api,tests @helper Write a one-paragraph status report
+//! fix after api @bob:app verify=test attempts=3 claims=C-1 Make the parser accept empty input
+//! review after fix #qa:app apply=fix verify=test claims=C-1 Check the fix independently
+//! signoff after review approve @carol claims=C-1 Approve the change for release
 //! ```
 //!
 //! `@peer` runs on that peer and `#squad` on the least busy online member of the
 //! squad; `:folder` picks a folder the peer shares with you (default: its data
-//! folder) and `using <provider>` a provider (default: copilot).
+//! folder) and `using <provider>` a provider (default: copilot). Options before the
+//! prompt: `verify=a,b` asks the peer's runtime to run those owner-defined checks
+//! after the model (as signed evidence), `attempts=N` retries with the failures,
+//! `claims=C-1` says which claims the step proves and `apply=step` applies that
+//! prerequisite's commit first. `approve @person` (or `@me`) asks a team member to
+//! sign off instead of running a model. See [`crate::runs`] for the verdicts.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -22,7 +29,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
-use crate::agent::{Agent, PeerInfo};
+use crate::agent::{Agent, Delivered, PeerInfo};
+use crate::evidence::Evidence;
 use crate::llm::{LlmTask, Provider};
 use crate::profile::validate_name;
 
@@ -116,10 +124,34 @@ pub struct Step {
     pub share: Option<String>,
     pub provider: Provider,
     pub prompt: String,
+    /// Owner-defined checks the peer's runtime runs after the model (`verify=a,b`).
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// Model attempts while checks fail (`attempts=N`).
+    #[serde(default)]
+    pub attempts: Option<u32>,
+    /// Claims this step provides evidence for (`claims=C-1,C-2`).
+    #[serde(default)]
+    pub claims: Vec<String>,
+    /// A prerequisite whose commit (patch) is applied before this step (`apply=step`).
+    #[serde(default)]
+    pub apply: Option<String>,
+    /// A team member's sign-off instead of an LLM task (`approve @person`).
+    #[serde(default)]
+    pub approve: bool,
+}
+
+/// A statement the plan must prove with evidence (`claim: ID text`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimDef {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
+    #[serde(default)]
+    pub claims: Vec<ClaimDef>,
     pub steps: Vec<Step>,
 }
 
@@ -128,29 +160,39 @@ impl Plan {
     /// with its line number.
     pub fn parse(text: &str) -> Result<Self> {
         let mut steps = Vec::new();
+        let mut claims = Vec::new();
         let mut errors = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
                 continue;
             }
-            match parse_step(line) {
-                Ok(step) => steps.push(step),
-                Err(e) => errors.push(format!("line {}: {e}", n + 1)),
+            let parsed = match line.strip_prefix("claim:") {
+                Some(rest) => parse_claim(rest).map(|c| claims.push(c)),
+                None => parse_step(line).map(|s| steps.push(s)),
+            };
+            if let Err(e) = parsed {
+                errors.push(format!("line {}: {e}", n + 1));
             }
         }
         if !errors.is_empty() {
             bail!("{}", errors.join("\n"));
         }
-        let plan = Plan { steps };
+        let plan = Plan { claims, steps };
         plan.validate()?;
         Ok(plan)
     }
 
-    /// Unique ids, known dependencies and no cycles.
+    /// Unique ids, known dependencies and claims, sensible options and no cycles.
     pub fn validate(&self) -> Result<()> {
         if self.steps.is_empty() {
             bail!("the plan has no steps");
+        }
+        let mut claim_ids = HashMap::new();
+        for claim in &self.claims {
+            if claim_ids.insert(claim.id.as_str(), claim).is_some() {
+                bail!("claim '{}' is defined twice", claim.id);
+            }
         }
         let mut seen = HashMap::new();
         for step in &self.steps {
@@ -166,6 +208,41 @@ impl Plan {
                 if !seen.contains_key(dep.as_str()) {
                     bail!("step '{}' depends on unknown step '{dep}'", step.id);
                 }
+            }
+            if let Some(claim) = step
+                .claims
+                .iter()
+                .find(|c| !claim_ids.contains_key(c.as_str()))
+            {
+                bail!(
+                    "step '{}' proves unknown claim '{claim}'; define it first with a line: claim: {claim} <what must be true>",
+                    step.id
+                );
+            }
+            if let Some(apply) = &step.apply
+                && !step.after.contains(apply)
+            {
+                bail!(
+                    "step '{}' applies the work of '{apply}', so it must run after it (after {apply})",
+                    step.id
+                );
+            }
+            if step.attempts.is_some() && step.checks.is_empty() {
+                bail!(
+                    "step '{}' sets attempts but no checks to retry on (verify=...)",
+                    step.id
+                );
+            }
+            if step.approve
+                && (!step.checks.is_empty() || step.apply.is_some() || step.share.is_some())
+            {
+                bail!(
+                    "approval step '{}' can't have checks, a folder or a patch",
+                    step.id
+                );
+            }
+            if step.approve && matches!(step.target, Target::Squad(_)) {
+                bail!("approval step '{}' needs a person: @name or @me", step.id);
             }
         }
         // Kahn's algorithm: whatever can't be ordered is on a cycle.
@@ -200,6 +277,29 @@ impl Plan {
     }
 }
 
+fn parse_claim(rest: &str) -> Result<ClaimDef> {
+    let rest = rest.trim();
+    let (id, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    validate_name(id).map_err(|_| anyhow!("invalid claim id {id:?}"))?;
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("claim {id} needs a statement: claim: {id} <what must be true>");
+    }
+    Ok(ClaimDef {
+        id: id.to_owned(),
+        text: text.to_owned(),
+    })
+}
+
+fn list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn parse_step(line: &str) -> Result<Step> {
     let mut words = line.split_whitespace().peekable();
     let id = words.next().context("missing step id")?.to_owned();
@@ -216,6 +316,10 @@ fn parse_step(line: &str) -> Result<Step> {
             .map(str::to_owned)
             .collect();
     }
+    let approve = words.peek() == Some(&"approve");
+    if approve {
+        words.next();
+    }
     let target = words.next().context("missing target: @peer or #squad")?;
     let (kind, rest) = target.split_at(1);
     let (name, share) = match rest.split_once(':') {
@@ -229,11 +333,39 @@ fn parse_step(line: &str) -> Result<Step> {
         _ => bail!("target must be @peer or #squad, got {target:?}"),
     };
     let mut provider = Provider::Copilot;
-    if words.peek() == Some(&"using") {
-        words.next();
-        let name = words.next().context("'using' needs a provider")?;
-        provider = clap::ValueEnum::from_str(name, true)
-            .map_err(|_| anyhow!("unknown provider {name:?}"))?;
+    let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
+    loop {
+        match words.peek().copied() {
+            Some("using") => {
+                words.next();
+                let name = words.next().context("'using' needs a provider")?;
+                provider = clap::ValueEnum::from_str(name, true)
+                    .map_err(|_| anyhow!("unknown provider {name:?}"))?;
+            }
+            Some(word) if word.contains('=') => {
+                let (key, value) = word.split_once('=').expect("contains '='");
+                match key {
+                    "verify" => checks = list(value),
+                    "attempts" => {
+                        let n: u32 = value
+                            .parse()
+                            .map_err(|_| anyhow!("attempts must be a number, got {value:?}"))?;
+                        if !(1..=crate::evidence::MAX_ATTEMPTS).contains(&n) {
+                            bail!(
+                                "attempts must be between 1 and {}",
+                                crate::evidence::MAX_ATTEMPTS
+                            );
+                        }
+                        attempts = Some(n);
+                    }
+                    "claims" | "claim" => claims = list(value),
+                    "apply" => apply = Some(value.to_owned()).filter(|v| !v.is_empty()),
+                    _ => break,
+                }
+                words.next();
+            }
+            _ => break,
+        }
     }
     let prompt = words.collect::<Vec<_>>().join(" ");
     if prompt.is_empty() {
@@ -246,23 +378,89 @@ fn parse_step(line: &str) -> Result<Step> {
         share,
         provider,
         prompt,
+        checks,
+        attempts,
+        claims,
+        apply,
+        approve,
     })
 }
 
 /// Where a step is in its life.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum StepState {
     Waiting,
-    Running { peer: String },
-    Done { peer: String, output: String },
-    Failed { peer: Option<String>, error: String },
-    Skipped { reason: String },
+    Running {
+        peer: String,
+    },
+    Done {
+        peer: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<Evidence>,
+        /// The evidence is signed by `peer` for exactly this output.
+        #[serde(default)]
+        verified: bool,
+        /// The step's commit as a patch (kept out of JSON; saved next to run reports).
+        #[serde(skip)]
+        patch: Option<String>,
+    },
+    Failed {
+        peer: Option<String>,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<Evidence>,
+        #[serde(default)]
+        verified: bool,
+    },
+    Skipped {
+        reason: String,
+    },
 }
 
 impl StepState {
-    fn finished(&self) -> bool {
+    pub fn finished(&self) -> bool {
         !matches!(self, StepState::Waiting | StepState::Running { .. })
+    }
+
+    pub fn failed(peer: Option<String>, error: String) -> Self {
+        StepState::Failed {
+            peer,
+            error,
+            evidence: None,
+            verified: false,
+        }
+    }
+
+    /// The step's state from what `peer` sent back. Evidence that isn't signed by
+    /// `peer`, or missing evidence for requested checks, fails the step.
+    fn from_delivered(peer: String, step: &Step, d: Delivered) -> Self {
+        let problem = match &d.evidence {
+            Some(_) if !d.verified => Some(format!("the evidence isn't validly signed by {peer}")),
+            None if !step.checks.is_empty() || step.approve => {
+                Some(format!("{peer} sent no evidence (an older version?)"))
+            }
+            _ => None,
+        };
+        if d.ok && problem.is_none() {
+            return StepState::Done {
+                peer,
+                output: d.output,
+                evidence: d.evidence,
+                verified: d.verified,
+                patch: d.patch,
+            };
+        }
+        StepState::Failed {
+            peer: Some(peer),
+            error: match problem {
+                Some(problem) => format!("{problem}\n\n{}", d.output),
+                None => d.output,
+            },
+            evidence: d.evidence,
+            verified: d.verified,
+        }
     }
 }
 
@@ -357,7 +555,7 @@ pub async fn run_plan(
         on_update(&step.id, &StepState::Waiting);
     }
     let mut busy: HashMap<String, usize> = HashMap::new();
-    let mut running: JoinSet<(String, String, Result<String>)> = JoinSet::new();
+    let mut running: JoinSet<(String, String, Result<Delivered>)> = JoinSet::new();
     loop {
         // Skip steps whose prerequisites failed; start steps whose prerequisites are done.
         let mut changed = true;
@@ -388,43 +586,76 @@ pub async fn run_plan(
                 {
                     continue;
                 }
-                let peer = match choose_peer(step, &agent.peers(), squads, &busy) {
-                    Ok(peer) => peer,
+                let deps: Vec<(&str, &str, &str)> = step
+                    .after
+                    .iter()
+                    .filter_map(|d| match &states[d] {
+                        StepState::Done { peer, output, .. } => {
+                            Some((d.as_str(), peer.as_str(), output.as_str()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let prompt = step_prompt(step, &deps);
+                let chosen = if step.approve {
+                    choose_approver(step, &agent.peers()).map(|(id, name)| (id, name, None))
+                } else {
+                    choose_peer(step, &agent.peers(), squads, &busy).map(|peer| {
+                        let mut task = LlmTask::new(step.provider, prompt.clone())
+                            .with_checks(step.checks.clone(), step.attempts);
+                        if let Some(share) = &step.share {
+                            task = task.in_share(share.clone());
+                        }
+                        task.patch = step.apply.as_ref().and_then(|a| match &states[a] {
+                            StepState::Done { patch, .. } => patch.clone(),
+                            _ => None,
+                        });
+                        (Some(peer.id), peer.name, Some(task))
+                    })
+                };
+                let (peer_id, peer_name, task) = match chosen {
+                    Ok(chosen) => chosen,
                     Err(e) => {
-                        let state = StepState::Failed {
-                            peer: None,
-                            error: format!("{e:#}"),
-                        };
+                        let state = StepState::failed(None, format!("{e:#}"));
                         on_update(&step.id, &state);
                         states.insert(step.id.clone(), state);
                         changed = true;
                         continue;
                     }
                 };
-                let deps: Vec<(&str, &str, &str)> = step
-                    .after
-                    .iter()
-                    .filter_map(|d| match &states[d] {
-                        StepState::Done { peer, output } => {
-                            Some((d.as_str(), peer.as_str(), output.as_str()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let mut task = LlmTask::new(step.provider, step_prompt(step, &deps));
-                if let Some(share) = &step.share {
-                    task = task.in_share(share.clone());
+                if task
+                    .as_ref()
+                    .is_some_and(|t| step.apply.is_some() && t.patch.is_none())
+                {
+                    let state = StepState::failed(
+                        None,
+                        format!(
+                            "step {} left no patch to apply (it changed nothing, or its folder isn't shared with --worktrees)",
+                            step.apply.as_deref().unwrap_or_default()
+                        ),
+                    );
+                    on_update(&step.id, &state);
+                    states.insert(step.id.clone(), state);
+                    changed = true;
+                    continue;
                 }
-                *busy.entry(peer.name.clone()).or_default() += 1;
+                *busy.entry(peer_name.clone()).or_default() += 1;
                 let state = StepState::Running {
-                    peer: peer.name.clone(),
+                    peer: peer_name.clone(),
                 };
                 on_update(&step.id, &state);
                 states.insert(step.id.clone(), state);
-                let (agent, id) = (agent.clone(), step.id.clone());
+                let (agent, id, title) = (
+                    agent.clone(),
+                    step.id.clone(),
+                    format!("Plan step {}", step.id),
+                );
                 running.spawn(async move {
-                    let result = agent.delegate(peer.id, task).await;
-                    (id, peer.name, result)
+                    let result = match (peer_id, task) {
+                        (Some(peer), Some(task)) => agent.delegate_verified(peer, task).await,
+                        (approver, _) => agent.request_approval(approver, &title, &prompt).await,
+                    };
+                    (id, peer_name, result)
                 });
             }
         }
@@ -437,18 +668,29 @@ pub async fn run_plan(
         if let Some(n) = busy.get_mut(&peer) {
             *n = n.saturating_sub(1);
         }
+        let step = plan.steps.iter().find(|s| s.id == id).expect("known step");
         let state = match result {
-            Ok(output) => StepState::Done { peer, output },
-            Err(e) => StepState::Failed {
-                peer: Some(peer),
-                error: format!("{e:#}"),
-            },
+            Ok(delivered) => StepState::from_delivered(peer, step, delivered),
+            Err(e) => StepState::failed(Some(peer), format!("{e:#}")),
         };
         on_update(&id, &state);
         states.insert(id, state);
     }
     debug_assert!(states.values().all(StepState::finished));
     states
+}
+
+/// The person who must approve `step`: a connected peer by name, or `@me` (None).
+fn choose_approver(step: &Step, peers: &[PeerInfo]) -> Result<(Option<iroh::EndpointId>, String)> {
+    match &step.target {
+        Target::Peer(name) if name == "me" => Ok((None, "you".to_owned())),
+        Target::Peer(name) => peers
+            .iter()
+            .find(|p| &p.name == name)
+            .map(|p| (Some(p.id), p.name.clone()))
+            .ok_or_else(|| anyhow!("{name} is not connected")),
+        Target::Squad(_) => bail!("approvals need a person: @name or @me"),
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +751,62 @@ mod tests {
     }
 
     #[test]
+    fn parses_claims_checks_patches_and_approvals() {
+        let plan = Plan::parse(
+            "claim: C-1 The parser handles empty input\n\
+             impl @dev:app using claude verify=test,lint attempts=3 claims=C-1 Fix the parser\n\
+             check after impl #qa:app apply=impl verify=test claims=C-1 Review it\n\
+             signoff after check approve @alice claims=C-1 Approve the release\n\
+             note @bob verify the=prompt words stay in the prompt",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.claims,
+            [ClaimDef {
+                id: "C-1".into(),
+                text: "The parser handles empty input".into()
+            }]
+        );
+        let impl_ = &plan.steps[0];
+        assert_eq!(impl_.provider, Provider::Claude);
+        assert_eq!(impl_.checks, ["test", "lint"]);
+        assert_eq!(impl_.attempts, Some(3));
+        assert_eq!(impl_.claims, ["C-1"]);
+        assert_eq!(impl_.prompt, "Fix the parser");
+        assert_eq!(plan.steps[1].apply.as_deref(), Some("impl"));
+        let signoff = &plan.steps[2];
+        assert!(signoff.approve && !impl_.approve);
+        assert_eq!(signoff.target, Target::Peer("alice".into()));
+        assert_eq!(signoff.prompt, "Approve the release");
+        assert_eq!(
+            plan.steps[3].prompt,
+            "verify the=prompt words stay in the prompt"
+        );
+
+        let fails = |text: &str, expected: &str| {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text:?}: {err}");
+        };
+        fails("a @x claims=C-9 do", "unknown claim 'C-9'");
+        fails("a @x do\nb @x apply=a check", "must run after it");
+        fails("a @x attempts=2 do", "no checks to retry on");
+        fails(
+            "a @x verify=t attempts=9 do",
+            "attempts must be between 1 and 5",
+        );
+        fails("a approve #qa ok?", "needs a person");
+        fails(
+            "a approve @x:repo ok?",
+            "can't have checks, a folder or a patch",
+        );
+        fails("claim: C-1\na @x do", "needs a statement");
+        fails(
+            "claim: C-1 x\nclaim: C-1 y\na @x do",
+            "claim 'C-1' is defined twice",
+        );
+    }
+
+    #[test]
     fn squads_persist_and_validate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("squads.json");
@@ -543,6 +841,7 @@ mod tests {
                 .map(|s| ShareInfo {
                     name: (*s).into(),
                     access: Access::ReadOnly,
+                    ..Default::default()
                 })
                 .collect(),
             owner: None,
