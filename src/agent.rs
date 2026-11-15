@@ -11,6 +11,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
+use crate::audit::{AuditEntry, AuditLog};
 use crate::llm::{Access, Executor, LlmTask, Provider};
 use crate::protocol::{ALPN, Message, write_message};
 use crate::trust::{TrustStore, TrustedPeer};
@@ -44,6 +45,8 @@ pub struct AgentConfig {
     pub trust: TrustStore,
     /// Runs LLM tasks that allowlisted peers delegate (none: serve nothing).
     pub executor: Option<Arc<dyn Executor>>,
+    /// Where to record tasks peers ask this agent to run (none: no audit log).
+    pub audit: Option<Arc<AuditLog>>,
 }
 
 impl AgentConfig {
@@ -55,6 +58,7 @@ impl AgentConfig {
             bind: None,
             trust: TrustStore::default(),
             executor: None,
+            audit: None,
         }
     }
 }
@@ -124,6 +128,7 @@ struct Inner {
     next_conn_id: AtomicU64,
     shutdown: watch::Sender<bool>,
     executor: Option<Arc<dyn Executor>>,
+    audit: Option<Arc<AuditLog>>,
     task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
@@ -167,6 +172,7 @@ impl Agent {
             next_conn_id: AtomicU64::new(0),
             shutdown: watch::Sender::new(false),
             executor: config.executor,
+            audit: config.audit,
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -544,6 +550,28 @@ impl Inner {
         task_id: u64,
         task: LlmTask,
     ) -> Result<String> {
+        let clock = std::time::SystemTime::now();
+        let mut granted = None;
+        let result = self
+            .run_peer_task(id, from, task_id, &task, &mut granted)
+            .await;
+        if let Some(audit) = &self.audit {
+            audit.record(&AuditEntry::new(
+                from, id, task_id, &task, granted, &result, clock,
+            ));
+        }
+        result
+    }
+
+    /// Checks and runs a peer's task; sets `granted` once it is admitted.
+    async fn run_peer_task(
+        &self,
+        id: &EndpointId,
+        from: &str,
+        task_id: u64,
+        task: &LlmTask,
+        granted: &mut Option<Access>,
+    ) -> Result<String> {
         let executor = self
             .executor
             .as_ref()
@@ -552,13 +580,14 @@ impl Inner {
             bail!("{} does not serve {}", self.name, task.provider);
         }
         let access = self.admit_task(id)?;
+        *granted = Some(access);
         let _ = self.events.send(Event::TaskReceived {
             from: from.to_owned(),
             task_id,
             provider: task.provider,
         });
         let _slot = self.task_slots.acquire().await?;
-        let result = executor.execute(&task, access).await;
+        let result = executor.execute(task, access).await;
         let _ = self.events.send(Event::TaskCompleted {
             from: from.to_owned(),
             task_id,

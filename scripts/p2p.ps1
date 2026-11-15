@@ -9,15 +9,19 @@
   .\scripts\p2p.ps1 test        # cargo test (no LLM credentials needed)
   .\scripts\p2p.ps1 demo        # worker + boss windows, allowlisted to each other, over the internet
   .\scripts\p2p.ps1 live-test   # 4 agents over the internet, 2 accounts, allowlist + real Copilot delegation
+  .\scripts\p2p.ps1 evidence    # gates + tests matched to evidence/claims.json; report in target\evidence
+  .\scripts\p2p.ps1 evidence -Live   # same, plus the live internet test
   .\scripts\p2p.ps1 agent --name me --providers copilot   # run one agent in this terminal
   .\scripts\p2p.ps1 agent auth status                     # any p2pagents command, e.g. auth
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('doctor', 'build', 'test', 'demo', 'live-test', 'agent')]
+    [ValidateSet('doctor', 'build', 'test', 'demo', 'live-test', 'evidence', 'agent')]
     [string]$Command = 'doctor',
     # demo: folder the worker's Copilot may read (read-only). Default: this repo.
     [string]$Workspace,
+    # evidence: also run the live internet test.
+    [switch]$Live,
     [Parameter(ValueFromRemainingArguments)]
     [string[]]$AgentArgs
 )
@@ -107,6 +111,11 @@ switch ($Command) {
     'live-test' {
         Invoke-Build
         python (Join-Path $PSScriptRoot 'live_test.py')
+        exit $LASTEXITCODE
+    }
+    'evidence' {
+        $evidenceArgs = @(if ($Live) { '--live' })
+        python (Join-Path $PSScriptRoot 'evidence.py') @evidenceArgs
         exit $LASTEXITCODE
     }
 }

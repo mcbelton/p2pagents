@@ -18,6 +18,15 @@ jobs:
           node-version: 22
       - name: Install Linux build dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      # fmt, clippy and tests, each result matched to a claim in evidence/claims.json.
+      - name: Evidence (gates, tests, claims)
+        run: python3 scripts/evidence.py
+      - name: Upload evidence report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-report
+          path: target/evidence/
+      - name: Evidence summary
+        if: always()
+        run: test -f target/evidence/report.md && cat target/evidence/report.md >> "$GITHUB_STEP_SUMMARY"

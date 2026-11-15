@@ -354,6 +354,11 @@ impl Profile {
         self.dir.join("peers.json")
     }
 
+    /// Log of tasks peers ran on this profile's agents (see [`crate::audit`]).
+    pub fn audit_path(&self) -> PathBuf {
+        self.dir.join("audit.jsonl")
+    }
+
     /// Deletes the profile: its identity, stored secrets and folder (including
     /// the provider homes and their sign-ins).
     pub fn delete(self) -> Result<()> {

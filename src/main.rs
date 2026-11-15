@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use p2pagents::audit::AuditLog;
 use p2pagents::auth::{LoginMethod, ProviderTools};
 use p2pagents::profile::DEFAULT_GITHUB_HOST;
 use p2pagents::trust::DEFAULT_TASKS_PER_HOUR;
@@ -60,6 +61,18 @@ enum Command {
     Doctor {
         #[command(flatten)]
         bridge: BridgeArg,
+    },
+    /// Show the tasks peers ran on a profile's agents (who, provider, access, outcome).
+    /// Prompts are not stored, only their SHA-256 and length.
+    Audit {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// How many of the most recent entries to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print the raw JSON lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -281,8 +294,76 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Audit {
+            profile,
+            limit,
+            json,
+        }) => run_audit(&profile.name, limit, json),
         None => run_agent(cli.run).await,
     }
+}
+
+fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
+    let profile = Profile::open(profile)?;
+    let entries = AuditLog::read(&profile.audit_path(), limit)?;
+    if json {
+        for entry in &entries {
+            println!("{}", serde_json::to_string(entry)?);
+        }
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("profile '{}': no peer tasks recorded yet", profile.name);
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8}  prompt",
+        "time (UTC)", "peer", "task", "provider", "access", "outcome", "seconds"
+    );
+    for e in &entries {
+        let secs = e.ts_ms / 1000;
+        let (days, rem) = (secs / 86_400, secs % 86_400);
+        let access = e.access.map_or("-".to_owned(), |a| a.to_string());
+        let outcome = serde_json::to_value(e.outcome)?;
+        println!(
+            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}",
+            format!(
+                "{} {:02}:{:02}:{:02}",
+                civil_date(days),
+                rem / 3600,
+                rem % 3600 / 60,
+                rem % 60
+            ),
+            e.peer,
+            e.task_id,
+            e.provider.to_string(),
+            access,
+            outcome.as_str().unwrap_or("?"),
+            e.duration_ms as f64 / 1000.0,
+            e.prompt_chars,
+            &e.prompt_sha256[..12],
+            e.error
+                .as_deref()
+                .map(|err| format!("\n{:>22}{err}", "error: "))
+                .unwrap_or_default(),
+        );
+    }
+    println!("log: {}", profile.audit_path().display());
+    Ok(())
+}
+
+/// `YYYY-MM-DD` for days since 1970-01-01 (proleptic Gregorian calendar).
+fn civil_date(days: u64) -> String {
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn run_peers(command: PeersCommand) -> Result<()> {
@@ -476,6 +557,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.trust = profile.trust()?;
         if args.serve {
             config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
+            config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
         }
         Agent::bind(config).await?
     };
@@ -687,5 +769,12 @@ mod tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(11_016), "2000-02-29");
+        assert_eq!(civil_date(20_772), "2026-11-15");
     }
 }

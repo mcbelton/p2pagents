@@ -2,6 +2,7 @@
 //! OpenAI Codex SDK (official TypeScript SDKs, reached through the Node bridge).
 
 pub mod bridge;
+pub mod changes;
 pub mod copilot;
 pub mod policy;
 
@@ -204,21 +205,24 @@ impl Executor for SdkExecutor {
             bail!("provider {} is not enabled on this agent", task.provider);
         }
         let access = grant.min(self.access);
-        match task.provider {
-            Provider::Copilot => {
-                self.copilot
-                    .as_ref()
-                    .expect("enabled")
-                    .run(task, access)
-                    .await
+        let run = async {
+            match task.provider {
+                Provider::Copilot => {
+                    self.copilot
+                        .as_ref()
+                        .expect("enabled")
+                        .run(task, access)
+                        .await
+                }
+                Provider::Claude | Provider::Codex => {
+                    self.bridge
+                        .as_ref()
+                        .expect("enabled")
+                        .run(task, &self.workspace, access)
+                        .await
+                }
             }
-            Provider::Claude | Provider::Codex => {
-                self.bridge
-                    .as_ref()
-                    .expect("enabled")
-                    .run(task, &self.workspace, access)
-                    .await
-            }
-        }
+        };
+        changes::track_changes(&self.workspace, access, run).await
     }
 }

@@ -5,6 +5,7 @@
 //! accounts (see [`profile`]).
 
 pub mod agent;
+pub mod audit;
 pub mod auth;
 pub mod llm;
 pub mod profile;

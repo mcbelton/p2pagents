@@ -164,6 +164,7 @@ try:
     path = os.path.join(ws, "p2p_live.txt")
     content = open(path).read().strip() if os.path.exists(path) else None
     check("worker2 wrote p2p_live.txt in its workspace", content and "written via p2p delegation" in content, repr(content))
+    check("boss sees the files worker2's task changed", any("added `p2p_live.txt`" in l for l in boss.lines))
     check("no task failures at boss", not any("failed" in l for l in boss.lines))
     for profile in ("worker1", "worker2"):
         state = os.path.join(HOME, "profiles", profile, "copilot", "session-state")
@@ -187,6 +188,18 @@ try:
     check("worker1 saw worker2 disconnect", w1.wait_for(r"^- worker2", 60))
     boss.send("/delegate copilot@worker2 hi")
     check("delegating to departed peer refused", boss.wait_for(r"no peer named worker2"))
+
+    print("== audit logs on the workers")
+    def audit(profile):
+        _, out = cli("audit", "--profile", profile, "--json")
+        return [json.loads(l) for l in out.splitlines() if l.startswith("{")]
+    a1, a2 = audit("worker1"), audit("worker2")
+    check("worker1 audited boss's tasks", sum(e["peer"] == "boss" and e["outcome"] == "done" for e in a1) >= 2, a1)
+    check("worker2 audited boss's task with its grant",
+          any(e["peer"] == "boss" and e["outcome"] == "done" and e["access"] == "workspace-write" for e in a2), a2)
+    check("worker2 audited the refused request from worker1",
+          any(e["peer"] == "worker1" and e["outcome"] == "refused" for e in a2), a2)
+    check("audit logs hold no prompt text", not any("p2p_live" in json.dumps(e) for e in a1 + a2))
 finally:
     for a in reversed(agents):
         a.stop()
@@ -197,4 +210,7 @@ finally:
 
 passed = sum(ok for _, ok in results)
 print(f"\n== {passed}/{len(results)} checks passed")
+if os.environ.get("P2P_LIVE_RESULTS"):
+    with open(os.environ["P2P_LIVE_RESULTS"], "w") as f:
+        json.dump([{"check": name, "ok": ok} for name, ok in results], f, indent=1)
 sys.exit(0 if passed == len(results) else 1)

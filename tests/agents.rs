@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use p2pagents::audit::{AuditLog, Outcome};
 use p2pagents::{
     Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
     TrustStore, TrustedPeer,
@@ -38,6 +39,7 @@ struct Node {
     key: SecretKey,
     trust: TrustStore,
     executor: Option<Arc<dyn Executor>>,
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl Node {
@@ -47,6 +49,7 @@ impl Node {
             key: SecretKey::generate(),
             trust: TrustStore::default(),
             executor: None,
+            audit: None,
         }
     }
 
@@ -77,6 +80,7 @@ impl Node {
         config.bind = Some("127.0.0.1:0".parse().unwrap());
         config.trust = self.trust;
         config.executor = self.executor;
+        config.audit = self.audit;
         Agent::bind(config).await.unwrap()
     }
 }
@@ -318,6 +322,9 @@ async fn delegation_needs_permission_and_respects_the_hourly_limit() {
     worker.trusts(&limited, Some(1));
     chatty.trusts(&worker, None);
     limited.trusts(&worker, None);
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    worker.audit = Some(Arc::new(AuditLog::new(audit_path.clone())));
     let (worker, _we) = worker.start().await;
     let (chatty, _ce) = chatty.start().await;
     let (limited, _le) = limited.start().await;
@@ -345,6 +352,26 @@ async fn delegation_needs_permission_and_respects_the_hourly_limit() {
         err.to_string().contains("limit of 1 tasks per hour"),
         "{err}"
     );
+
+    // Every request is audited on the worker: who, outcome and access, no prompt text.
+    let entries = AuditLog::read(&audit_path, 10).unwrap();
+    let summary: Vec<(&str, Outcome)> = entries
+        .iter()
+        .map(|e| (e.peer.as_str(), e.outcome))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("chatty", Outcome::Refused),
+            ("limited", Outcome::Done),
+            ("limited", Outcome::Refused),
+        ]
+    );
+    assert_eq!(entries[1].access, Some(Access::ReadOnly));
+    assert_eq!(entries[1].peer_id, limited.id().to_string());
+    assert!(entries[0].error.as_deref().unwrap().contains("not allowed"));
+    let raw = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!raw.contains("\"one\"") && !raw.contains("\"two\""));
 }
 
 #[tokio::test]

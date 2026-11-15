@@ -88,6 +88,7 @@ cd D:\dev\p2pagents
 .\scripts\p2p.ps1 test        # automated tests (no LLM sign-in needed)
 .\scripts\p2p.ps1 demo        # worker + boss windows, allowlisted to each other, connected over the internet
 .\scripts\p2p.ps1 live-test   # 4 agents over the internet, 2 accounts, allowlist + real Copilot delegation (needs Python)
+.\scripts\p2p.ps1 evidence    # every claim in evidence/claims.json checked against its tests (add -Live for the internet test)
 ```
 
 In the **boss** window wait for `+ worker`, then type `/peers` and
@@ -419,6 +420,35 @@ In terminal 2, once `+ worker` appears:
 
 Results print when they arrive, so you can keep typing while tasks run.
 
+When a task may edit files (`workspace-write` or `full`), its result ends with the files it
+changed in the worker's workspace, so you can see what a delegated coding task touched:
+
+```text
+=== copilot on worker2 ===
+DONE
+---
+**Files changed in the workspace (1):**
+- added `p2p_live.txt`
+```
+
+Build output and dependencies (`.git`, `target`, `node_modules`, ...) are not listed. If
+two tasks edit the same workspace at once, each lists both tasks' changes.
+
+### Audit log
+
+An agent started with `--serve` records every task a peer asks it to run, accepted or
+refused, in the profile's `audit.jsonl`: peer name and key, provider, the access the task
+got, outcome (`done`, `failed`, `refused`), duration and any error. The prompt is **not**
+stored, only its SHA-256 and length, so the log holds no peer content.
+
+```text
+> p2pagents audit --profile worker
+time (UTC)           peer            task provider access           outcome   seconds  prompt
+2026-11-15 18:39:55  boss               1 copilot  read-only        done          7.0  43 chars, sha256 7a9139bee1be
+```
+
+`--limit N` shows more entries and `--json` prints the raw lines.
+
 ### Options
 
 | Option | Default | Description |
@@ -438,8 +468,8 @@ Results print when they arrive, so you can keep typing while tasks run.
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
-`p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder (and uses a separate
-credential store namespace).
+`p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
+(and uses a separate credential store namespace).
 
 ## Web UI
 
@@ -576,6 +606,41 @@ so they need Node.js but no LLM credentials. The multi-agent tests run real iroh
 endpoints on localhost in local mode, so they need no internet.
 `.\scripts\p2p.ps1 live-test` runs the end-to-end test over the internet.
 
+## Evidence-driven development
+
+Every behavior p2pagents promises is written down as a **claim** in
+[evidence/claims.json](evidence/claims.json), with the evidence that proves it: unit and
+integration tests, and checks from the live internet test. For example:
+
+```json
+{ "id": "AUD-1", "claim": "Every task a peer asks an agent to run is recorded ... without the prompt text.",
+  "tests": ["lib::audit::records_outcomes_without_the_prompt", "agents::delegation_needs_permission_and_respects_the_hourly_limit"],
+  "live":  ["worker2 audited the refused request from worker1", "audit logs hold no prompt text"] }
+```
+
+[scripts/evidence.py](scripts/evidence.py) runs the gates and the tests, matches each result
+to the claims and writes a report:
+
+```powershell
+.\scripts\p2p.ps1 evidence         # fmt, clippy, tests -> claims (no credentials; what CI runs)
+.\scripts\p2p.ps1 evidence -Live   # also the live internet test with real Copilot (needs gh sign-in)
+# report: target\evidence\report.md (+ report.json, raw logs in target\evidence\logs)
+```
+
+It fails when a gate fails, any claim has missing or failing evidence, or a test or live
+check proves no claim. Every claim needs evidence, and every test must prove a claim. CI
+runs it on every push, publishes the report in the run summary and keeps it as the
+`evidence-report` artifact.
+
+Workflow for a change:
+
+1. Write or update the claim in `evidence/claims.json` first (what will be true).
+2. Add the tests (and a live check in `scripts/live_test.py` if it involves real peers or
+   providers) and list them under the claim. Test ids are `<target>::<path>` as printed by
+   `cargo test`, without `::tests` (`lib::...`, `bin::...`, or the file name in `tests/`).
+3. Implement until `.\scripts\p2p.ps1 evidence` passes. Run with `-Live` before a release.
+4. Keep the report (`target\evidence\report.md`) with the PR or release as its evidence.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -613,6 +678,9 @@ endpoints on localhost in local mode, so they need no internet.
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
+- [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
+- [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
+- [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
 - [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events

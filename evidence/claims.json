@@ -1,0 +1,200 @@
+{
+  "$comment": "Evidence-driven development: every claim p2pagents makes, and the evidence that proves it. Test ids are <target>::<path> as printed by cargo test with '::tests' removed (target: lib, bin, or an integration test file name). Live checks are names printed by scripts/live_test.py; a trailing * matches a prefix. Run: python scripts/evidence.py [--live]. See README 'Evidence-driven development'.",
+  "claims": [
+    {
+      "id": "NET-1",
+      "area": "network",
+      "claim": "Agents authenticate each other by public key and refuse every key that is not on the allowlist, including peers learned through gossip.",
+      "tests": [
+        "agents::rejects_peers_that_are_not_allowlisted",
+        "agents::gossip_does_not_connect_peers_that_do_not_trust_each_other"
+      ],
+      "live": ["worker1 refused intruder", "intruder has no peers"]
+    },
+    {
+      "id": "NET-2",
+      "area": "network",
+      "claim": "Agents on different networks find and connect to each other over the internet using only their endpoint ids (no IPs, ports or --peer).",
+      "tests": ["lib::trust::ticket_round_trips_and_bare_ids_parse", "lib::protocol::hello_with_addresses_round_trips"],
+      "live": [
+        "worker1 online with a ticket",
+        "worker2 found worker1 by id over the internet",
+        "boss connected to worker1",
+        "boss connected to worker2"
+      ]
+    },
+    {
+      "id": "NET-3",
+      "area": "network",
+      "claim": "Allowlisted peers discover each other by gossip and chat is delivered to every connected peer.",
+      "tests": ["agents::peers_discover_each_other_via_gossip_and_chat", "lib::protocol::uses_tagged_json"],
+      "live": ["worker1 got chat", "worker2 got chat"]
+    },
+    {
+      "id": "NET-4",
+      "area": "network",
+      "claim": "Two peers dialing each other at once end up with one connection and no join/leave flapping.",
+      "tests": ["agents::simultaneous_dials_converge_on_one_connection"]
+    },
+    {
+      "id": "NET-5",
+      "area": "network",
+      "claim": "Peers see disconnects; a task in flight fails cleanly when its peer leaves, and departed peers can't be delegated to.",
+      "tests": ["agents::shutdown_disconnects_peers", "agents::delegated_task_fails_when_peer_disconnects"],
+      "live": ["boss saw worker2 disconnect", "worker1 saw worker2 disconnect", "delegating to departed peer refused"]
+    },
+    {
+      "id": "DEL-1",
+      "area": "delegation",
+      "claim": "A peer can delegate tasks only if allowlisted with --delegate, and only within its hourly limit.",
+      "tests": ["agents::delegation_needs_permission_and_respects_the_hourly_limit"],
+      "live": ["delegation without permission refused"]
+    },
+    {
+      "id": "DEL-2",
+      "area": "delegation",
+      "claim": "Delegated tasks run on a peer that serves the provider and the result comes back; providers a peer doesn't serve are refused.",
+      "tests": [
+        "agents::delegates_tasks_to_a_peer_that_serves_the_provider",
+        "agents::refuses_providers_the_peer_does_not_serve",
+        "lib::protocol::task_request_round_trips"
+      ],
+      "live": [
+        "boss sees worker1 serving Copilot",
+        "boss sees worker2 serving Copilot",
+        "worker1 started task",
+        "worker2 started task",
+        "worker1 result back at boss",
+        "worker2 result back at boss",
+        "worker1 answer mentions task_request",
+        "worker2 wrote p2p_live.txt in its workspace",
+        "no task failures at boss"
+      ]
+    },
+    {
+      "id": "DEL-3",
+      "area": "delegation",
+      "claim": "A peer's task gets the lower of the peer's own grant (default read-only) and the agent's --access; peers can't raise it.",
+      "tests": [
+        "agents::delegates_tasks_to_a_peer_that_serves_the_provider",
+        "lib::trust::allow_replaces_same_id_or_name_and_persists"
+      ],
+      "live": ["worker2 audited boss's task with its grant"]
+    },
+    {
+      "id": "ACC-1",
+      "area": "accounts",
+      "claim": "Each agent uses only its own profile's identity, accounts and private provider instances, never the machine's global sign-in.",
+      "tests": [
+        "isolation::bridge_gets_only_the_profile_credentials",
+        "secret_files::file_secret_store_keeps_identity_and_tokens_in_the_profile",
+        "lib::profile::rejects_path_like_names",
+        "lib::profile::config_round_trips_and_homes_are_per_profile",
+        "lib::profile::unconfigured_providers_fail_with_login_hint",
+        "lib::profile::bridge_env_points_each_provider_at_the_profile_home"
+      ],
+      "live": [
+        "worker1 signed in as *",
+        "worker2 signed in as *",
+        "unsigned profile refused",
+        "4 distinct endpoint ids",
+        "allowlists written",
+        "worker1 uses its own account",
+        "worker2 uses its own account",
+        "worker1's Copilot instance used its own COPILOT_HOME",
+        "worker2's Copilot instance used its own COPILOT_HOME"
+      ]
+    },
+    {
+      "id": "SEC-1",
+      "area": "security",
+      "claim": "Tasks can't read files outside the workspace or credential files inside it (Copilot and Claude), and secrets never reach the requesting peer.",
+      "tests": [
+        "lib::llm::policy::reads_stay_inside_the_workspace",
+        "lib::llm::policy::credentials_are_never_readable",
+        {"test": "lib::llm::policy::symlinks_cannot_escape", "os": "unix"},
+        "lib::llm::copilot::reads_are_confined_to_the_workspace",
+        "bridge::claude_tool_policy_confines_paths_and_tools"
+      ],
+      "live": ["outside read result back at boss", "secret never reached boss"]
+    },
+    {
+      "id": "SEC-2",
+      "area": "security",
+      "claim": "Writes need workspace-write access, stay in the workspace, and can't plant files that run code later (.git hooks, editor tasks, agent settings).",
+      "tests": [
+        "lib::llm::policy::writes_cannot_plant_code_that_runs_later",
+        "lib::llm::copilot::writes_need_write_access_and_stay_in_the_workspace"
+      ]
+    },
+    {
+      "id": "SEC-3",
+      "area": "security",
+      "claim": "Only the tools of the granted access level are offered; web, MCP, memory and sub-agents are never available to tasks.",
+      "tests": [
+        "lib::llm::copilot::tools_grow_with_access",
+        "lib::llm::copilot::network_mcp_and_other_tools_are_always_refused"
+      ]
+    },
+    {
+      "id": "SEC-4",
+      "area": "security",
+      "claim": "Shell commands need full access and run in an OS sandbox with no network and no bypass; obvious escapes are refused before they run.",
+      "tests": [
+        "lib::llm::copilot::shell_needs_full_access_and_no_urls_or_outside_paths",
+        "lib::llm::copilot::shell_runs_in_an_offline_sandbox_without_bypass",
+        "lib::llm::policy::shell_commands_are_scanned_for_obvious_escapes",
+        "bridge::claude_tool_policy_confines_paths_and_tools"
+      ]
+    },
+    {
+      "id": "UI-1",
+      "area": "web ui",
+      "claim": "The web UI is reachable only from this machine with the per-run token (DNS rebinding refused), sets a strict CSP, and runs tasks.",
+      "tests": ["ui::ui_requires_token_and_local_host_and_runs_tasks"]
+    },
+    {
+      "id": "AUD-1",
+      "area": "audit",
+      "claim": "Every task a peer asks an agent to run is recorded in the profile's audit log (peer, provider, access, outcome, duration) without the prompt text.",
+      "tests": [
+        "lib::audit::records_outcomes_without_the_prompt",
+        "agents::delegation_needs_permission_and_respects_the_hourly_limit",
+        "bin::civil_dates"
+      ],
+      "live": [
+        "worker1 audited boss's tasks",
+        "worker2 audited boss's task with its grant",
+        "worker2 audited the refused request from worker1",
+        "audit logs hold no prompt text"
+      ]
+    },
+    {
+      "id": "CHG-1",
+      "area": "delegation",
+      "claim": "When a task can edit files, its result lists the workspace files it added, modified or deleted (build output and .git ignored).",
+      "tests": [
+        "lib::llm::changes::reports_added_modified_and_deleted_files",
+        "lib::llm::changes::read_only_tasks_and_unchanged_workspaces_report_nothing",
+        "lib::llm::changes::long_lists_are_capped"
+      ],
+      "live": ["boss sees the files worker2's task changed"]
+    },
+    {
+      "id": "BRG-1",
+      "area": "providers",
+      "claim": "The Claude/Codex bridge passes task fields, runs requests concurrently, and surfaces provider errors and bridge exits.",
+      "tests": [
+        "bridge::sends_task_fields_and_returns_text",
+        "bridge::multiplexes_concurrent_requests",
+        "bridge::surfaces_provider_errors_and_bridge_exit"
+      ]
+    },
+    {
+      "id": "CLI-1",
+      "area": "cli",
+      "claim": "The command line definition is valid (no conflicting flags or subcommands).",
+      "tests": ["bin::cli_definition_is_valid"]
+    }
+  ]
+}
