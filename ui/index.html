@@ -57,6 +57,16 @@
         <ul class="list" id="trust-list"></ul>
       </section>
 
+      <section class="card" aria-labelledby="squads-h">
+        <div class="card-head">
+          <h2 id="squads-h">Squads</h2>
+          <button type="button" class="btn small" id="add-squad-btn">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>New squad
+          </button>
+        </div>
+        <ul class="list" id="squad-list"></ul>
+      </section>
+
       <section class="card" aria-labelledby="ticket-h">
         <div class="card-head"><h2 id="ticket-h">Your ticket</h2></div>
         <p class="muted small">Give this to peers so they can allowlist this agent.</p>
@@ -81,6 +91,7 @@
           <div class="segmented" role="radiogroup" aria-label="Send as">
             <button type="button" role="radio" data-mode="chat" aria-checked="true">Chat</button>
             <button type="button" role="radio" data-mode="task" aria-checked="false">Run task</button>
+            <button type="button" role="radio" data-mode="plan" aria-checked="false">Plan</button>
           </div>
           <div class="task-opts" id="task-opts" hidden>
             <label class="field-inline">
@@ -165,6 +176,26 @@
       <div class="dialog-actions">
         <button type="button" class="btn" id="add-cancel">Cancel</button>
         <button type="submit" class="btn primary" id="add-submit">Add peer</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="squad-dialog" aria-labelledby="squad-h">
+    <form method="dialog" id="squad-form" novalidate>
+      <h2 id="squad-h">New squad</h2>
+      <p class="muted small">A squad is a group of peers. In a plan, <span class="mono">#name</span> runs a step on its least busy online member that can do it.</p>
+      <label class="field">
+        <span>Squad name</span>
+        <input id="squad-name" type="text" maxlength="64" spellcheck="false" placeholder="e.g. qa">
+      </label>
+      <fieldset class="field">
+        <legend>Members</legend>
+        <div id="squad-members" class="share-checks"></div>
+      </fieldset>
+      <p class="form-error" id="squad-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="squad-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Save squad</button>
       </div>
     </form>
   </dialog>

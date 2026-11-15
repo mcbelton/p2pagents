@@ -144,6 +144,8 @@ pub struct ExecutorConfig {
 /// folder and access ([`TaskContext`]).
 pub struct SdkExecutor {
     providers: Vec<Provider>,
+    /// The profile's role, given to the model with every task.
+    role: Option<String>,
     copilot: Option<CopilotBackend>,
     bridge: Option<Bridge>,
     accounts: Vec<(Provider, String)>,
@@ -176,7 +178,10 @@ impl SdkExecutor {
             None
         } else {
             for &provider in &bridged {
-                accounts.push((provider, tools.check(profile, provider).await?));
+                accounts.push((
+                    provider,
+                    tools.check(&profile.account_profile()?, provider).await?,
+                ));
             }
             Some(Bridge::spawn_node(
                 &config.bridge_script,
@@ -185,6 +190,7 @@ impl SdkExecutor {
         };
         Ok(Arc::new(Self {
             providers,
+            role: profile.config.role.clone(),
             copilot,
             bridge,
             accounts,
@@ -210,6 +216,7 @@ impl Executor for SdkExecutor {
         if !ctx.workspace.is_dir() {
             bail!("folder {} does not exist", ctx.workspace.display());
         }
+        let task = &with_role(self.role.as_deref(), task);
         let run = async {
             match task.provider {
                 Provider::Copilot => {
@@ -229,5 +236,37 @@ impl Executor for SdkExecutor {
             }
         };
         changes::track_changes(&ctx.workspace, ctx.access, run).await
+    }
+}
+
+/// `task` with the agent's role put in front of the prompt, so the model acts in it.
+pub fn with_role(role: Option<&str>, task: &LlmTask) -> LlmTask {
+    let mut task = task.clone();
+    if let Some(role) = role.map(str::trim).filter(|r| !r.is_empty()) {
+        task.prompt = format!(
+            "You are working as: {role}. Act in that role.\n\nTask:\n{}",
+            task.prompt
+        );
+    }
+    task
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_guides_the_prompt() {
+        let task = LlmTask::new(Provider::Copilot, "Review src/lib.rs").in_share("repo");
+        let guided = with_role(Some("security reviewer"), &task);
+        assert!(
+            guided
+                .prompt
+                .starts_with("You are working as: security reviewer.")
+        );
+        assert!(guided.prompt.ends_with("Task:\nReview src/lib.rs"));
+        assert_eq!(guided.share.as_deref(), Some("repo"));
+        assert_eq!(with_role(None, &task), task);
+        assert_eq!(with_role(Some("  "), &task), task);
     }
 }

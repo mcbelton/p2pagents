@@ -74,7 +74,7 @@ def cli(*args):
 
 ws = tempfile.mkdtemp(prefix="p2p-live-")
 agents = []
-PROFILES = ("worker1", "worker2", "boss", "intruder")
+PROFILES = ("worker1", "worker2", "boss", "intruder", "helper")
 try:
     accounts = gh_accounts()
     if not accounts:
@@ -92,7 +92,7 @@ try:
 
     print("== each profile gets its own identity key")
     ids = {}
-    for profile in PROFILES:
+    for profile in PROFILES[:4]:  # 'helper' is created later as a digital worker
         _, out = cli("peers", "id", "--profile", profile)
         ids[profile] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
     check("4 distinct endpoint ids", len(set(ids.values())) == 4)
@@ -116,6 +116,13 @@ try:
         allow("intruder", "worker1"),  # worker1 does NOT allow intruder
     ])
     check("allowlists written", ok)
+    print("== digital worker: worker1's owner creates 'helper', which runs on worker1's account")
+    _, out = cli("worker", "create", "helper", "--owner", "worker1", "--role", "release note writer")
+    print(f"  {out.strip()}")
+    _, out = cli("peers", "id", "--profile", "helper")
+    ids["helper"] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
+    allow("helper", "boss", delegate=True)
+    allow("boss", "helper")
     # Something worker1's owner chose to share with peers, in its .p2pdata folder.
     data1 = os.path.join(HOME, ".p2pdata", "worker1")
     os.makedirs(data1, exist_ok=True)
@@ -139,6 +146,19 @@ try:
     agents.append(boss)
     check("boss connected to worker1", boss.wait_for(r"^\+ worker1", 120))
     check("boss connected to worker2", boss.wait_for(r"^\+ worker2", 120))
+
+    print("== start digital worker 'helper' (no sign-in of its own)")
+    helper = Agent("helper", ["--providers", "copilot", "--serve"])
+    agents.append(helper)
+    helper_acct = helper.wait_for(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'helper'\]", 90)
+    boss.wait_for(r"^\+ helper", 120)
+    boss.cursor = len(boss.lines)
+    boss.send("/peers")
+    check("boss sees the digital worker's owner and role",
+          boss.wait_for(r"helper \([0-9a-f]+\) \[digital worker of worker1: release note writer\]", 30))
+    boss.send("/delegate copilot@helper Reply with exactly: HELPER-OK")
+    check("digital worker ran boss's task on its owner's account",
+          helper_acct and boss.wait_for(r"HELPER-OK", 300) and boss.wait_for(r"=== copilot on helper ===", 5))
 
     print("== intruder (worker1 never allowlisted it) tries to connect")
     intruder = Agent("intruder", [])
@@ -212,6 +232,20 @@ try:
         boss.send(f"/cancel {re.search(r'as task (\d+)', started).group(1)}")
     check("boss cancelled a running Copilot task on worker1",
           boss.wait_for(r"=== copilot on worker1 cancelled", 15) and w1.wait_for(r"task #\d+ from boss cancelled", 30))
+
+    print("== plan: a step on worker1, then a dependent step on the digital worker that uses its result")
+    plan_file = os.path.join(HOME, "plan.txt")
+    with open(plan_file, "w") as f:
+        f.write("facts @worker1 Read notes.md and reply with only the status token it contains.\n"
+                "relay after facts @helper Reply with only the status token from the earlier step's result.\n")
+    boss.cursor = len(boss.lines)
+    boss.send(f"/plan {plan_file}")
+    boss.wait_for(r"=== plan finished", 400)
+    lines = boss.lines[boss.cursor:]
+    relay_at = next((i for i, l in enumerate(lines) if "=== step relay on helper ===" in l), None)
+    check("boss's plan ran a dependent step with its prerequisite's result",
+          relay_at is not None and any("p2pdata-token-7731" in l for l in lines[relay_at:relay_at + 6]),
+          lines[-12:])
 
     print("== worker2 leaves")
     w2.stop()

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use p2pagents::audit::{AuditLog, Outcome};
 use p2pagents::auth::{LoginMethod, ProviderTools};
+use p2pagents::plan::{Plan, SquadStore, StepState, run_plan};
 use p2pagents::profile::DEFAULT_GITHUB_HOST;
 use p2pagents::trust::DEFAULT_TASKS_PER_HOUR;
 use p2pagents::{
@@ -22,6 +23,8 @@ commands:
   /delegate <provider>[@peer[:folder]] <prompt>  run a task on a peer, in a folder it shares with you (default: data)
   /tasks                                list your running tasks
   /cancel <n>                           cancel your running task n (the peer stops it too)
+  /plan <file>                          run a plan: steps on peers (@name) or squads (#squad), in dependency order
+  /squads                               list your squads and which members are online
   /peers                                list connected peers and the providers they serve
   /ticket                               print this agent's ticket (give it to peers)
   /help                                 show this help
@@ -52,6 +55,13 @@ enum Command {
     /// Manage the folders a profile shares with peers for their tasks.
     #[command(subcommand)]
     Share(ShareCommand),
+    /// Create digital workers: agents with their own peer identity that run on
+    /// their owner's accounts.
+    #[command(subcommand)]
+    Worker(WorkerCommand),
+    /// Group peers into squads that plans can assign steps to.
+    #[command(subcommand)]
+    Squad(SquadCommand),
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
@@ -85,6 +95,61 @@ enum Command {
 enum ProfileCommand {
     /// Delete a profile: its identity key, stored credentials, allowlist and provider sign-ins.
     Delete {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkerCommand {
+    /// Create a digital worker owned by --owner.
+    #[command(after_help = "\
+examples:
+  p2pagents worker create tester --owner alice --role \"test engineer for the parser\"
+  p2pagents --name tester --providers copilot --serve        (runs on alice's Copilot sign-in)
+The worker gets its own key, allowlist, shared folders and audit log, but no accounts:
+it always uses its owner's. Its owner is allowlisted on it (may run read-only tasks in its
+data folder) and it is allowlisted on its owner (chat only).")]
+    Create {
+        /// Name of the new worker (also its profile name).
+        name: String,
+        /// Profile that owns the worker and whose accounts it uses.
+        #[arg(long)]
+        owner: String,
+        /// What the worker is for; shown to peers and given to the model with every task.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// List digital workers (all, or those of --owner).
+    List {
+        #[arg(long)]
+        owner: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SquadCommand {
+    /// Create or replace a squad of allowlisted peers.
+    #[command(after_help = "\
+examples:
+  p2pagents squad create qa --member alice,tester --profile boss
+In a plan, `#qa` runs a step on the least busy online member of squad qa.")]
+    Create {
+        name: String,
+        /// Allowlist names of the members (comma-separated).
+        #[arg(long, value_delimiter = ',', required = true)]
+        member: Vec<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// List squads.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Remove a squad.
+    Remove {
+        name: String,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -321,6 +386,8 @@ async fn main() -> Result<()> {
         Some(Command::Auth(command)) => run_auth(command).await,
         Some(Command::Peers(command)) => run_peers(command),
         Some(Command::Share(command)) => run_share(command),
+        Some(Command::Worker(command)) => run_worker(command),
+        Some(Command::Squad(command)) => run_squad(command),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
             let name = profile.name.clone();
@@ -412,6 +479,107 @@ fn civil_date(days: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn run_worker(command: WorkerCommand) -> Result<()> {
+    match command {
+        WorkerCommand::Create { name, owner, role } => {
+            let owner = Profile::open(&owner)?;
+            let worker = owner.create_digital_worker(&name, role)?;
+            // Owner and worker know each other: the owner may give it tasks.
+            let (owner_id, worker_id) = (owner.identity()?.public(), worker.identity()?.public());
+            let mut trust = worker.trust()?;
+            trust.allow(TrustedPeer {
+                name: owner.name.clone(),
+                id: owner_id,
+                addrs: Default::default(),
+                can_delegate: true,
+                tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
+                access: Access::ReadOnly,
+                shares: vec![p2pagents::shares::DATA_SHARE.to_owned()],
+            });
+            trust.save(&worker.trust_path())?;
+            let mut trust = owner.trust()?;
+            trust.allow(TrustedPeer {
+                name: worker.name.clone(),
+                id: worker_id,
+                addrs: Default::default(),
+                can_delegate: false,
+                tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
+                access: Access::ReadOnly,
+                shares: vec![p2pagents::shares::DATA_SHARE.to_owned()],
+            });
+            trust.save(&owner.trust_path())?;
+            println!(
+                "digital worker '{name}' created for '{}' (endpoint id {worker_id}); it runs on '{}''s accounts",
+                owner.name, owner.name
+            );
+            println!(
+                "start it:  p2pagents --name {name} --providers copilot --serve\nshare its ticket with peers:  p2pagents peers id --profile {name}"
+            );
+        }
+        WorkerCommand::List { owner } => {
+            for name in Profile::list()? {
+                let profile = Profile::open(&name)?;
+                let Some(of) = &profile.config.owner else {
+                    continue;
+                };
+                if owner.as_ref().is_some_and(|o| o != of) {
+                    continue;
+                }
+                println!(
+                    "  {name:<16} owner {of:<12} {}",
+                    profile.config.role.as_deref().unwrap_or("")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_squad(command: SquadCommand) -> Result<()> {
+    match command {
+        SquadCommand::Create {
+            name,
+            member,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let trust = profile.trust()?;
+            if let Some(unknown) = member.iter().find(|m| trust.get_by_name(m).is_none()) {
+                bail!(
+                    "'{unknown}' is not on profile '{}''s allowlist; add it with: p2pagents peers allow <ticket> --profile {}",
+                    profile.name,
+                    profile.name
+                );
+            }
+            let mut squads = SquadStore::load(&profile.squads_path())?;
+            squads.set(&name, member)?;
+            squads.save(&profile.squads_path())?;
+            let squad = squads.get(&name).expect("just set");
+            println!(
+                "profile '{}': squad {name} = {}",
+                profile.name,
+                squad.members.join(", ")
+            );
+        }
+        SquadCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            for squad in SquadStore::load(&profile.squads_path())?.squads {
+                println!("  {:<12} {}", squad.name, squad.members.join(", "));
+            }
+        }
+        SquadCommand::Remove { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut squads = SquadStore::load(&profile.squads_path())?;
+            if !squads.remove(&name) {
+                bail!("profile '{}' has no squad {name}", profile.name);
+            }
+            squads.save(&profile.squads_path())?;
+            println!("profile '{}': removed squad {name}", profile.name);
+        }
+    }
+    Ok(())
 }
 
 fn run_share(command: ShareCommand) -> Result<()> {
@@ -579,6 +747,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
                 (None, false, false) => LoginMethod::Browser,
             };
             let mut profile = Profile::open(&profile.name)?;
+            profile.check_can_sign_in()?;
             let account = ProviderTools::new(&bridge.path())
                 .login(&mut profile, provider, method)
                 .await?;
@@ -593,6 +762,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             bridge,
         } => {
             let mut profile = Profile::open(&profile.name)?;
+            profile.check_can_sign_in()?;
             ProviderTools::new(&bridge.path()).logout(&mut profile, provider)?;
             println!("profile '{}': {provider} signed out", profile.name);
         }
@@ -610,6 +780,18 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             for name in names {
                 let profile = Profile::open(&name)?;
                 println!("profile '{name}' ({})", profile.dir.display());
+                if let Some(owner) = &profile.config.owner {
+                    println!(
+                        "  digital worker of '{owner}': runs on its accounts (see profile '{owner}'){}",
+                        profile
+                            .config
+                            .role
+                            .as_deref()
+                            .map(|r| format!("; role: {r}"))
+                            .unwrap_or_default()
+                    );
+                    continue;
+                }
                 for provider in [Provider::Copilot, Provider::Claude, Provider::Codex] {
                     let state = if profile.is_configured(provider) {
                         match tools.check(&profile, provider).await {
@@ -667,6 +849,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.network = args.network;
         config.bind = args.listen;
         config.trust = profile.trust()?;
+        config.owner = profile.config.owner.clone();
+        config.role = profile.config.role.clone();
         if args.serve {
             let data = profile.data_folder();
             std::fs::create_dir_all(&data)
@@ -683,6 +867,17 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         profile.name,
         agent.id()
     );
+    if let Some(owner) = &profile.config.owner {
+        println!(
+            "digital worker of '{owner}' (runs on its accounts){}",
+            profile
+                .config
+                .role
+                .as_deref()
+                .map(|r| format!("; role: {r}"))
+                .unwrap_or_default()
+        );
+    }
     if args.network == Network::Internet && !agent.online(Duration::from_secs(15)).await {
         eprintln!("warning: no relay reachable yet; peers behind NAT may not reach this agent");
     }
@@ -840,9 +1035,10 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         .map(|s| format!("{} ({})", s.name, s.access))
                         .collect();
                     println!(
-                        "  {} ({}) serves {:?}{}",
+                        "  {} ({}){} serves {:?}{}",
                         peer.name,
                         peer.id.fmt_short(),
+                        peer_kind(&peer),
                         peer.capabilities,
                         if shares.is_empty() {
                             String::new()
@@ -850,6 +1046,54 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                             format!(", folders shared with you: {}", shares.join(", "))
                         }
                     );
+                }
+            }
+            "/squads" => {
+                let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
+                if squads.squads.is_empty() {
+                    println!(
+                        "no squads; create one with: p2pagents squad create <name> --member a,b --profile {}",
+                        profile.name
+                    );
+                }
+                let online: Vec<String> = agent.peers().into_iter().map(|p| p.name).collect();
+                for squad in squads.squads {
+                    let members: Vec<String> = squad
+                        .members
+                        .iter()
+                        .map(|m| {
+                            let state = if online.contains(m) {
+                                "online"
+                            } else {
+                                "offline"
+                            };
+                            format!("{m} ({state})")
+                        })
+                        .collect();
+                    println!("  #{}: {}", squad.name, members.join(", "));
+                }
+            }
+            "/plan" => {
+                let file = rest.trim();
+                let plan = std::fs::read_to_string(file)
+                    .with_context(|| format!("reading plan file {file:?}"))
+                    .and_then(|text| Plan::parse(&text));
+                match plan {
+                    Err(e) => eprintln!("{e:#}"),
+                    Ok(plan) => {
+                        let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
+                        let agent = agent.clone();
+                        let steps = plan.steps.len();
+                        let n = tasks.spawn(format!("plan {file} ({steps} steps)"), async move {
+                            let states = run_plan(&agent, &squads, &plan, print_step).await;
+                            let done = states
+                                .values()
+                                .filter(|s| matches!(s, StepState::Done { .. }))
+                                .count();
+                            println!("=== plan finished: {done}/{steps} steps done ===");
+                        });
+                        println!("running plan {file} as task {n} (/cancel {n} to stop it)");
+                    }
                 }
             }
             "/ask" => match (parse_task(rest), &executor) {
@@ -975,6 +1219,33 @@ impl RunningTasks {
         let (label, handle) = self.inner.lock().unwrap().1.remove(&n)?;
         handle.abort();
         Some(label)
+    }
+}
+
+/// ` [digital worker of alice: role]`-style suffix for a peer.
+fn peer_kind(peer: &p2pagents::PeerInfo) -> String {
+    match (&peer.owner, &peer.role) {
+        (Some(owner), Some(role)) => format!(" [digital worker of {owner}: {role}]"),
+        (Some(owner), None) => format!(" [digital worker of {owner}]"),
+        (None, Some(role)) => format!(" [{role}]"),
+        (None, None) => String::new(),
+    }
+}
+
+fn print_step(id: &str, state: &StepState) {
+    match state {
+        StepState::Waiting => println!("  step {id}: waiting"),
+        StepState::Running { peer } => println!("  step {id}: running on {peer}"),
+        StepState::Done { peer, output } => {
+            println!("=== step {id} on {peer} ===\n{output}\n=== end ===")
+        }
+        StepState::Failed { peer, error } => println!(
+            "=== step {id}{} failed: {error}",
+            peer.as_deref()
+                .map(|p| format!(" on {p}"))
+                .unwrap_or_default()
+        ),
+        StepState::Skipped { reason } => println!("  step {id}: skipped ({reason})"),
     }
 }
 

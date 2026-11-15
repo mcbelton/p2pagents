@@ -8,6 +8,7 @@ pub mod agent;
 pub mod audit;
 pub mod auth;
 pub mod llm;
+pub mod plan;
 pub mod profile;
 pub mod protocol;
 pub mod setup;

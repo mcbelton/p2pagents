@@ -135,6 +135,14 @@ pub struct ProfileConfig {
     pub claude: Option<ClaudeAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexAuth>,
+    /// Set for a digital worker: the profile whose accounts it runs on (see
+    /// [`Profile::account_profile`]). It has no sign-ins of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// What this agent is for (e.g. "test engineer"); shown to peers and given to
+    /// the model with every task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +262,17 @@ impl Profile {
         format!("p2pagents auth login {provider} --profile {}", self.name)
     }
 
+    /// Digital workers can't be signed in: they always use their owner's accounts.
+    pub fn check_can_sign_in(&self) -> Result<()> {
+        match &self.config.owner {
+            Some(owner) => bail!(
+                "'{}' is a digital worker of '{owner}' and runs on its accounts; sign in '{owner}' instead",
+                self.name
+            ),
+            None => Ok(()),
+        }
+    }
+
     pub fn not_signed_in(&self, provider: Provider) -> anyhow::Error {
         anyhow!(
             "{provider} is not signed in for profile '{}'; run: {}",
@@ -364,6 +383,11 @@ impl Profile {
         self.dir.join("shares.json")
     }
 
+    /// Squads this profile groups its peers into (see [`crate::plan`]).
+    pub fn squads_path(&self) -> PathBuf {
+        self.dir.join("squads.json")
+    }
+
     /// The profile's `.p2pdata` folder: the built-in read-only `data` share.
     /// `~/.p2pdata/<profile>`, or `$P2PAGENTS_HOME/.p2pdata/<profile>`.
     pub fn data_folder(&self) -> PathBuf {
@@ -404,7 +428,66 @@ impl Profile {
         crate::trust::TrustStore::load(&self.trust_path())
     }
 
+    /// The profile whose accounts this profile's tasks run on: itself, or for a
+    /// digital worker its owner (which must exist and can't be a digital worker).
+    pub fn account_profile(&self) -> Result<Profile> {
+        let Some(owner) = &self.config.owner else {
+            return Ok(self.clone());
+        };
+        let root = self.dir.parent().context("profile has no parent folder")?;
+        let account = Profile::open_in(root, owner)?;
+        if !account.dir.join("profile.json").is_file() {
+            bail!(
+                "digital worker '{}' belongs to profile '{owner}', which does not exist",
+                self.name
+            );
+        }
+        if account.config.owner.is_some() {
+            bail!(
+                "digital worker '{}' belongs to '{owner}', which is itself a digital worker",
+                self.name
+            );
+        }
+        Ok(account)
+    }
+
+    /// Creates digital worker `name` owned by this profile: its own identity,
+    /// allowlist, folders and audit log, but this profile's accounts.
+    pub fn create_digital_worker(&self, name: &str, role: Option<String>) -> Result<Profile> {
+        if self.config.owner.is_some() {
+            bail!(
+                "'{}' is a digital worker; only owners can create workers",
+                self.name
+            );
+        }
+        if !self.dir.join("profile.json").is_file() {
+            bail!(
+                "profile '{}' has no sign-ins yet; sign it in first (p2pagents auth login copilot --profile {})",
+                self.name,
+                self.name
+            );
+        }
+        let root = self.dir.parent().context("profile has no parent folder")?;
+        let mut worker = Profile::open_in(root, name)?;
+        if worker.dir.exists() {
+            bail!("profile '{name}' already exists");
+        }
+        worker.config = ProfileConfig {
+            owner: Some(self.name.clone()),
+            role,
+            ..ProfileConfig::default()
+        };
+        worker.save()?;
+        Ok(worker)
+    }
+
     pub fn copilot_credentials(&self) -> Result<CopilotCredentials> {
+        if self.config.owner.is_some() {
+            // The owner's sign-in, in the worker's own Copilot home (its own sessions).
+            let mut creds = self.account_profile()?.copilot_credentials()?;
+            creds.home = self.home(Provider::Copilot)?;
+            return Ok(creds);
+        }
         let (token, host) = match &self.config.copilot {
             None => return Err(self.not_signed_in(Provider::Copilot)),
             Some(CopilotAuth::Gh { user, host }) => (gh_token(user, host)?, host.clone()),
@@ -420,6 +503,10 @@ impl Profile {
     /// Environment for this profile's Claude/Codex processes (the Node bridge):
     /// isolated config homes plus this profile's own secrets.
     pub fn bridge_env(&self, providers: &[Provider]) -> Result<Vec<(String, OsString)>> {
+        if self.config.owner.is_some() {
+            // Claude/Codex sign-ins live in the owner's config homes.
+            return self.account_profile()?.bridge_env(providers);
+        }
         let mut env = Vec::new();
         if providers.contains(&Provider::Claude) {
             env.push((
@@ -569,5 +656,74 @@ mod tests {
         assert_eq!(get("CLAUDE_CONFIG_DIR"), Some(root.path().join("w/claude")));
         assert_eq!(get("CODEX_HOME"), Some(root.path().join("w/codex")));
         assert!(get("ANTHROPIC_API_KEY").is_none());
+    }
+
+    #[test]
+    fn digital_worker_uses_its_owners_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut alice = Profile::open_in(root.path(), "alice").unwrap();
+        alice.config.claude = Some(ClaudeAuth::Login);
+        alice.config.codex = Some(CodexAuth::Login);
+        alice.save().unwrap();
+        alice
+            .create_digital_worker("helper", Some("test engineer".into()))
+            .unwrap();
+        let helper = Profile::open_in(root.path(), "helper").unwrap();
+        assert_eq!(helper.config.owner.as_deref(), Some("alice"));
+        assert_eq!(helper.config.role.as_deref(), Some("test engineer"));
+        assert!(helper.config.claude.is_none(), "no sign-ins of its own");
+        assert_eq!(helper.account_profile().unwrap().name, "alice");
+
+        // Claude/Codex run in the owner's signed-in homes.
+        let env = helper
+            .bridge_env(&[Provider::Claude, Provider::Codex])
+            .unwrap();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        assert_eq!(
+            get("CLAUDE_CONFIG_DIR"),
+            Some(root.path().join("alice/claude"))
+        );
+        assert_eq!(get("CODEX_HOME"), Some(root.path().join("alice/codex")));
+        // Not signed in to Copilot: the hint names the owner, the account that matters.
+        let err = helper.copilot_credentials().unwrap_err().to_string();
+        assert!(err.contains("--profile alice"), "{err}");
+        // Its own identity, folders and data stay separate from the owner's.
+        assert_ne!(helper.data_folder(), alice.data_folder());
+        assert_ne!(helper.trust_path(), alice.trust_path());
+    }
+
+    #[test]
+    fn digital_workers_cannot_sign_in_or_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let mut alice = Profile::open_in(root.path(), "alice").unwrap();
+        alice.config.codex = Some(CodexAuth::Login);
+        alice.save().unwrap();
+        let helper = alice.create_digital_worker("helper", None).unwrap();
+        assert!(
+            helper.create_digital_worker("sub", None).is_err(),
+            "no chains"
+        );
+        assert!(
+            alice.create_digital_worker("helper", None).is_err(),
+            "exists"
+        );
+        assert!(alice.create_digital_worker("../x", None).is_err());
+        let fresh = Profile::open_in(root.path(), "fresh").unwrap();
+        assert!(
+            fresh.create_digital_worker("w", None).is_err(),
+            "owner must exist"
+        );
+        assert!(helper.check_can_sign_in().is_err());
+        assert!(alice.check_can_sign_in().is_ok());
+
+        // An owner that became a digital worker can't lend its accounts.
+        let mut alice = Profile::open_in(root.path(), "alice").unwrap();
+        alice.config.owner = Some("someone".into());
+        alice.save().unwrap();
+        assert!(helper.account_profile().is_err());
     }
 }

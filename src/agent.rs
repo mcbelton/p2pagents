@@ -50,6 +50,10 @@ pub struct AgentConfig {
     pub audit: Option<Arc<AuditLog>>,
     /// Folders peers' tasks may run in (each peer only in those granted to it).
     pub shares: ShareStore,
+    /// For a digital worker: the owner profile, shown to peers.
+    pub owner: Option<String>,
+    /// What this agent is for, shown to peers.
+    pub role: Option<String>,
 }
 
 impl AgentConfig {
@@ -63,6 +67,8 @@ impl AgentConfig {
             executor: None,
             audit: None,
             shares: ShareStore::default(),
+            owner: None,
+            role: None,
         }
     }
 }
@@ -116,6 +122,10 @@ pub struct PeerInfo {
     pub capabilities: Vec<Provider>,
     /// Folders this peer shares with us for tasks (name and access we get).
     pub shares: Vec<ShareInfo>,
+    /// Set if the peer is a digital worker: the profile that owns it.
+    pub owner: Option<String>,
+    /// What the peer is for, as its owner describes it.
+    pub role: Option<String>,
 }
 
 struct PeerHandle {
@@ -124,12 +134,16 @@ struct PeerHandle {
     addr: EndpointAddr,
     capabilities: Vec<Provider>,
     shares: Vec<ShareInfo>,
+    owner: Option<String>,
+    role: Option<String>,
     tx: mpsc::UnboundedSender<Message>,
     close: Arc<Notify>,
 }
 
+/// A task this agent delegated, waiting for `peer`'s result. Tied to the peer, not
+/// a connection, so it survives a duplicate connection being replaced.
 struct PendingTask {
-    conn_id: u64,
+    peer: EndpointId,
     reply: oneshot::Sender<Result<String, String>>,
 }
 
@@ -168,9 +182,14 @@ struct Inner {
     executor: Option<Arc<dyn Executor>>,
     audit: Option<Arc<AuditLog>>,
     shares: Mutex<ShareStore>,
+    owner: Option<String>,
+    role: Option<String>,
     task_slots: Semaphore,
     task_log: Mutex<HashMap<EndpointId, VecDeque<Instant>>>,
     pending: Mutex<HashMap<u64, PendingTask>>,
+    /// Cancel senders of tasks peers asked us to run, by (peer, task id); dropping
+    /// one cancels its task.
+    serving: Mutex<HashMap<(EndpointId, u64), oneshot::Sender<()>>>,
     /// Peers reported via `PeerConnected` and not yet via `PeerDisconnected`.
     announced: Mutex<HashSet<EndpointId>>,
     next_task_id: AtomicU64,
@@ -213,9 +232,12 @@ impl Agent {
             executor: config.executor,
             audit: config.audit,
             shares: Mutex::new(config.shares),
+            owner: config.owner,
+            role: config.role,
             task_slots: Semaphore::new(MAX_CONCURRENT_TASKS),
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            serving: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashSet::new()),
             next_task_id: AtomicU64::new(1),
         });
@@ -260,6 +282,20 @@ impl Agent {
         dial(self.inner.clone(), addr.into()).await
     }
 
+    /// Opens a fresh connection to a connected peer (e.g. after a network change).
+    /// Tasks in flight either way carry on over whichever connection is kept.
+    pub async fn reconnect(&self, peer: EndpointId) -> Result<()> {
+        let addr = self
+            .inner
+            .peers
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .map(|p| p.addr.clone())
+            .ok_or_else(|| anyhow!("not connected to {}", peer.fmt_short()))?;
+        dial_with(self.inner.clone(), addr, true).await
+    }
+
     /// Dials every allowlisted peer that isn't connected, now and then every
     /// `interval`, so the mesh heals after restarts and network changes.
     pub fn keep_connected(&self, interval: Duration) {
@@ -294,6 +330,8 @@ impl Agent {
                 id: *id,
                 capabilities: p.capabilities.clone(),
                 shares: p.shares.clone(),
+                owner: p.owner.clone(),
+                role: p.role.clone(),
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -379,13 +417,11 @@ impl Agent {
             if !handle.capabilities.contains(&task.provider) {
                 bail!("{} does not serve {}", handle.name, task.provider);
             }
-            self.inner.pending.lock().unwrap().insert(
-                task_id,
-                PendingTask {
-                    conn_id: handle.conn_id,
-                    reply,
-                },
-            );
+            self.inner
+                .pending
+                .lock()
+                .unwrap()
+                .insert(task_id, PendingTask { peer, reply });
             if handle
                 .tx
                 .send(Message::TaskRequest { task_id, task })
@@ -448,12 +484,22 @@ async fn accept_loop(inner: Arc<Inner>) {
 
 // Boxed because dial -> run_connection -> (gossip) dial is recursive.
 fn dial(inner: Arc<Inner>, addr: EndpointAddr) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    dial_with(inner, addr, false)
+}
+
+/// Dials `addr`; with `force`, even if already connected (the simultaneous-dial
+/// tie-break then keeps one of the two connections).
+fn dial_with(
+    inner: Arc<Inner>,
+    addr: EndpointAddr,
+    force: bool,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
         if *inner.shutdown.borrow() {
             bail!("agent is shut down");
         }
         let id = addr.id;
-        if id == inner.endpoint.id() || inner.peers.lock().unwrap().contains_key(&id) {
+        if id == inner.endpoint.id() || (!force && inner.peers.lock().unwrap().contains_key(&id)) {
             return Ok(());
         }
         if !inner.is_trusted(&id) {
@@ -549,12 +595,12 @@ impl Inner {
         false
     }
 
-    /// Fails tasks delegated over a connection that has closed.
-    fn fail_pending(&self, conn_id: u64) {
+    /// Fails tasks delegated to `peer` once it is really gone.
+    fn fail_pending(&self, peer: &EndpointId) {
         let mut pending = self.pending.lock().unwrap();
         let ids: Vec<u64> = pending
             .iter()
-            .filter(|(_, p)| p.conn_id == conn_id)
+            .filter(|(_, p)| &p.peer == peer)
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
@@ -566,13 +612,36 @@ impl Inner {
         }
     }
 
-    fn complete_pending(&self, conn_id: u64, task_id: u64, result: Result<String, String>) {
+    fn complete_pending(&self, peer: &EndpointId, task_id: u64, result: Result<String, String>) {
         let mut pending = self.pending.lock().unwrap();
         // Only the peer the task was sent to may answer it.
-        if pending.get(&task_id).is_some_and(|p| p.conn_id == conn_id)
+        if pending.get(&task_id).is_some_and(|p| &p.peer == peer)
             && let Some(task) = pending.remove(&task_id)
         {
             let _ = task.reply.send(result);
+        }
+    }
+
+    /// Stops the tasks `peer` asked this agent to run (it left for good).
+    fn cancel_served(&self, peer: &EndpointId) {
+        self.serving.lock().unwrap().retain(|(p, _), _| p != peer);
+    }
+
+    /// Sends `msg` to `peer` over its current connection, waiting out a brief
+    /// reconnect (e.g. a duplicate connection being replaced).
+    async fn deliver(&self, peer: EndpointId, msg: Message) {
+        let deadline = Instant::now() + DISCONNECT_GRACE * 2;
+        loop {
+            let tx = self.peers.lock().unwrap().get(&peer).map(|h| h.tx.clone());
+            if let Some(tx) = tx
+                && tx.send(msg.clone()).is_ok()
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -737,6 +806,8 @@ async fn run_connection(
         addr: inner.endpoint.addr(),
         capabilities: inner.capabilities(),
         shares: inner.shares_for(&peer_id),
+        owner: inner.owner.clone(),
+        role: inner.role.clone(),
     };
     write_message(&mut send, &hello).await?;
     let first = lines
@@ -748,6 +819,8 @@ async fn run_connection(
         addr,
         capabilities,
         shares,
+        owner,
+        role,
     } = serde_json::from_str(&first)?
     else {
         bail!("expected hello, got {first}");
@@ -771,6 +844,8 @@ async fn run_connection(
         addr,
         capabilities,
         shares,
+        owner,
+        role,
         tx: tx.clone(),
         close: close.clone(),
     };
@@ -802,8 +877,6 @@ async fn run_connection(
         }
     });
     let _ = tx.send(Message::Peers { addrs: known });
-    // Cancel senders of this peer's running tasks; dropping one cancels its task.
-    let running: Arc<Mutex<HashMap<u64, oneshot::Sender<()>>>> = Arc::default();
 
     let result = async {
         loop {
@@ -826,28 +899,33 @@ async fn run_connection(
                     }
                 }
                 Message::TaskRequest { task_id, task } => {
-                    let (inner, tx, from) = (inner.clone(), tx.clone(), name.clone());
+                    let (inner, from) = (inner.clone(), name.clone());
                     let (cancel_tx, cancel_rx) = oneshot::channel();
-                    running.lock().unwrap().insert(task_id, cancel_tx);
-                    let running = running.clone();
+                    inner
+                        .serving
+                        .lock()
+                        .unwrap()
+                        .insert((peer_id, task_id), cancel_tx);
                     tokio::spawn(async move {
                         let result = inner
                             .serve_task(&peer_id, &from, task_id, task, cancel_rx)
                             .await;
-                        running.lock().unwrap().remove(&task_id);
+                        inner.serving.lock().unwrap().remove(&(peer_id, task_id));
                         let (ok, output) = match result {
                             Ok(output) => (true, output),
                             Err(e) => (false, format!("{e:#}")),
                         };
-                        let _ = tx.send(Message::TaskResult {
+                        let msg = Message::TaskResult {
                             task_id,
                             ok,
                             output,
-                        });
+                        };
+                        inner.deliver(peer_id, msg).await;
                     });
                 }
                 Message::TaskCancel { task_id } => {
-                    if let Some(cancel) = running.lock().unwrap().remove(&task_id) {
+                    let cancel = inner.serving.lock().unwrap().remove(&(peer_id, task_id));
+                    if let Some(cancel) = cancel {
                         let _ = cancel.send(());
                     }
                 }
@@ -857,7 +935,7 @@ async fn run_connection(
                     output,
                 } => {
                     inner.complete_pending(
-                        conn_id,
+                        &peer_id,
                         task_id,
                         if ok { Ok(output) } else { Err(output) },
                     );
@@ -877,19 +955,22 @@ async fn run_connection(
     }
     .await;
 
-    // Nobody is left to receive the results: stop the peer's running tasks.
-    running.lock().unwrap().clear();
     writer_task.abort();
     conn.close(0u32.into(), b"bye");
-    inner.fail_pending(conn_id);
     if inner.unregister(peer_id, conn_id) {
-        // Report the disconnect only if the peer doesn't come back quickly, e.g.
-        // when a connection loses the simultaneous-dial tie-break.
+        // Only if the peer doesn't come back quickly (e.g. this connection lost the
+        // simultaneous-dial tie-break): report the disconnect, fail the tasks we
+        // delegated to it and stop the tasks it asked us to run.
         let inner = inner.clone();
         tokio::spawn(async move {
             tokio::time::sleep(DISCONNECT_GRACE).await;
             let gone = !inner.peers.lock().unwrap().contains_key(&peer_id);
-            if gone && inner.announced.lock().unwrap().remove(&peer_id) {
+            if !gone {
+                return;
+            }
+            inner.fail_pending(&peer_id);
+            inner.cancel_served(&peer_id);
+            if inner.announced.lock().unwrap().remove(&peer_id) {
                 let _ = inner
                     .events
                     .send(Event::PeerDisconnected { name, id: peer_id });

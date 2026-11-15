@@ -69,6 +69,13 @@
       "live": ["worker2 wrote p2p_live.txt in its workspace", "worker2 audited boss's task with its grant"]
     },
     {
+      "id": "NET-6",
+      "area": "network",
+      "claim": "A task in flight survives its connection being replaced (e.g. both peers dialed each other at once): it keeps running and its result arrives over the connection that is kept.",
+      "tests": ["agents::delegated_tasks_survive_a_connection_being_replaced"],
+      "live": ["digital worker ran boss's task on its owner's account"]
+    },
+    {
       "id": "DEL-1",
       "area": "delegation",
       "claim": "A peer can delegate tasks only if allowlisted with --delegate, and only within its hourly limit.",
@@ -228,6 +235,51 @@
       "area": "web ui",
       "claim": "The agent's owner sees the audit log in the web UI (token-protected, no prompt text).",
       "tests": ["ui::ui_cancels_running_tasks_and_shows_the_audit_log"]
+    },
+    {
+      "id": "DW-1",
+      "area": "digital workers",
+      "claim": "An owner can create digital workers: each is its own peer (key, allowlist, shared folders, audit log) but has no accounts of its own. It runs tasks signed in as its owner, can't be signed in separately, and digital workers can't own other workers.",
+      "tests": [
+        "lib::profile::digital_worker_uses_its_owners_accounts",
+        "lib::profile::digital_workers_cannot_sign_in_or_chain"
+      ],
+      "live": ["digital worker ran boss's task on its owner's account"]
+    },
+    {
+      "id": "DW-2",
+      "area": "digital workers",
+      "claim": "Peers see a digital worker's owner and role, and the role guides every task the worker runs.",
+      "tests": ["agents::peers_see_a_digital_workers_owner_and_role", "lib::llm::role_guides_the_prompt"],
+      "live": ["boss sees the digital worker's owner and role"]
+    },
+    {
+      "id": "SQD-1",
+      "area": "squads",
+      "claim": "A boss groups peers into squads; a squad step runs on an online member that serves the provider and the folder, preferring the least busy one.",
+      "tests": [
+        "lib::plan::squads_persist_and_validate",
+        "lib::plan::squad_steps_pick_the_least_busy_capable_member",
+        "agents::plans_run_dependent_steps_across_squads"
+      ]
+    },
+    {
+      "id": "SQD-2",
+      "area": "squads",
+      "claim": "Plans run steps in dependency order and in parallel where possible, give each step the results it depends on, skip steps whose prerequisites failed, and reject cycles and unknown steps before running anything.",
+      "tests": [
+        "lib::plan::parses_plan_text",
+        "lib::plan::rejects_cycles_and_unknown_dependencies",
+        "agents::plans_run_dependent_steps_across_squads",
+        "agents::plan_steps_after_a_failure_are_skipped"
+      ],
+      "live": ["boss's plan ran a dependent step with its prerequisite's result"]
+    },
+    {
+      "id": "SQD-3",
+      "area": "web ui",
+      "claim": "The boss runs plans and sees squads (members, online, running tasks) in the web UI.",
+      "tests": ["ui::ui_runs_plans_and_shows_squads"]
     },
     {
       "id": "BRG-1",

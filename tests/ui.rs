@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use p2pagents::audit::{AuditEntry, AuditLog};
+use p2pagents::shares::ShareStore;
 use p2pagents::ui::{self, UiInfo};
 use p2pagents::{
     Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, SecretKey,
-    TaskContext,
+    TaskContext, TrustedPeer,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -262,4 +263,130 @@ async fn ui_cancels_running_tasks_and_shows_the_audit_log() {
     assert!(!audit.body.contains("private prompt text"));
 
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn ui_runs_plans_and_shows_squads() {
+    let home = tempfile::tempdir().unwrap();
+    let (boss_key, worker_key) = (SecretKey::generate(), SecretKey::generate());
+    let trust = |name: &str, key: &SecretKey, delegate: bool| TrustedPeer {
+        name: name.into(),
+        id: key.public(),
+        addrs: Default::default(),
+        can_delegate: delegate,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec!["data".into()],
+    };
+    let mut worker = AgentConfig::new("worker", worker_key.clone());
+    worker.network = Network::Local;
+    worker.bind = Some("127.0.0.1:0".parse().unwrap());
+    worker.trust.allow(trust("boss", &boss_key, true));
+    worker.executor = Some(Arc::new(Echo));
+    worker.shares = ShareStore::with_data(home.path().join("data"));
+    let (worker, _we) = Agent::bind(worker).await.unwrap();
+
+    let mut config = AgentConfig::new("boss", boss_key);
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.trust.allow(trust("worker", &worker_key, false));
+    let (boss, events) = Agent::bind(config).await.unwrap();
+    boss.connect(worker.addr()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while boss.peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "boss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        boss.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let post = |path: &'static str, body: String| {
+        let host = host.clone();
+        let token = token.to_owned();
+        async move { request(port, "POST", path, &host, Some(&token), Some(&body)).await }
+    };
+
+    // Squads: only allowlisted members; shown with who is online.
+    let bad = post(
+        "/api/squads",
+        r#"{"name":"qa","members":["stranger"]}"#.into(),
+    )
+    .await;
+    assert_eq!(bad.status, 400);
+    let made = post(
+        "/api/squads",
+        r#"{"name":"qa","members":["worker"]}"#.into(),
+    )
+    .await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(state["squads"][0]["name"], "qa");
+    assert_eq!(state["squads"][0]["members"][0]["online"], true);
+    assert!(
+        home.path().join("boss/squads.json").is_file(),
+        "saved to the profile"
+    );
+
+    // Plans: invalid ones are rejected before anything runs.
+    let cycle = post(
+        "/api/plans",
+        r#"{"text":"a after b @worker x\nb after a @worker y"}"#.into(),
+    )
+    .await;
+    assert_eq!(cycle.status, 400);
+    assert!(cycle.body.contains("cycle"), "{}", cycle.body);
+    let text = serde_json::json!({ "text": "find @worker find the facts\nsum after find #qa summarize them" });
+    let started = post("/api/plans", text.to_string()).await;
+    assert_eq!(started.status, 200, "{}", started.body);
+
+    let tasks = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            let tasks = state["tasks"].as_array().unwrap().clone();
+            if tasks.len() == 2 && tasks.iter().all(|t| t["status"] == "done") {
+                return tasks;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("plan finished");
+    let step = |id: &str| tasks.iter().find(|t| t["step"] == id).unwrap().clone();
+    assert_eq!(step("find")["target"], "worker");
+    assert_eq!(step("sum")["after"][0], "find");
+    let sum = step("sum")["output"].as_str().unwrap().to_owned();
+    assert!(
+        sum.contains("### Step find (done by worker)\necho: find the facts"),
+        "{sum}"
+    );
+
+    let removed = request(port, "DELETE", "/api/squads/qa", &host, Some(token), None).await;
+    assert_eq!(removed.status, 200);
+    boss.shutdown().await;
+    worker.shutdown().await;
 }

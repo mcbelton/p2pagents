@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use p2pagents::audit::{AuditLog, Outcome};
+use p2pagents::plan::{Plan, SquadStore, StepState, run_plan};
 use p2pagents::shares::{DATA_SHARE, ShareInfo, ShareStore};
 use p2pagents::{
     Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
@@ -51,6 +52,10 @@ impl Executor for FakeExecutor {
                 std::future::pending().await
             }
             "fail" => anyhow::bail!("model error"),
+            "slow" => {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Ok("slow done".into())
+            }
             "access" => Ok(ctx.access.to_string()),
             "where" => Ok(ctx.workspace.display().to_string()),
             prompt => Ok(format!("{} did: {prompt}", task.provider)),
@@ -67,6 +72,8 @@ struct Node {
     /// Hanging task runs that were stopped (see [`FakeExecutor`]).
     stopped: Arc<AtomicUsize>,
     shares: ShareStore,
+    owner: Option<String>,
+    role: Option<String>,
 }
 
 impl Node {
@@ -79,6 +86,8 @@ impl Node {
             audit: None,
             stopped: Arc::default(),
             shares: ShareStore::with_data(data_folder(name)),
+            owner: None,
+            role: None,
         }
     }
 
@@ -115,6 +124,8 @@ impl Node {
         config.executor = self.executor;
         config.audit = self.audit;
         config.shares = self.shares;
+        config.owner = self.owner;
+        config.role = self.role;
         Agent::bind(config).await.unwrap()
     }
 }
@@ -704,4 +715,187 @@ async fn peers_reach_only_folders_shared_with_them() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("has not shared a folder"), "{err}");
+}
+
+#[tokio::test]
+async fn peers_see_a_digital_workers_owner_and_role() {
+    let mut helper = Node::new("helper").serving(vec![Provider::Copilot]);
+    helper.owner = Some("alice".into());
+    helper.role = Some("test engineer".into());
+    let mut boss = Node::new("boss");
+    mutual(&mut helper, &mut boss);
+    let (helper, _he) = helper.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(helper.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    let peer = &boss.peers()[0];
+    assert_eq!(peer.owner.as_deref(), Some("alice"));
+    assert_eq!(peer.role.as_deref(), Some("test engineer"));
+    assert_eq!(
+        helper.peers()[0].owner,
+        None,
+        "boss is a person, not a worker"
+    );
+}
+
+/// Starts `boss` connected to `workers`, all allowlisted to each other.
+async fn boss_with(workers: Vec<Node>) -> (Agent, Vec<Agent>) {
+    let mut boss = Node::new("boss");
+    let mut workers = workers;
+    for w in &mut workers {
+        mutual(w, &mut boss);
+    }
+    let mut started = Vec::new();
+    for w in workers {
+        started.push(w.start().await.0);
+    }
+    let (boss, _be) = boss.start().await;
+    for w in &started {
+        boss.connect(w.addr()).await.unwrap();
+    }
+    wait_for_peers(&boss, started.len()).await;
+    (boss, started)
+}
+
+#[tokio::test]
+async fn plans_run_dependent_steps_across_squads() {
+    let (boss, _workers) = boss_with(vec![
+        Node::new("lead").serving(vec![Provider::Copilot]),
+        Node::new("qa1").serving(vec![Provider::Copilot]),
+        Node::new("qa2").serving(vec![Provider::Copilot]),
+    ])
+    .await;
+    let mut squads = SquadStore::default();
+    squads.set("qa", vec!["qa1".into(), "qa2".into()]).unwrap();
+    let plan = Plan::parse(
+        "api @lead summarize the api\n\
+         unit after api #qa write unit tests\n\
+         e2e after api #qa write e2e tests\n\
+         report after unit,e2e @lead report",
+    )
+    .unwrap();
+
+    let mut log = Vec::new();
+    let states = run_plan(&boss, &squads, &plan, |id, state| {
+        log.push((id.to_owned(), state.clone()));
+    })
+    .await;
+
+    let done = |id: &str| match &states[id] {
+        StepState::Done { peer, output } => (peer.clone(), output.clone()),
+        other => panic!("{id}: {other:?}"),
+    };
+    let (api_peer, api_out) = done("api");
+    assert_eq!(api_peer, "lead");
+    assert_eq!(api_out, "copilot did: summarize the api");
+    let (unit_peer, unit_out) = done("unit");
+    let (e2e_peer, e2e_out) = done("e2e");
+    assert_ne!(
+        unit_peer, e2e_peer,
+        "the squad spreads parallel steps over its members"
+    );
+    assert!(
+        [unit_peer.as_str(), e2e_peer.as_str()]
+            .iter()
+            .all(|p| p.starts_with("qa"))
+    );
+    // Each step got the result of the step it depends on.
+    assert!(unit_out.contains("### Step api (done by lead)\ncopilot did: summarize the api"));
+    assert!(e2e_out.ends_with("Your task:\nwrite e2e tests"));
+    let (_, report_out) = done("report");
+    assert!(report_out.contains("### Step unit") && report_out.contains("### Step e2e"));
+
+    // Dependents start only after their prerequisites finished.
+    let at = |id: &str, pred: fn(&StepState) -> bool| {
+        log.iter()
+            .position(|(i, s)| i == id && pred(s))
+            .unwrap_or_else(|| panic!("no matching update for {id}"))
+    };
+    let started = |id: &str| at(id, |s| matches!(s, StepState::Running { .. }));
+    let finished = |id: &str| at(id, |s| matches!(s, StepState::Done { .. }));
+    assert!(finished("api") < started("unit"));
+    assert!(finished("api") < started("e2e"));
+    assert!(finished("unit") < started("report"));
+    assert!(finished("e2e") < started("report"));
+}
+
+#[tokio::test]
+async fn plan_steps_after_a_failure_are_skipped() {
+    let (boss, _workers) =
+        boss_with(vec![Node::new("solo").serving(vec![Provider::Copilot])]).await;
+    let plan = Plan::parse(
+        "broken @solo fail\n\
+         after_broken after broken @solo never runs\n\
+         chained after after_broken @solo never runs either\n\
+         independent @solo still runs\n\
+         away @nobody cannot run",
+    )
+    .unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}).await;
+    assert!(matches!(&states["broken"], StepState::Failed { error, .. } if error == "model error"));
+    assert!(
+        matches!(&states["after_broken"], StepState::Skipped { reason } if reason.contains("broken"))
+    );
+    assert!(matches!(&states["chained"], StepState::Skipped { .. }));
+    assert!(matches!(&states["independent"], StepState::Done { .. }));
+    assert!(
+        matches!(&states["away"], StepState::Failed { peer: None, error } if error.contains("not connected"))
+    );
+}
+
+#[tokio::test]
+async fn delegated_tasks_survive_a_connection_being_replaced() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    // Connect from the higher id, so a dial from the lower id replaces the connection.
+    let (low, high) = if boss.id() < worker.id() {
+        (&boss, &worker)
+    } else {
+        (&worker, &boss)
+    };
+    high.connect(low.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    wait_for_peers(&worker, 1).await;
+
+    let task = tokio::spawn({
+        let (boss, id) = (boss.clone(), worker.id());
+        async move {
+            boss.delegate(id, LlmTask::new(Provider::Copilot, "slow"))
+                .await
+        }
+    });
+    next_matching(&mut worker_events, |e| {
+        matches!(e, Event::TaskReceived { .. })
+    })
+    .await;
+    // A second connection wins the tie-break while the task runs; the first closes.
+    low.reconnect(high.id()).await.unwrap();
+
+    let out = timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        out.unwrap(),
+        "slow done",
+        "the result arrives over the new connection"
+    );
+    let completed = next_matching(&mut worker_events, |e| {
+        matches!(e, Event::TaskCompleted { .. })
+    })
+    .await;
+    assert!(
+        matches!(
+            completed,
+            Event::TaskCompleted {
+                outcome: Outcome::Done,
+                ..
+            }
+        ),
+        "{completed:?}"
+    );
+    assert_eq!(boss.peers().len(), 1);
 }

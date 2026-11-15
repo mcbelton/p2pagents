@@ -79,6 +79,10 @@ impl TrustStore {
         self.peers.iter().find(|p| &p.id == id)
     }
 
+    pub fn get_by_name(&self, name: &str) -> Option<&TrustedPeer> {
+        self.peers.iter().find(|p| p.name == name)
+    }
+
     /// Adds or updates a peer; an existing entry with the same id or name is replaced.
     pub fn allow(&mut self, peer: TrustedPeer) {
         self.peers

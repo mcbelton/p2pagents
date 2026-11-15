@@ -307,6 +307,30 @@ own provider processes.
 `p2pagents profile delete --profile P` removes a profile: its identity key, stored
 credentials, allowlist and provider sign-ins.
 
+### Digital workers
+
+A **digital worker** is an autonomous agent with no identity of its own: it works on the
+accounts of the person (profile) who created it, its **owner**.
+
+```powershell
+p2pagents worker create tester --owner alice --role "test engineer for the parser"
+p2pagents --name tester --providers copilot --serve     # runs on alice's Copilot sign-in
+p2pagents worker list --owner alice
+```
+
+- The worker is its own peer: its own key, allowlist, [shared folders](#shared-folders),
+  hourly limits and [audit log](#audit-log). Peers allowlist it like any agent, and alice
+  decides who may delegate to it and which folders it shares.
+- It has **no accounts**: Copilot, Claude and Codex run with the owner's sign-in, in the
+  worker's own private provider homes. `auth login`/`logout` are refused for workers, and
+  `auth status` shows whose accounts they use. A worker can't own another worker.
+- Peers see `[digital worker of alice: test engineer for the parser]` next to it, and the
+  role is given to the model with every task the worker runs.
+- `worker create` allowlists the owner on the worker (read-only tasks in its data folder)
+  and the worker on the owner (chat only). Widen either with `peers allow`.
+- Work stays private unless shared: a peer reaches only the folders the worker or owner
+  explicitly shares with that peer.
+
 ## Internet P2P
 
 Agents connect with [iroh](https://iroh.computer):
@@ -418,6 +442,8 @@ In terminal 2, once `+ worker` appears:
 | `<text>` | Broadcast a chat message |
 | `/ask <provider> <prompt>` | Run a task locally (needs `--providers`) |
 | `/delegate <provider>[@peer[:folder]] <prompt>` | Run a task on a peer that serves `<provider>` (first match, or the named peer), in a folder it shares with you (default: its `data` folder) |
+| `/plan <file>` | Run a [plan](#squads-and-plans): steps on peers (`@name`) or squads (`#squad`), in dependency order |
+| `/squads` | List your squads and which members are online |
 | `/tasks` | List your running tasks with their numbers |
 | `/cancel <n>` | Cancel your running task `n`; the peer stops the model run and frees the slot |
 | `/peers` | List connected peers and the providers they serve |
@@ -462,6 +488,45 @@ the peer is told to stop: it aborts the Copilot session (or the Claude/Codex run
 task slot and records the task as `cancelled` in its audit log. If you disconnect, the peer
 cancels your running tasks the same way, so nothing keeps spending its accounts for you.
 
+A brief reconnect doesn't lose work: if a connection is replaced (for example both peers
+dialed each other at once), running tasks carry on and their results arrive over the new
+connection. Tasks are failed or cancelled only if the peer stays away for 2 seconds.
+
+### Squads and plans
+
+A boss (a person, or itself a digital worker) groups peers into **squads** and runs
+**plans**: steps that run on a named peer or on any member of a squad, in dependency
+order, in parallel where possible.
+
+```powershell
+p2pagents squad create qa --member alice,tester --profile boss
+p2pagents squad list --profile boss
+p2pagents squad remove qa --profile boss
+```
+
+A plan is a text file with one step per line (`//` starts a comment):
+
+```text
+// id [after a,b] @peer[:folder] | #squad[:folder] [using provider] prompt
+api @alice:repo Summarize the public API of src/agent.rs
+tests after api #qa:repo using claude Write test ideas for this API
+report after api,tests @helper Write a one-paragraph status report
+```
+
+- `@peer` runs on that peer; `#squad` runs on the least busy online member that serves the
+  provider (and shares the folder, if one is named). `:folder` defaults to the peer's
+  `data` folder and `using` to `copilot`.
+- A step starts when the steps it waits for (`after`) are done, and gets their results
+  (up to 8,000 characters each) ahead of its prompt. Steps without dependencies run at once.
+- If a step fails, the steps that depend on it are **skipped**; independent steps still run.
+  Unknown steps, duplicate ids and dependency cycles are rejected before anything runs.
+- Every step is an ordinary delegated task, so each peer's allowlist, folder grants, hourly
+  limit, access level and audit log apply. Squads live only in the boss's profile
+  (`squads.json`); members just see tasks from the boss.
+
+Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. Each step appears as a task
+that waits, runs, finishes or is skipped, and cancelling any step cancels the whole plan.
+
 ### Options
 
 | Option | Default | Description |
@@ -481,7 +546,8 @@ cancels your running tasks the same way, so nothing keeps spending its accounts 
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
-`p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
+`p2pagents share add|list|remove`, `p2pagents worker create|list`,
+`p2pagents squad create|list|remove`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
 (and uses a separate credential store namespace).
 
 ## Web UI
@@ -506,6 +572,10 @@ p2pagents --name me --providers copilot --serve --ui
   when several serve it).
   The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
   results and errors, and has a **Cancel** button on running tasks.
+- **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
+  Ctrl+Enter runs it). Steps show which steps they wait for, and skipped steps are flagged.
+- **Squads**: create, view (members, who is online, running tasks) and remove squads.
+  Digital workers show their owner and role in the peer list.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
@@ -718,13 +788,14 @@ Workflow for a change:
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
 - [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with per-access tool allowlists and the path-checking permission handler
 - [src/llm/policy.rs](src/llm/policy.rs): workspace confinement, credential-file and code-execution-file rules, shell command scan
-- [src/profile.rs](src/profile.rs): profiles: private provider homes, OS credential store secrets, environment isolation
+- [src/profile.rs](src/profile.rs): profiles: private provider homes, OS credential store secrets, environment isolation, digital workers (owner accounts, role)
 - [src/auth.rs](src/auth.rs): `auth login/status/logout` for Copilot, Claude and Codex
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access)
+- [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation, and the dependency-ordered plan runner
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases

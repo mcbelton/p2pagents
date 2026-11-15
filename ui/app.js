@@ -280,6 +280,9 @@ function renderPeers() {
       avatar(p.name, true),
       el("div", { class: "who" },
         el("span", { class: "name", text: p.name }),
+        p.owner || p.role
+          ? el("span", { class: "role", text: [p.owner ? `Digital worker of ${p.owner}` : null, p.role].filter(Boolean).join(" · ") })
+          : null,
         el("span", { class: "sub" },
           el("span", { class: "mono", text: p.short }),
           p.capabilities.length
@@ -351,24 +354,34 @@ function appendFeed(item) {
 const openResults = new Map();
 
 function taskNode(t) {
-  const statusText = { running: "Running", done: "Done", failed: "Failed", cancelled: "Cancelled" }[t.status];
+  const statusText = {
+    running: "Running", done: "Done", failed: "Failed", cancelled: "Cancelled", waiting: "Waiting", skipped: "Skipped",
+  }[t.status];
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
+  const title = t.step
+    ? `Step ${t.step} · ${providerLabel(t.provider)} → ${t.target}`
+    : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
+  const meta = t.status === "waiting"
+    ? el("div", { class: "task-meta", text: t.after?.length ? `Waits for: ${t.after.join(", ")}` : "Starting…" })
+    : el("div", { class: "task-meta" }, `Started ${clock(t.started_ms)} · `,
+      el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
+        t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`),
+      t.after?.length ? ` · after ${t.after.join(", ")}` : null);
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
     el("div", { class: "task-top" },
-      el("span", { class: "task-title", text: `#${t.id} · ${providerLabel(t.provider)} → ${t.target}` }),
+      el("span", { class: "task-title", text: title }),
       el("span", { class: `status ${t.status}` },
         t.status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, statusText)),
     el("p", { class: "task-prompt", text: t.prompt }),
-    el("div", { class: "task-meta" }, `Started ${clock(t.started_ms)} · `,
-      el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
-        t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`)));
-  if (t.status === "running") {
+    meta);
+  if (t.status === "running" || (t.plan && t.status === "waiting")) {
     node.append(el("button", {
-      type: "button", class: "btn small", "aria-label": `Cancel task #${t.id}`,
+      type: "button", class: "btn small",
+      "aria-label": t.plan ? `Cancel the plan of step ${t.step}` : `Cancel task #${t.id}`,
       onclick: (e) => cancelTask(t, e.currentTarget),
-    }, icon(ICONS.stop), "Cancel"));
+    }, icon(ICONS.stop), t.plan ? "Cancel plan" : "Cancel"));
   }
-  if (t.output !== null && t.output !== undefined && t.status !== "cancelled") {
+  if (t.output !== null && t.output !== undefined && !["cancelled", "skipped"].includes(t.status)) {
     const open = openResults.has(t.id) ? openResults.get(t.id) : true;
     const details = el("details", { open: open || undefined },
       el("summary", { text: t.status === "failed" ? "Error" : "Result" }),
@@ -391,6 +404,76 @@ function renderTasks() {
       " below to run a prompt on this agent or a peer."));
   }
   for (const t of [...state.tasks].reverse()) list.append(taskNode(t));
+  renderSquads();
+}
+
+// ---------- squads ----------
+function renderSquads() {
+  const list = $("#squad-list");
+  list.replaceChildren();
+  const squads = state.squads ?? [];
+  if (!squads.length) {
+    list.append(el("li", { class: "empty" }, "Group peers into squads, then give a squad steps in a ",
+      el("strong", { text: "Plan" }), "."));
+  }
+  for (const s of squads) {
+    const online = s.members.filter((m) => m.online).length;
+    list.append(el("li", { class: "squad" },
+      el("div", { class: "who" },
+        el("span", { class: "name", text: `#${s.name}` }),
+        el("span", { class: "sub", text: `${online}/${s.members.length} online` }),
+        el("ul", { class: "squad-members" }, ...s.members.map((m) => {
+          const busy = state.tasks.filter((t) => t.status === "running" && t.target === m.name).length;
+          return el("li", {},
+            el("span", { class: `dot${m.online ? " on" : ""}`, "aria-hidden": "true" }),
+            el("span", { text: m.name }),
+            el("span", { class: "muted small", text: m.online ? (busy ? ` · ${busy} running` : " · idle") : " · offline" }));
+        }))),
+      el("button", {
+        type: "button", class: "icon-btn", title: `Remove squad ${s.name}`, "aria-label": `Remove squad ${s.name}`,
+        onclick: () => removeSquad(s.name),
+      }, icon(ICONS.trash))));
+  }
+}
+
+function openSquadDialog() {
+  $("#squad-form").reset();
+  $("#squad-error").textContent = "";
+  const box = $("#squad-members");
+  box.replaceChildren(...(state.trusted.length
+    ? state.trusted.map((t) => el("label", { class: "check" },
+      el("input", { type: "checkbox", value: t.name }),
+      el("span", { text: `${t.name}${t.connected ? "" : " (offline)"}` })))
+    : [el("span", { class: "muted small", text: "Add peers to the allowlist first." })]));
+  $("#squad-dialog").showModal();
+  $("#squad-name").focus();
+}
+
+async function submitSquad(e) {
+  e.preventDefault();
+  const name = $("#squad-name").value.trim();
+  const members = [...document.querySelectorAll("#squad-members input:checked")].map((i) => i.value);
+  if (!name || !members.length) {
+    $("#squad-error").textContent = "Enter a name and pick at least one member.";
+    return;
+  }
+  try {
+    await api("/api/squads", { method: "POST", body: JSON.stringify({ name, members }) });
+    $("#squad-dialog").close();
+    toast(`Squad #${name} saved`);
+  } catch (err) {
+    $("#squad-error").textContent = err.message;
+  }
+}
+
+async function removeSquad(name) {
+  if (!confirm(`Remove squad #${name}? Its members stay on the allowlist.`)) return;
+  try {
+    await api(`/api/squads/${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(`Squad #${name} removed`);
+  } catch (err) {
+    toast(err.message, "error");
+  }
 }
 
 function upsertTask(task) {
@@ -399,9 +482,10 @@ function upsertTask(task) {
   if (isNew) state.tasks.push(task);
   else state.tasks[i] = task;
   renderTasks();
-  if (!isNew && task.status !== "running") {
-    const verb = { done: "finished", failed: "failed", cancelled: "cancelled" }[task.status];
-    toast(`Task #${task.id} ${verb}`, task.status === "failed" ? "error" : "");
+  if (!isNew && !["running", "waiting"].includes(task.status)) {
+    const verb = { done: "finished", failed: "failed", cancelled: "cancelled", skipped: "skipped" }[task.status];
+    const label = task.step ? `Step ${task.step}` : `Task #${task.id}`;
+    toast(`${label} ${verb}`, task.status === "failed" ? "error" : "");
   }
 }
 
@@ -481,20 +565,28 @@ function renderShareOptions() {
   if (shares.some((s) => s.name === prev)) sel.value = prev;
 }
 
+const PLAN_EXAMPLE = "api @alice:repo Summarize the public API\ntests after api #qa Write test ideas for it\nreport after api,tests @bob Write a short status report";
+
 function updateComposer() {
   const task = state.mode === "task";
+  const plan = state.mode === "plan";
   const input = $("#composer-input");
   const noProviders = task && !availableProviders().length;
   $("#task-opts").hidden = !task;
-  input.placeholder = task
-    ? noProviders
-      ? "No provider available: enable one with --providers, or connect a peer that serves one"
-      : "Describe the task, e.g. “Add unit tests for the parser module”"
-    : "Message all connected peers…";
-  $("#composer-label").textContent = task ? "Task prompt" : "Message";
-  $("#send-btn").querySelector("span").textContent = task ? "Run" : "Send";
+  input.rows = plan ? 5 : 2;
+  input.placeholder = plan
+    ? `One step per line: id [after a,b] @peer[:folder] or #squad [using claude] prompt\n${PLAN_EXAMPLE}`
+    : task
+      ? noProviders
+        ? "No provider available: enable one with --providers, or connect a peer that serves one"
+        : "Describe the task, e.g. “Add unit tests for the parser module”"
+      : "Message all connected peers…";
+  $("#composer-label").textContent = plan ? "Plan" : task ? "Task prompt" : "Message";
+  $("#send-btn").querySelector("span").textContent = plan ? "Run plan" : task ? "Run" : "Send";
   $("#send-btn").disabled = noProviders || (task && !$("#target").value);
-  $("#composer-hint").textContent = "Enter to send · Shift+Enter for a new line";
+  $("#composer-hint").textContent = plan
+    ? "Ctrl+Enter to run · steps wait for the steps after “after” and get their results"
+    : "Enter to send · Shift+Enter for a new line";
 }
 
 async function submitComposer(e) {
@@ -507,6 +599,9 @@ async function submitComposer(e) {
     if (state.mode === "chat") {
       const res = await api("/api/chat", { method: "POST", body: JSON.stringify({ text }) });
       if (res.sent === 0) toast("No peers connected; nobody received the message");
+    } else if (state.mode === "plan") {
+      const res = await api("/api/plans", { method: "POST", body: JSON.stringify({ text }) });
+      toast(`Plan started: ${Object.keys(res.steps).length} steps`);
     } else {
       const task = await api("/api/tasks", {
         method: "POST",
@@ -606,7 +701,7 @@ async function removePeer(t) {
 // ---------- live updates ----------
 async function loadState() {
   const s = await api("/api/state");
-  Object.assign(state, { me: s.me, peers: s.peers, trusted: s.trusted, feed: s.feed, tasks: s.tasks });
+  Object.assign(state, { me: s.me, peers: s.peers, trusted: s.trusted, squads: s.squads, feed: s.feed, tasks: s.tasks });
   renderMe();
   renderPeers();
   renderFeed();
@@ -627,7 +722,9 @@ function connectEvents() {
     else if (msg.type === "peers") {
       state.peers = msg.peers;
       state.trusted = msg.trusted;
+      state.squads = msg.squads;
       renderPeers();
+      renderSquads();
     }
   };
   source.onerror = () => {
@@ -663,8 +760,23 @@ function init() {
 
   $("#composer").addEventListener("submit", submitComposer);
   $("#composer-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) submitComposer(e);
+    if (e.key !== "Enter" || e.isComposing) return;
+    // In a plan Enter starts a new step; Ctrl/Cmd+Enter runs it.
+    if (state.mode === "plan" ? e.ctrlKey || e.metaKey : !e.shiftKey) submitComposer(e);
   });
+  $("#add-squad-btn").addEventListener("click", openSquadDialog);
+  $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
+  $("#squad-dialog").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      $("#squad-dialog").close();
+    }
+  });
+  $("#squad-dialog").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) $("#squad-dialog").close();
+  });
+  $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
+  $("#squad-form").addEventListener("submit", submitSquad);
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));

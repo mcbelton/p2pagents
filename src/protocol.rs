@@ -25,6 +25,12 @@ pub enum Message {
         /// Folders the receiving peer may run tasks in (names and access, no paths).
         #[serde(default)]
         shares: Vec<ShareInfo>,
+        /// For a digital worker: the profile that owns it (and whose accounts it uses).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        /// What this agent is for, as set by its owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
     },
     Peers {
         addrs: Vec<EndpointAddr>,
@@ -114,6 +120,8 @@ mod tests {
             addr,
             capabilities: vec![Provider::Claude],
             shares: Vec::new(),
+            owner: Some("alice".into()),
+            role: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);

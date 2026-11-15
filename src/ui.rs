@@ -29,6 +29,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent::{Agent, Event, Network};
 use crate::audit::{AuditLog, Outcome};
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
+use crate::plan::{Plan, SquadStore, StepState, run_plan};
 use crate::profile::{Profile, validate_name};
 use crate::trust::{Ticket, TrustedPeer};
 
@@ -58,6 +59,19 @@ struct TaskView {
     output: Option<String>,
     started_ms: u128,
     finished_ms: Option<u128>,
+    /// For plan steps: the plan, the step id and the steps it waits for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    after: Vec<String>,
+}
+
+impl TaskView {
+    fn finished(&self) -> bool {
+        !matches!(self.status, "running" | "waiting")
+    }
 }
 
 struct Shared {
@@ -69,9 +83,10 @@ struct Shared {
     feed: Mutex<VecDeque<Value>>,
     next_feed_id: AtomicU64,
     tasks: Mutex<Vec<TaskView>>,
-    /// Abort handles of running tasks, for `DELETE /api/tasks/{id}`.
+    /// Abort handles of running tasks (a plan's steps share one), for `DELETE /api/tasks/{id}`.
     running: Mutex<HashMap<u64, AbortHandle>>,
     next_task_id: AtomicU64,
+    squads: Mutex<SquadStore>,
     tx: broadcast::Sender<String>,
 }
 
@@ -124,6 +139,8 @@ impl Shared {
                     "short": p.id.fmt_short().to_string(),
                     "name": p.name,
                     "capabilities": p.capabilities,
+                    "owner": p.owner,
+                    "role": p.role,
                     "shares": p.shares,
                 })
             })
@@ -146,7 +163,22 @@ impl Shared {
                 })
             })
             .collect();
-        json!({ "peers": peers_json, "trusted": trusted })
+        let squads: Vec<Value> = self
+            .squads
+            .lock()
+            .unwrap()
+            .squads
+            .iter()
+            .map(|s| {
+                let members: Vec<Value> = s
+                    .members
+                    .iter()
+                    .map(|m| json!({ "name": m, "online": peers.iter().any(|p| &p.name == m) }))
+                    .collect();
+                json!({ "name": s.name, "members": members })
+            })
+            .collect();
+        json!({ "peers": peers_json, "trusted": trusted, "squads": squads })
     }
 
     fn broadcast_peers(&self) {
@@ -225,6 +257,7 @@ pub async fn start(
 ) -> Result<UiServer> {
     let token = data_encoding::HEXLOWER.encode(&iroh::SecretKey::generate().to_bytes()[..16]);
     let (tx, _) = broadcast::channel(256);
+    let squads = SquadStore::load(&info.profile.squads_path()).unwrap_or_default();
     let shared = Arc::new(Shared {
         agent,
         info,
@@ -234,6 +267,7 @@ pub async fn start(
         feed: Mutex::new(VecDeque::new()),
         next_feed_id: AtomicU64::new(1),
         tasks: Mutex::new(Vec::new()),
+        squads: Mutex::new(squads),
         running: Mutex::new(HashMap::new()),
         next_task_id: AtomicU64::new(1),
         tx,
@@ -304,6 +338,9 @@ pub async fn start(
         .route("/api/tasks", post(create_task))
         .route("/api/tasks/{id}", delete(cancel_task))
         .route("/api/audit", get(audit))
+        .route("/api/plans", post(create_plan))
+        .route("/api/squads", post(save_squad))
+        .route("/api/squads/{name}", delete(remove_squad))
         .route("/api/trust", post(allow_peer))
         .route("/api/trust/{id}", delete(remove_peer))
         .route_layer(middleware::from_fn_with_state(
@@ -507,6 +544,9 @@ async fn create_task(
         output: None,
         started_ms: now_ms(),
         finished_ms: None,
+        plan: None,
+        step: None,
+        after: Vec::new(),
     };
     s.tasks.lock().unwrap().push(view.clone());
     s.send(json!({ "type": "task", "task": view }));
@@ -548,8 +588,8 @@ async fn create_task(
     Ok(Json(json!(view)))
 }
 
-/// Cancels a running task. Dropping a delegation tells the peer to stop it; a
-/// local task's provider run is aborted.
+/// Cancels a running task, or the whole plan a step belongs to. Dropping a
+/// delegation tells the peer to stop it; a local task's provider run is aborted.
 async fn cancel_task(
     State(s): State<AppState>,
     Path(id): Path<u64>,
@@ -561,12 +601,178 @@ async fn cancel_task(
         )
     })?;
     handle.abort();
-    s.update_task(id, |t| {
-        t.finished_ms = Some(now_ms());
-        t.status = "cancelled";
-        t.output = Some("Cancelled by you.".into());
-    });
+    let plan = s
+        .tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.plan);
+    let ids: Vec<u64> = match plan {
+        Some(plan) => s
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.plan == Some(plan) && !t.finished())
+            .map(|t| t.id)
+            .collect(),
+        None => vec![id],
+    };
+    for id in ids {
+        s.running.lock().unwrap().remove(&id);
+        s.update_task(id, |t| {
+            t.finished_ms = Some(now_ms());
+            t.status = "cancelled";
+            t.output = Some("Cancelled by you.".into());
+        });
+    }
     Ok(Json(json!({ "cancelled": id })))
+}
+
+#[derive(Deserialize)]
+struct PlanBody {
+    text: String,
+}
+
+/// Runs a plan (see [`crate::plan`]); each step shows up as a task, updated live.
+async fn create_plan(
+    State(s): State<AppState>,
+    Json(body): Json<PlanBody>,
+) -> Result<Json<Value>, ApiError> {
+    let plan = Plan::parse(&body.text).map_err(|e| bad_request(format!("{e:#}")))?;
+    let plan_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
+    let mut ids = HashMap::new();
+    for step in &plan.steps {
+        let id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
+        ids.insert(step.id.clone(), id);
+        let view = TaskView {
+            id,
+            provider: step.provider,
+            prompt: step.prompt.clone(),
+            target: format!(
+                "{}{}",
+                step.target,
+                step.share
+                    .as_ref()
+                    .map(|f| format!(":{f}"))
+                    .unwrap_or_default()
+            ),
+            status: "waiting",
+            output: None,
+            started_ms: now_ms(),
+            finished_ms: None,
+            plan: Some(plan_id),
+            step: Some(step.id.clone()),
+            after: step.after.clone(),
+        };
+        s.tasks.lock().unwrap().push(view.clone());
+        s.send(json!({ "type": "task", "task": view }));
+    }
+    let squads = s.squads.lock().unwrap().clone();
+    let shared = s.clone();
+    let step_ids = ids.clone();
+    let handle = tokio::spawn(async move {
+        run_plan(&shared.agent.clone(), &squads, &plan, |step, state| {
+            let id = step_ids[step];
+            if !matches!(state, StepState::Waiting | StepState::Running { .. }) {
+                shared.running.lock().unwrap().remove(&id);
+            }
+            shared.update_task(id, |t| match state {
+                StepState::Waiting => {}
+                StepState::Running { peer } => {
+                    t.status = "running";
+                    t.target = peer.clone();
+                    t.started_ms = now_ms();
+                }
+                StepState::Done { peer, output } => {
+                    t.status = "done";
+                    t.target = peer.clone();
+                    t.output = Some(output.clone());
+                    t.finished_ms = Some(now_ms());
+                }
+                StepState::Failed { error, .. } => {
+                    t.status = "failed";
+                    t.output = Some(error.clone());
+                    t.finished_ms = Some(now_ms());
+                }
+                StepState::Skipped { reason } => {
+                    t.status = "skipped";
+                    t.output = Some(format!("Skipped: {reason}"));
+                    t.finished_ms = Some(now_ms());
+                }
+            });
+        })
+        .await;
+    });
+    {
+        let mut running = s.running.lock().unwrap();
+        let tasks = s.tasks.lock().unwrap();
+        for id in ids.values() {
+            if tasks.iter().any(|t| t.id == *id && !t.finished()) {
+                running.insert(*id, handle.abort_handle());
+            }
+        }
+    }
+    s.system("task", format!("Plan started: {} steps", ids.len()));
+    Ok(Json(json!({ "plan": plan_id, "steps": ids })))
+}
+
+#[derive(Deserialize)]
+struct SquadBody {
+    name: String,
+    members: Vec<String>,
+}
+
+async fn save_squad(
+    State(s): State<AppState>,
+    Json(body): Json<SquadBody>,
+) -> Result<Json<Value>, ApiError> {
+    let trusted = s.agent.trusted();
+    if let Some(unknown) = body
+        .members
+        .iter()
+        .find(|m| trusted.get_by_name(m).is_none())
+    {
+        return Err(bad_request(format!("'{unknown}' is not on the allowlist")));
+    }
+    let saved = {
+        let mut squads = s.squads.lock().unwrap();
+        squads
+            .set(body.name.trim(), body.members)
+            .map_err(|e| bad_request(format!("{e:#}")))?;
+        squads.save(&s.info.profile.squads_path())
+    };
+    saved.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    s.system("info", format!("Squad {} saved", body.name.trim()));
+    s.broadcast_peers();
+    Ok(Json(json!({ "name": body.name.trim() })))
+}
+
+async fn remove_squad(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let saved = {
+        let mut squads = s.squads.lock().unwrap();
+        if !squads.remove(&name) {
+            return Err(bad_request(format!("there is no squad {name}")));
+        }
+        squads.save(&s.info.profile.squads_path())
+    };
+    saved.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    s.broadcast_peers();
+    Ok(Json(json!({ "removed": name })))
 }
 
 #[derive(Deserialize)]
