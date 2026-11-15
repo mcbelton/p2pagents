@@ -20,7 +20,7 @@ impl Executor for Echo {
         vec![Provider::Copilot]
     }
 
-    async fn execute(&self, task: &LlmTask) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, _grant: Access) -> anyhow::Result<String> {
         Ok(format!("echo: {}", task.prompt))
     }
 }

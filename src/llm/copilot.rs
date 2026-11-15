@@ -10,7 +10,9 @@ use github_copilot_sdk::types::{
     SessionId,
 };
 use github_copilot_sdk::{Client, ClientOptions};
+use serde_json::Value;
 
+use super::policy::Workspace;
 use super::{Access, LlmTask};
 use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
@@ -18,22 +20,46 @@ use crate::profile::{
 
 const TASK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
+/// Built-in Copilot CLI tools a session may use, per access level. Everything
+/// else (web_fetch, sub-agents, skills, MCP servers such as GitHub's) is not
+/// offered to the model at all.
+const READ_TOOLS: &[&str] = &["view", "glob", "grep"];
+const WRITE_TOOLS: &[&str] = &["create", "edit"];
+const SHELL_TOOLS: &[&str] = &[
+    "powershell",
+    "read_powershell",
+    "write_powershell",
+    "stop_powershell",
+    "list_powershell",
+    "bash",
+    "read_bash",
+    "write_bash",
+    "stop_bash",
+    "list_bash",
+];
+
+pub(crate) fn available_tools(access: Access) -> Vec<&'static str> {
+    let mut tools = READ_TOOLS.to_vec();
+    if access >= Access::WorkspaceWrite {
+        tools.extend(WRITE_TOOLS);
+    }
+    if access >= Access::Full {
+        tools.extend(SHELL_TOOLS);
+    }
+    tools
+}
+
 /// A private GitHub Copilot CLI instance (official `github-copilot-sdk` crate) for one
 /// agent: its own `COPILOT_HOME`, its own token, and no fallback to the machine's
 /// signed-in user or inherited `GH_TOKEN`-style variables.
 pub struct CopilotBackend {
     workspace: PathBuf,
-    access: Access,
     client: Client,
     login: Option<String>,
 }
 
 impl CopilotBackend {
-    pub async fn start(
-        creds: CopilotCredentials,
-        workspace: PathBuf,
-        access: Access,
-    ) -> Result<Self> {
+    pub async fn start(creds: CopilotCredentials, workspace: PathBuf) -> Result<Self> {
         let cli = find_copilot_cli()?;
         let mut env = vec![("COPILOT_HOME".to_owned(), creds.home.into_os_string())];
         if creds.host != DEFAULT_GITHUB_HOST {
@@ -56,7 +82,6 @@ impl CopilotBackend {
         let login = github_login(&creds.token, &creds.host);
         Ok(Self {
             workspace,
-            access,
             client,
             login,
         })
@@ -90,10 +115,16 @@ impl CopilotBackend {
         let _ = self.client.stop().await;
     }
 
-    pub async fn run(&self, task: &LlmTask) -> Result<String> {
+    pub async fn run(&self, task: &LlmTask, access: Access) -> Result<String> {
+        let policy = AccessPolicy {
+            access,
+            workspace: Workspace::new(&self.workspace)
+                .with_context(|| format!("opening workspace {}", self.workspace.display()))?,
+        };
         let mut config = SessionConfig::default()
             .with_working_directory(self.workspace.clone())
-            .with_permission_handler(Arc::new(AccessPolicy(self.access)));
+            .with_available_tools(available_tools(access))
+            .with_permission_handler(Arc::new(policy));
         if let Some(model) = &task.model {
             config = config.with_model(model.clone());
         }
@@ -134,14 +165,93 @@ pub fn find_copilot_cli() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("Copilot CLI not found; install it or set COPILOT_CLI_PATH"))
 }
 
-struct AccessPolicy(Access);
+struct AccessPolicy {
+    access: Access,
+    workspace: Workspace,
+}
 
-pub(crate) fn is_allowed(access: Access, kind: Option<&PermissionRequestKind>) -> bool {
+/// String values of `key` in a permission request (string, array or map values).
+fn strings(req: &Value, key: &str) -> Vec<String> {
+    match req.get(key) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        Some(Value::Object(map)) => map
+            .values()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Why Copilot's permission request `req` is refused at `access`, or `None` to approve.
+pub(crate) fn refusal(
+    access: Access,
+    workspace: &Workspace,
+    kind: Option<&PermissionRequestKind>,
+    req: &Value,
+) -> Option<String> {
     use PermissionRequestKind::*;
-    matches!(
-        (access, kind),
-        (_, Some(Read)) | (Access::WorkspaceWrite, Some(Write | Shell))
-    )
+    match kind {
+        Some(Read) => {
+            let paths = [strings(req, "path"), strings(req, "resolvedPath")].concat();
+            if paths.is_empty() {
+                return Some("read request without a path".into());
+            }
+            paths.iter().find_map(|p| workspace.check_read(p))
+        }
+        Some(Write) if access >= Access::WorkspaceWrite => {
+            let mut paths = [strings(req, "fileName"), strings(req, "resolvedPath")].concat();
+            for edit in req
+                .get("fileEdits")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                for side in ["before", "after"] {
+                    if let Some(path) = edit[side]["path"].as_str() {
+                        paths.push(path.to_owned());
+                    }
+                }
+            }
+            if paths.is_empty() {
+                return Some("write request without a path".into());
+            }
+            paths.iter().find_map(|p| workspace.check_write(p))
+        }
+        // Best effort only: a shell command can do anything the OS user can.
+        Some(Shell) if access >= Access::Full => {
+            if req["possibleUrls"]
+                .as_array()
+                .is_some_and(|urls| !urls.is_empty())
+            {
+                return Some("shell commands may not access URLs".into());
+            }
+            let text = strings(req, "fullCommandText");
+            if text.is_empty() {
+                return Some("shell request without a command".into());
+            }
+            text.iter()
+                .find_map(|t| workspace.check_command(t))
+                .or_else(|| {
+                    [
+                        strings(req, "possiblePaths"),
+                        strings(req, "resolvedPaths"),
+                        strings(req, "resolvedWorkingDirectory"),
+                    ]
+                    .concat()
+                    .iter()
+                    .find_map(|p| workspace.check_read(p))
+                })
+        }
+        Some(Write) => Some(format!("{access} access does not allow editing files")),
+        Some(Shell) => Some(format!("{access} access does not allow shell commands")),
+        Some(Url) => Some("web access is disabled for tasks".into()),
+        Some(Mcp) => Some("MCP tools are disabled for tasks".into()),
+        _ => Some("this tool is disabled for tasks".into()),
+    }
 }
 
 #[async_trait]
@@ -152,35 +262,129 @@ impl PermissionHandler for AccessPolicy {
         _rid: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
-        if data.managed_approval_required != Some(true) && is_allowed(self.0, data.kind.as_ref()) {
-            PermissionResult::approve_once()
+        let req = Value::from(&data);
+        if std::env::var_os("P2PAGENTS_DEBUG_PERMISSIONS").is_some() {
+            eprintln!("  copilot: permission request {req}");
+        }
+        let reason = if data.managed_approval_required == Some(true) {
+            Some("managed policy requires a human decision".into())
         } else {
-            PermissionResult::reject(Some(format!("denied by p2pagents {:?} policy", self.0)))
+            refusal(self.access, &self.workspace, data.kind.as_ref(), &req)
+        };
+        match reason {
+            None => PermissionResult::approve_once(),
+            Some(reason) => {
+                eprintln!("  copilot: denied {} ({reason})", short(&req));
+                PermissionResult::reject(Some(format!("denied by p2pagents: {reason}")))
+            }
         }
     }
+}
+
+/// One-line summary of a permission request for the agent's log.
+fn short(req: &Value) -> String {
+    let kind = req["kind"].as_str().unwrap_or("?");
+    let target = ["path", "fileName", "fullCommandText", "url", "toolName"]
+        .iter()
+        .find_map(|k| req[*k].as_str())
+        .unwrap_or("");
+    let target: String = target.chars().take(120).collect();
+    format!("{kind} {target}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use PermissionRequestKind::*;
+    use serde_json::json;
 
-    #[test]
-    fn read_only_allows_only_reads() {
-        assert!(is_allowed(Access::ReadOnly, Some(&Read)));
-        for kind in [Write, Shell, Url, Mcp] {
-            assert!(!is_allowed(Access::ReadOnly, Some(&kind)));
-        }
-        assert!(!is_allowed(Access::ReadOnly, None));
+    fn workspace() -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        (dir, ws)
+    }
+
+    fn file(ws: &Workspace, rel: &str) -> String {
+        ws.root().join(rel).to_string_lossy().into_owned()
     }
 
     #[test]
-    fn workspace_write_allows_coding_but_not_network_or_mcp() {
-        for kind in [Read, Write, Shell] {
-            assert!(is_allowed(Access::WorkspaceWrite, Some(&kind)));
+    fn tools_grow_with_access() {
+        let read = available_tools(Access::ReadOnly);
+        assert_eq!(read, ["view", "glob", "grep"]);
+        let write = available_tools(Access::WorkspaceWrite);
+        assert!(write.contains(&"edit") && !write.contains(&"powershell"));
+        let full = available_tools(Access::Full);
+        assert!(full.contains(&"powershell") && full.contains(&"bash"));
+        for access in [Access::ReadOnly, Access::WorkspaceWrite, Access::Full] {
+            for tool in ["web_fetch", "task", "skill", "write_agent"] {
+                assert!(!available_tools(access).contains(&tool));
+            }
         }
+    }
+
+    #[test]
+    fn reads_are_confined_to_the_workspace() {
+        let (_dir, ws) = workspace();
+        let read = |path: &str| json!({ "kind": "read", "path": path });
+        let inside = read(&file(&ws, "src/main.rs"));
+        assert_eq!(refusal(Access::ReadOnly, &ws, Some(&Read), &inside), None);
+        let outside = std::env::temp_dir().join("elsewhere.txt");
+        let outside = read(outside.to_str().unwrap());
+        assert!(refusal(Access::Full, &ws, Some(&Read), &outside).is_some());
+        let secret = read(&file(&ws, ".env"));
+        assert!(refusal(Access::Full, &ws, Some(&Read), &secret).is_some());
+        assert!(
+            refusal(
+                Access::ReadOnly,
+                &ws,
+                Some(&Read),
+                &json!({ "kind": "read" })
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn writes_need_write_access_and_stay_in_the_workspace() {
+        let (_dir, ws) = workspace();
+        let write = |path: &str| json!({ "kind": "write", "fileName": path });
+        let ok = write(&file(&ws, "src/lib.rs"));
+        assert!(refusal(Access::ReadOnly, &ws, Some(&Write), &ok).is_some());
+        assert_eq!(
+            refusal(Access::WorkspaceWrite, &ws, Some(&Write), &ok),
+            None
+        );
+        let hook = write(&file(&ws, ".git/hooks/pre-commit"));
+        assert!(refusal(Access::Full, &ws, Some(&Write), &hook).is_some());
+        let sneaky = json!({
+            "kind": "write",
+            "fileName": file(&ws, "a.txt"),
+            "fileEdits": [{ "after": { "path": "../escape.txt", "content": "" } }],
+        });
+        assert!(refusal(Access::Full, &ws, Some(&Write), &sneaky).is_some());
+    }
+
+    #[test]
+    fn shell_needs_full_access_and_no_urls_or_outside_paths() {
+        let (_dir, ws) = workspace();
+        let cmd = |paths: Vec<String>, urls: Value| json!({ "kind": "shell", "fullCommandText": "x", "possiblePaths": paths, "possibleUrls": urls });
+        let plain = cmd(vec![file(&ws, "Cargo.toml")], json!([]));
+        assert!(refusal(Access::WorkspaceWrite, &ws, Some(&Shell), &plain).is_some());
+        assert_eq!(refusal(Access::Full, &ws, Some(&Shell), &plain), None);
+        let curl = cmd(vec![], json!([{ "url": "https://example.com" }]));
+        assert!(refusal(Access::Full, &ws, Some(&Shell), &curl).is_some());
+        let home = std::env::temp_dir().to_string_lossy().into_owned();
+        let outside = cmd(vec![home], json!([]));
+        assert!(refusal(Access::Full, &ws, Some(&Shell), &outside).is_some());
+    }
+
+    #[test]
+    fn network_mcp_and_other_tools_are_always_refused() {
+        let (_dir, ws) = workspace();
         for kind in [Url, Mcp, CustomTool, Memory, Hook, Unknown] {
-            assert!(!is_allowed(Access::WorkspaceWrite, Some(&kind)));
+            assert!(refusal(Access::Full, &ws, Some(&kind), &json!({})).is_some());
         }
+        assert!(refusal(Access::Full, &ws, None, &json!({})).is_some());
     }
 }

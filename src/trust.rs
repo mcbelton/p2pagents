@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use serde::{Deserialize, Serialize};
 
+use crate::llm::Access;
+
 pub const DEFAULT_TASKS_PER_HOUR: u32 = 20;
 
 fn default_tasks_per_hour() -> u32 {
@@ -31,6 +33,9 @@ pub struct TrustedPeer {
     pub can_delegate: bool,
     #[serde(default = "default_tasks_per_hour")]
     pub tasks_per_hour: u32,
+    /// Most a delegated task from this peer may do; capped by the agent's `--access`.
+    #[serde(default)]
+    pub access: Access,
 }
 
 impl TrustedPeer {
@@ -135,6 +140,7 @@ mod tests {
             addrs: BTreeSet::new(),
             can_delegate: false,
             tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
+            access: Access::ReadOnly,
         }
     }
 

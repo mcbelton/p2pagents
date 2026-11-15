@@ -53,3 +53,18 @@ async fn surfaces_provider_errors_and_bridge_exit() {
         .await;
     assert_eq!(exit.unwrap_err().to_string(), "bridge process exited");
 }
+
+#[test]
+fn claude_tool_policy_confines_paths_and_tools() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("node")
+        .arg(root.join("tests/fixtures/bridge_policy.mjs"))
+        .env("P2PAGENTS_BRIDGE_IMPORT_ONLY", "1")
+        .output()
+        .expect("node must be installed to run bridge tests");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

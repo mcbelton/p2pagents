@@ -250,7 +250,7 @@ function renderMe() {
     fact("Providers", me.providers.map(providerLabel).join(", "));
     for (const a of me.accounts) fact(providerLabel(a.provider), a.account);
     fact("Serves peers", me.serving ? "Yes" : "No");
-    fact("Access", me.access === "workspace-write" ? "Read and write" : "Read only");
+    fact("Max access", ACCESS_SHORT[me.access] ?? me.access);
     fact("Workspace", el("span", { class: "mono", text: me.workspace }));
   } else {
     fact("Providers", "None (delegates only)");
@@ -293,7 +293,7 @@ function renderPeers() {
         el("span", { class: "sub" },
           el("span", { text: t.connected ? "Connected" : "Offline" }),
           t.can_delegate
-            ? el("span", { class: "badge ok", text: `Can run tasks · ${t.tasks_per_hour}/h` })
+            ? el("span", { class: "badge ok", title: "May run tasks on this agent", text: `Tasks: ${ACCESS_SHORT[t.access] ?? "Read only"} · ${t.tasks_per_hour}/h` })
             : el("span", { class: "badge neutral", text: "Chat only" }))),
       el("button", {
         type: "button", class: "icon-btn", title: `Remove ${t.name}`, "aria-label": `Remove ${t.name} from the allowlist`,
@@ -462,9 +462,29 @@ async function submitComposer(e) {
 }
 
 // ---------- allowlist ----------
+const ACCESS_SHORT = { "read-only": "Read only", "workspace-write": "Edit files", full: "Full" };
+const ACCESS_RANK = { "read-only": 0, "workspace-write": 1, full: 2 };
+
+function syncDelegateFields() {
+  const on = $("#add-delegate").checked;
+  $("#rate-field").hidden = !on;
+  $("#access-field").hidden = !on;
+  const chosen = $("#add-access").value;
+  const ceiling = state.me?.access ?? "read-only";
+  const hint = [];
+  if (ACCESS_RANK[chosen] > ACCESS_RANK[ceiling]) {
+    hint.push(`This agent runs with --access ${ceiling}, so their tasks get ${ACCESS_SHORT[ceiling].toLowerCase()} until you restart it with a higher --access.`);
+  }
+  if (chosen === "full") {
+    hint.push("Shell commands are not sandboxed: they can do anything your user account can.");
+  }
+  hint.push("Files outside the workspace and credential files (.env, keys, .ssh…) are always refused.");
+  $("#access-hint").textContent = hint.join(" ");
+}
+
 function openAddDialog() {
   $("#add-form").reset();
-  $("#rate-field").hidden = true;
+  syncDelegateFields();
   $("#add-error").textContent = "";
   $("#add-dialog").showModal();
   $("#add-ticket").focus();
@@ -488,6 +508,7 @@ async function submitAdd(e) {
         name: $("#add-name").value.trim() || null,
         delegate,
         tasks_per_hour: delegate ? Number($("#add-rate").value) || 20 : null,
+        access: delegate ? $("#add-access").value : "read-only",
       }),
     });
     $("#add-dialog").close();
@@ -585,7 +606,8 @@ function init() {
   });
   $("#add-dialog").addEventListener("close", () => $("#add-peer-btn").focus());
   $("#add-form").addEventListener("submit", submitAdd);
-  $("#add-delegate").addEventListener("change", (e) => { $("#rate-field").hidden = !e.target.checked; });
+  $("#add-delegate").addEventListener("change", syncDelegateFields);
+  $("#add-access").addEventListener("change", syncDelegateFields);
   setInterval(() => {
     for (const span of document.querySelectorAll(".elapsed[data-start]")) {
       span.textContent = `running ${duration(Date.now() - Number(span.dataset.start))}`;

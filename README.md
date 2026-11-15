@@ -352,7 +352,7 @@ with `/ticket`.
 | Peers command | Description |
 | --- | --- |
 | `p2pagents peers id --profile P` | Show P's endpoint id and ticket |
-| `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
+| `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
 | `p2pagents peers list --profile P` | List allowlisted peers and their rights |
 | `p2pagents peers remove <name-or-id> --profile P` | Remove a peer |
 
@@ -386,12 +386,12 @@ and [Internet P2P](#internet-p2p)):
 cargo run -- auth login copilot --profile worker --gh-user <login>
 cargo run -- auth login claude --profile worker
 cargo run -- peers id --profile boss                              # copy boss's ticket
-cargo run -- peers allow <boss-ticket> --profile worker --delegate
+cargo run -- peers allow <boss-ticket> --profile worker --delegate --access full
 cargo run -- peers id --profile worker                            # copy worker's ticket
 cargo run -- peers allow <worker-ticket> --profile boss
 
-# terminal 1 (any machine): worker that runs tasks for boss, may edit files in D:\src\myrepo
-cargo run -- --name worker --providers copilot,claude --serve --workspace D:\src\myrepo --access workspace-write
+# terminal 1 (any machine): worker that runs tasks for boss, may edit files and run builds/tests in D:\src\myrepo
+cargo run -- --name worker --providers copilot,claude --serve --workspace D:\src\myrepo --access full
 
 # terminal 2 (any machine): a peer that delegates work to it (needs no LLM accounts)
 cargo run -- --name boss
@@ -431,7 +431,7 @@ Results print when they arrive, so you can keep typing while tasks run.
 | `--providers <LIST>` | none | Comma-separated `copilot,claude,codex` to enable on this agent |
 | `--serve` | off | Run tasks that allowlisted peers with delegation rights send |
 | `--workspace <DIR>` | `.` | Directory the LLM agents work in |
-| `--access <MODE>` | `read-only` | `read-only` or `workspace-write` (see below) |
+| `--access <MODE>` | `read-only` | Most any task on this agent may do: `read-only`, `workspace-write` (edit files) or `full` (also shell). See [What tasks may do](#what-tasks-may-do) |
 | `--bridge <PATH>` | `bridge/index.mjs` in this repo (env `P2PAGENTS_BRIDGE`) | Node bridge script |
 | `--ui` | off | Open the [web UI](#web-ui) instead of the terminal prompt |
 | `--ui-port <PORT>` | random | Port for the web UI on 127.0.0.1 (needs `--ui`) |
@@ -452,8 +452,9 @@ p2pagents --name me --providers copilot --serve --ui
 
 - **Connected peers** with the providers they serve, live.
 - **Allowlist**: add a peer by pasting their ticket (optionally letting them delegate, with an
-  hourly limit) or remove one; changes are saved to the profile's `peers.json` and take
-  effect at once (removed peers are disconnected).
+  hourly limit and an access level: read only, edit files, or full) or remove one; changes
+  are saved to the profile's `peers.json` and take effect at once (removed peers are
+  disconnected).
 - **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
   access level and workspace.
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections,
@@ -481,20 +482,62 @@ Press Ctrl+C in the terminal to stop the agent.
 - An agent runs peer tasks **only** with `--serve`, only for the providers it enabled, only
   from peers allowlisted with `--delegate`, within their hourly limit, and at most 2 at a
   time (others queue).
-- `--workspace` and `--access` are decided by the agent that runs the task. A peer cannot
-  choose the directory or raise the access level.
-- What each access level allows:
+- `--workspace` and access are decided by the agent that runs the task. A peer cannot
+  choose the directory or raise its access level. Each delegated task gets the **lower** of
+  the peer's grant (`peers allow ... --delegate --access <level>`, default `read-only`) and
+  the agent's `--access` (default `read-only`). Local tasks get the agent's `--access`.
 
-  | | `read-only` | `workspace-write` |
-  | --- | --- | --- |
-  | Copilot | approves `read` permission requests only | approves `read`, `write`, `shell`; rejects URL, MCP, memory, custom tools |
-  | Claude | `dontAsk` mode, tools `Read`, `Glob`, `Grep`; user/project settings not loaded | adds `Edit`, `Write`, `NotebookEdit`, `Bash` |
-  | Codex | sandbox `read-only`, approvals `never` | sandbox `workspace-write`, approvals `never` |
+### What tasks may do
+
+| Level | Allows | Grant with |
+| --- | --- | --- |
+| `read-only` | Read and search files **in the workspace** | default |
+| `workspace-write` | Also create and edit files in the workspace. No shell commands | `--access workspace-write` on both the agent and the peer |
+| `full` | Also run shell commands (build, test, git) | `--access full` on both. Only for peers you trust like a user of your machine |
+
+Always enforced, at every level and for local tasks too:
+
+- **No file access outside the workspace.** Paths are resolved (`..`, symlinks, junctions)
+  before checking, so `../`, absolute paths and links pointing outside are refused.
+- **No credential files**, even inside the workspace: `.env`/`.env.*` (templates such as
+  `.env.example` are fine), `*.pem`, `*.key`, `*.pfx`, `*.p12`, SSH keys (`id_rsa`,
+  `id_ed25519`, ...), `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `credentials*`,
+  `secrets.*`, and anything under `.ssh`, `.aws`, `.azure`, `.kube`, `.docker`, `.gnupg`,
+  `.p2pagents`, `.copilot`.
+- **No writes that would run code later**: `.git/` (hooks, config), `.vscode/`, `.idea/`,
+  `.claude/`, `.codex/`, `.copilot/`, `.cursor/`, `.github/hooks/`, `.mcp.json`, `.gitmodules`.
+- **No web, MCP, memory or sub-agents**: web fetch/search, MCP servers (including GitHub's),
+  Copilot memory, sub-agents/skills are not offered to the model at all.
+
+Per provider:
+
+| | `read-only` | `workspace-write` | `full` |
+| --- | --- | --- | --- |
+| Copilot | only tools `view`, `glob`, `grep`; every read request is path-checked | adds `create`, `edit` (path-checked) | adds the shell tool (`powershell`/`bash`) |
+| Claude | `dontAsk` mode, tools `Read`, `Glob`, `Grep`, a PreToolUse hook path-checks every call; user/project settings not loaded | adds `Edit`, `Write`, `NotebookEdit` | adds `Bash` |
+| Codex | sandbox `read-only`, approvals `never`, no network or web search | sandbox `workspace-write` | same as `workspace-write` (never `danger-full-access`) |
+
+Limits to know:
+
+- **Shell commands (`full`) are not sandboxed** for Copilot and Claude. Commands that name a
+  URL, a path outside the workspace, the home folder (`~`, `$HOME`, `$env:USERPROFILE`,
+  `%APPDATA%`, ...) or a credential file are refused, but this is a text check: an
+  obfuscated command can get past it. A `full` peer can do whatever your OS account can.
+- **Searches see the whole workspace.** A `grep` over the workspace folder is approved as one
+  request, so it can return lines from a `.env` inside it. Keep secrets out of the workspace
+  you serve (or out of Git-ignored files in it).
+- **Codex** confines writes and network with its own sandbox, but its sandbox does not stop
+  reads outside the workspace (and on Windows the sandbox is limited). Serve Codex only to
+  peers you trust, or run that agent under a separate OS account or in a container.
+- Denied requests are printed in the agent's terminal (`copilot: denied ...`,
+  `claude: denied ...`). Set `P2PAGENTS_DEBUG_PERMISSIONS=1` to print every Copilot
+  permission request.
 
 - Each agent uses only its own profile's accounts and provider instances (see
   [Isolation guarantees](#accounts-and-profiles)). Delegating peers never get credentials.
-- Prompts from a peer you allow to delegate run with your accounts and in your workspace.
-  Only grant `--delegate` (and especially `--access workspace-write`) to people you trust.
+- Prompts from a peer you allow to delegate run with your accounts and in your workspace,
+  and the result goes back to that peer: anything the task can read, the peer can see. Only
+  grant `--delegate` to people you trust, and `workspace-write`/`full` to fewer still.
 
 ## Test
 
@@ -538,7 +581,8 @@ endpoints on localhost in local mode, so they need no internet.
 - [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, shutdown
 - [src/trust.rs](src/trust.rs): allowlist (`peers.json`) and `p2pa1...` tickets
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
-- [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with the access-based permission handler
+- [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with per-access tool allowlists and the path-checking permission handler
+- [src/llm/policy.rs](src/llm/policy.rs): workspace confinement, credential-file and code-execution-file rules, shell command scan
 - [src/profile.rs](src/profile.rs): profiles: private provider homes, OS credential store secrets, environment isolation
 - [src/auth.rs](src/auth.rs): `auth login/status/logout` for Copilot, Claude and Codex
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)

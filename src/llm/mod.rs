@@ -3,6 +3,7 @@
 
 pub mod bridge;
 pub mod copilot;
+pub mod policy;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,16 +48,43 @@ impl std::fmt::Display for Provider {
     }
 }
 
-/// What the executing agent lets an LLM do inside its workspace. Always decided
-/// by the agent that runs the task, never by the peer that requested it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+/// What the executing agent lets an LLM do. Always decided by the agent that runs
+/// the task (its `--access` ceiling and each peer's grant), never by the requester.
+/// File access is confined to the workspace and credential files are refused at
+/// every level (see [`policy`]).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {
-    /// Read files and search only.
+    /// Read and search files in the workspace.
     #[default]
     ReadOnly,
-    /// Read, edit files and run shell commands in the workspace (coding tasks).
+    /// Also create and edit files in the workspace (no shell commands).
     WorkspaceWrite,
+    /// Also run shell commands. Commands are not sandboxed for Copilot and Claude:
+    /// grant only to peers you trust with your machine.
+    Full,
+}
+
+impl std::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(match self {
+            Access::ReadOnly => "read-only",
+            Access::WorkspaceWrite => "workspace-write",
+            Access::Full => "full",
+        })
+    }
 }
 
 /// A unit of LLM work, local or delegated to a peer.
@@ -82,12 +110,16 @@ impl LlmTask {
 #[async_trait]
 pub trait Executor: Send + Sync {
     fn providers(&self) -> Vec<Provider>;
-    async fn execute(&self, task: &LlmTask) -> Result<String>;
+    /// Runs `task` with the lower of `grant` and the executor's own access ceiling.
+    /// Local tasks pass [`Access::Full`] to get the ceiling; peer tasks pass the
+    /// peer's allowlist grant.
+    async fn execute(&self, task: &LlmTask, grant: Access) -> Result<String>;
 }
 
 pub struct ExecutorConfig {
     pub providers: Vec<Provider>,
     pub workspace: PathBuf,
+    /// Highest access any task on this agent gets (`--access`).
     pub access: Access,
     /// Path to `bridge/index.mjs`; needed for Claude and Codex.
     pub bridge_script: PathBuf,
@@ -122,12 +154,8 @@ impl SdkExecutor {
         let mut accounts = Vec::new();
 
         let copilot = if providers.contains(&Provider::Copilot) {
-            let backend = CopilotBackend::start(
-                profile.copilot_credentials()?,
-                workspace.clone(),
-                config.access,
-            )
-            .await?;
+            let backend =
+                CopilotBackend::start(profile.copilot_credentials()?, workspace.clone()).await?;
             accounts.push((Provider::Copilot, backend.account().await?));
             Some(backend)
         } else {
@@ -171,17 +199,24 @@ impl Executor for SdkExecutor {
         self.providers.clone()
     }
 
-    async fn execute(&self, task: &LlmTask) -> Result<String> {
+    async fn execute(&self, task: &LlmTask, grant: Access) -> Result<String> {
         if !self.providers.contains(&task.provider) {
             bail!("provider {} is not enabled on this agent", task.provider);
         }
+        let access = grant.min(self.access);
         match task.provider {
-            Provider::Copilot => self.copilot.as_ref().expect("enabled").run(task).await,
+            Provider::Copilot => {
+                self.copilot
+                    .as_ref()
+                    .expect("enabled")
+                    .run(task, access)
+                    .await
+            }
             Provider::Claude | Provider::Codex => {
                 self.bridge
                     .as_ref()
                     .expect("enabled")
-                    .run(task, &self.workspace, self.access)
+                    .run(task, &self.workspace, access)
                     .await
             }
         }

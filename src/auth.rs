@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::llm::{Access, CopilotBackend, Provider};
+use crate::llm::{CopilotBackend, Provider};
 use crate::profile::{
     ClaudeAuth, CodexAuth, CopilotAuth, INHERITED_CREDENTIAL_VARS, Profile, gh_token,
 };
@@ -102,8 +102,7 @@ impl ProviderTools {
         match provider {
             Provider::Copilot => {
                 let creds = profile.copilot_credentials()?;
-                let backend =
-                    CopilotBackend::start(creds, std::env::temp_dir(), Access::ReadOnly).await?;
+                let backend = CopilotBackend::start(creds, std::env::temp_dir()).await?;
                 let account = backend.account().await;
                 backend.stop().await;
                 let source = match &profile.config.copilot {

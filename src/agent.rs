@@ -11,7 +11,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
-use crate::llm::{Executor, LlmTask, Provider};
+use crate::llm::{Access, Executor, LlmTask, Provider};
 use crate::protocol::{ALPN, Message, write_message};
 use crate::trust::{TrustStore, TrustedPeer};
 
@@ -497,14 +497,20 @@ impl Inner {
         }
     }
 
-    /// Checks the allowlist permission and hourly quota for a task from `id`.
-    fn admit_task(&self, id: &EndpointId) -> Result<()> {
-        let (name, can_delegate, per_hour) = {
+    /// Checks the allowlist permission and hourly quota for a task from `id`;
+    /// returns the access this peer is granted.
+    fn admit_task(&self, id: &EndpointId) -> Result<Access> {
+        let (name, can_delegate, per_hour, access) = {
             let trust = self.trust.lock().unwrap();
             let peer = trust
                 .get(id)
                 .ok_or_else(|| anyhow!("not on the allowlist"))?;
-            (peer.name.clone(), peer.can_delegate, peer.tasks_per_hour)
+            (
+                peer.name.clone(),
+                peer.can_delegate,
+                peer.tasks_per_hour,
+                peer.access,
+            )
         };
         if !can_delegate {
             bail!(
@@ -528,7 +534,7 @@ impl Inner {
             );
         }
         recent.push_back(now);
-        Ok(())
+        Ok(access)
     }
 
     async fn serve_task(
@@ -545,14 +551,14 @@ impl Inner {
         if !executor.providers().contains(&task.provider) {
             bail!("{} does not serve {}", self.name, task.provider);
         }
-        self.admit_task(id)?;
+        let access = self.admit_task(id)?;
         let _ = self.events.send(Event::TaskReceived {
             from: from.to_owned(),
             task_id,
             provider: task.provider,
         });
         let _slot = self.task_slots.acquire().await?;
-        let result = executor.execute(&task).await;
+        let result = executor.execute(&task, access).await;
         let _ = self.events.send(Event::TaskCompleted {
             from: from.to_owned(),
             task_id,

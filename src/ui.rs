@@ -135,6 +135,7 @@ impl Shared {
                     "name": t.name,
                     "can_delegate": t.can_delegate,
                     "tasks_per_hour": t.tasks_per_hour,
+                    "access": t.access,
                     "connected": peers.iter().any(|p| p.id == t.id),
                 })
             })
@@ -478,7 +479,7 @@ async fn create_task(
     let shared = s.clone();
     tokio::spawn(async move {
         let result = match route {
-            Route::Local(executor) => executor.execute(&task).await,
+            Route::Local(executor) => executor.execute(&task, Access::Full).await,
             Route::Peer(peer, _) => shared.agent.delegate(peer, task).await,
         };
         shared.update_task(id, |t| {
@@ -505,6 +506,8 @@ struct AllowBody {
     #[serde(default)]
     delegate: bool,
     tasks_per_hour: Option<u32>,
+    #[serde(default)]
+    access: Access,
 }
 
 async fn allow_peer(
@@ -531,6 +534,11 @@ async fn allow_peer(
         tasks_per_hour: body
             .tasks_per_hour
             .unwrap_or(crate::trust::DEFAULT_TASKS_PER_HOUR),
+        access: if body.delegate {
+            body.access
+        } else {
+            Access::ReadOnly
+        },
     });
     s.save_trust()?;
     s.system(
@@ -538,9 +546,9 @@ async fn allow_peer(
         format!(
             "Allowlisted {name}{}",
             if body.delegate {
-                " (may delegate tasks)"
+                format!(" (may delegate tasks, {} access)", body.access)
             } else {
-                ""
+                String::new()
             }
         ),
     );

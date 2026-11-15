@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use p2pagents::{
-    Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
+    Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
     TrustStore, TrustedPeer,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
-/// Echoes the prompt; "hang" never completes and "fail" errors.
+/// Echoes the prompt; "hang" never completes, "fail" errors and "access" returns
+/// the access the agent granted the task.
 struct FakeExecutor(Vec<Provider>);
 
 #[async_trait]
@@ -22,10 +23,11 @@ impl Executor for FakeExecutor {
         self.0.clone()
     }
 
-    async fn execute(&self, task: &LlmTask) -> anyhow::Result<String> {
+    async fn execute(&self, task: &LlmTask, grant: Access) -> anyhow::Result<String> {
         match task.prompt.as_str() {
             "hang" => std::future::pending().await,
             "fail" => anyhow::bail!("model error"),
+            "access" => Ok(grant.to_string()),
             prompt => Ok(format!("{} did: {prompt}", task.provider)),
         }
     }
@@ -65,6 +67,7 @@ impl Node {
             addrs: BTreeSet::new(),
             can_delegate: delegate.is_some(),
             tasks_per_hour: delegate.unwrap_or(0),
+            access: Access::ReadOnly,
         });
     }
 
@@ -268,6 +271,23 @@ async fn delegates_tasks_to_a_peer_that_serves_the_provider() {
         .expect("worker advertises codex");
     assert_eq!(peer.capabilities, vec![Provider::Claude, Provider::Codex]);
     assert!(boss.find_peer(Provider::Copilot).is_none());
+
+    let access = boss
+        .delegate(peer.id, LlmTask::new(Provider::Codex, "access"))
+        .await
+        .unwrap();
+    assert_eq!(
+        access, "read-only",
+        "peers get read-only unless granted more"
+    );
+    let mut grant = worker.trusted().get(&boss.id()).unwrap().clone();
+    grant.access = Access::WorkspaceWrite;
+    worker.allow(grant);
+    let access = boss
+        .delegate(peer.id, LlmTask::new(Provider::Codex, "access"))
+        .await
+        .unwrap();
+    assert_eq!(access, "workspace-write");
 
     let out = boss
         .delegate(peer.id, LlmTask::new(Provider::Codex, "add tests"))

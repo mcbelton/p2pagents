@@ -83,9 +83,11 @@ enum PeersCommand {
     #[command(after_help = "\
 examples:
   p2pagents peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate
+  p2pagents peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate --access workspace-write
   p2pagents peers allow 5f2c...e9 --profile alice --name bob --tasks-per-hour 5
 Both sides must allowlist each other. Only peers allowed with --delegate can make this
-agent run LLM tasks (on this profile's accounts).")]
+agent run LLM tasks (on this profile's accounts), with at most their --access and the
+agent's own --access.")]
     Allow {
         /// Peer's ticket (`p2pa1...`, from `peers id` or `/ticket`) or endpoint id.
         target: String,
@@ -100,6 +102,10 @@ agent run LLM tasks (on this profile's accounts).")]
         /// Maximum tasks this peer may delegate per hour.
         #[arg(long, default_value_t = DEFAULT_TASKS_PER_HOUR)]
         tasks_per_hour: u32,
+        /// What this peer's tasks may do: read-only, workspace-write (edit files) or
+        /// full (also shell commands). Capped by the agent's --access.
+        #[arg(long, value_enum, default_value_t = Access::ReadOnly, requires = "delegate")]
+        access: Access,
     },
     /// List allowlisted peers.
     List {
@@ -214,7 +220,8 @@ struct RunArgs {
     /// Directory LLM agents work in.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// What LLM agents may do in the workspace.
+    /// Most any task on this agent may do: read-only, workspace-write (edit files) or
+    /// full (also shell commands). Peer tasks also get no more than the peer's grant.
     #[arg(long, value_enum, default_value_t = Access::ReadOnly)]
     access: Access,
     /// Open the web UI (served on 127.0.0.1 only) instead of the terminal prompt.
@@ -304,6 +311,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             name,
             delegate,
             tasks_per_hour,
+            access,
         } => {
             let profile = Profile::open(&profile.name)?;
             let ticket = Ticket::parse(&target)?;
@@ -321,10 +329,11 @@ fn run_peers(command: PeersCommand) -> Result<()> {
                 addrs: ticket.addr.addrs,
                 can_delegate: delegate,
                 tasks_per_hour,
+                access,
             });
             trust.save(&profile.trust_path())?;
             let rights = if delegate {
-                format!("may delegate up to {tasks_per_hour} tasks/hour")
+                format!("may delegate up to {tasks_per_hour} tasks/hour with {access} access")
             } else {
                 "chat only, may not delegate".into()
             };
@@ -342,7 +351,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             }
             for p in trust.peers {
                 let rights = if p.can_delegate {
-                    format!("delegate <= {}/h", p.tasks_per_hour)
+                    format!("delegate <= {}/h, {}", p.tasks_per_hour, p.access)
                 } else {
                     "no delegation".into()
                 };
@@ -604,7 +613,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     let executor = executor.clone();
                     tokio::spawn(async move {
                         let label = format!("{} (local)", task.provider);
-                        print_result(&label, executor.execute(&task).await);
+                        print_result(&label, executor.execute(&task, Access::Full).await);
                     });
                 }
             },
