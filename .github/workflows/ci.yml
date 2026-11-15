@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,7 +21,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev
       # fmt, clippy and tests, each result matched to a claim in evidence/claims.json.
       - name: Evidence (gates, tests, claims)
+        timeout-minutes: 20
         run: python3 scripts/evidence.py
+      - name: Show test failures
+        if: failure() || cancelled()
+        run: tail -n 120 target/evidence/logs/test.log || true
       - name: Upload evidence report
         if: always()
         uses: actions/upload-artifact@v4

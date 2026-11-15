@@ -1167,7 +1167,12 @@ async fn plans_prove_claims_with_checks_and_a_team_members_approval() {
             alice_events
         })
     };
-    let states = run_plan(&boss, &squads, &plan, |_, _| {}).await;
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan(&boss, &squads, &plan, |_, _| {}),
+    )
+    .await
+    .expect("the plan finished (the reviewer answered)");
     let mut alice_events = reviewer.await.unwrap();
     match &states["signoff"] {
         StepState::Done {
@@ -1199,7 +1204,12 @@ async fn plans_prove_claims_with_checks_and_a_team_members_approval() {
             alice_events
         })
     };
-    let states = run_plan(&boss, &squads, &plan, |_, _| {}).await;
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan(&boss, &squads, &plan, |_, _| {}),
+    )
+    .await
+    .expect("the plan finished (the reviewer answered)");
     let mut alice_events = rejecting.await.unwrap();
     let run = RunRecord::new("boss", "b", text, &plan, &states, 0);
     assert!(!run.passed());
