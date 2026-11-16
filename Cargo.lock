@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "p2pagents"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

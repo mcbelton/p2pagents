@@ -615,6 +615,18 @@ async function loadPlaybooks() {
   for (const p of playbooks) select.append(el("option", { value: p.name, text: `${p.name}: ${p.description}` }));
 }
 
+const CHECK_VARS = new Set(["build", "test", "lint", "secscan", "licenses", "secrets"]);
+const VAR_HELP = {
+  peer: "The peer that does the work (connected peers that run tasks)",
+  folder: "A folder that peer shares with you",
+  reviewers: "A squad whose members review independently",
+  approver: "Who signs off",
+  privacy_approver: "Who accepts the privacy review",
+  change: "What to change, in a sentence",
+  change_id: "A short id for this change (letters, digits, -)",
+  project: "The project's name",
+};
+
 function openPlaybook() {
   const p = playbooks.find((x) => x.name === $("#playbook").value);
   if (!p) {
@@ -624,28 +636,108 @@ function openPlaybook() {
   $("#playbook-h").textContent = `Playbook: ${p.name}`;
   $("#playbook-desc").textContent = p.description;
   $("#playbook-error").textContent = "";
-  const peers = state.trusted.map((t) => t.name);
-  $("#playbook-vars").replaceChildren(...p.vars.map((v) => {
-    const input = el("input", { type: "text", name: v.name, value: v.default ?? "", spellcheck: "false", required: v.default ? null : "required" });
-    if (v.name === "peer" && !input.value && peers.length) input.value = peers[0];
-    return el("label", { class: "field" }, el("span", { text: v.default ? v.name : `${v.name} (required)` }), input);
-  }));
+  const workers = state.peers.filter((x) => x.capabilities.length);
+  const select = (name, options, value) => {
+    const s = el("select", { name }, ...options.map(([v, label]) => el("option", { value: v, text: label })));
+    if (options.some(([v]) => v === value)) s.value = value;
+    return s;
+  };
+  const fields = {};
+  const box = $("#playbook-vars");
+  box.replaceChildren();
+  const peerShares = () => workers.find((w) => w.name === fields.peer?.value)?.shares ?? [];
+  const folderChecks = () => peerShares().find((s) => s.name === fields.folder?.value)?.checks ?? [];
+  const refreshFolder = () => {
+    if (!(fields.folder instanceof HTMLSelectElement)) return;
+    const shares = peerShares();
+    const want = fields.folder.value || p.vars.find((v) => v.name === "folder")?.default;
+    fields.folder.replaceChildren(...(shares.length
+      ? shares.map((s) => el("option", { value: s.name, text: `${s.name} (${ACCESS_SHORT[s.access] ?? s.access}${s.worktrees ? ", worktrees" : ""}${s.checks?.length ? `, checks: ${s.checks.join(", ")}` : ""})` }))
+      : [el("option", { value: "", text: "(this peer shares no folder with you)" })]));
+    if (shares.some((s) => s.name === want)) fields.folder.value = want;
+    refreshChecks();
+  };
+  const refreshChecks = () => {
+    const checks = folderChecks();
+    for (const [name, field] of Object.entries(fields)) {
+      if (!CHECK_VARS.has(name)) continue;
+      const want = checks.includes(name) ? name : field.value;
+      field.replaceChildren(...(checks.length
+        ? checks.map((c) => el("option", { value: c, text: c }))
+        : [el("option", { value: name, text: `${name} (the folder has no checks yet)` })]));
+      field.value = checks.includes(want) ? want : checks[0] ?? name;
+    }
+  };
+  for (const v of p.vars) {
+    let field;
+    if (v.name === "peer") {
+      field = select("peer", workers.length ? workers.map((w) => [w.name, `${w.name} (${w.capabilities.map(providerLabel).join(", ")})`]) : [["", "(no connected peer runs tasks)"]], v.default);
+      field.addEventListener("change", refreshFolder);
+    } else if (v.name === "folder") {
+      field = el("select", { name: "folder" });
+      field.addEventListener("change", refreshChecks);
+    } else if (CHECK_VARS.has(v.name)) {
+      field = el("select", { name: v.name }, el("option", { value: v.default, text: v.default }));
+    } else if (v.name === "approver" || v.name === "privacy_approver") {
+      field = select(v.name, [["me", "me (you, in this UI)"], ...state.trusted.map((t) => [t.name, t.name])], v.default);
+    } else if (v.name === "reviewers" && (state.squads ?? []).length) {
+      field = select("reviewers", state.squads.map((s) => [s.name, `#${s.name} (${s.members.map((m) => m.name).join(", ")})`]), v.default);
+    } else {
+      field = el("input", { type: "text", name: v.name, value: v.default ?? "", spellcheck: "false" });
+    }
+    fields[v.name] = field;
+    const help = CHECK_VARS.has(v.name) ? `The folder's check that runs as "${v.name}"` : VAR_HELP[v.name];
+    box.append(el("label", { class: "field" },
+      el("span", { text: v.default == null ? `${v.name} (required)` : v.name }),
+      field,
+      help ? el("span", { class: "muted small", text: help }) : null));
+  }
+  refreshFolder();
   $("#playbook-dialog").showModal();
-  $("#playbook-vars input")?.focus();
+  box.querySelector("select, input")?.focus();
 }
 
 async function submitPlaybook(e) {
   e.preventDefault();
-  const vars = Object.fromEntries([...document.querySelectorAll("#playbook-vars input")].map((i) => [i.name, i.value]));
+  const vars = Object.fromEntries([...document.querySelectorAll("#playbook-vars [name]")].map((i) => [i.name, i.value]));
   try {
     const res = await api(`/api/playbooks/${encodeURIComponent($("#playbook").value)}`, { method: "POST", body: JSON.stringify({ vars }) });
     $("#composer-input").value = res.text;
     $("#playbook-dialog").close();
     $("#composer-input").focus();
-    toast("Playbook filled in: review it, then Ctrl+Enter to run");
+    const ok = await checkPlan(res.text);
+    toast(ok ? "Playbook filled in and checked: review it, then Ctrl+Enter to run" : "Playbook filled in, but it has problems (see under the editor)", ok ? "" : "error");
   } catch (err) {
     $("#playbook-error").textContent = err.message;
   }
+}
+
+/// Checks the plan against connected peers, folders, checks, squads, knowledge and
+/// skills; shows the problems under the editor; true if it can run.
+async function checkPlan(text) {
+  const box = $("#plan-problems");
+  if (!text.trim()) {
+    box.hidden = true;
+    return false;
+  }
+  const res = await api("/api/plans/check", { method: "POST", body: JSON.stringify({ text }) });
+  box.hidden = false;
+  if (!res.problems.length) {
+    box.replaceChildren(el("p", { class: "ok", text: `✓ Ready to run: ${res.steps} steps, ${res.claims} claims` }));
+    return true;
+  }
+  box.replaceChildren(
+    el("p", { class: res.ok ? "warn" : "bad", text: res.ok ? "Ready to run, with warnings:" : "Can't run yet:" }),
+    el("ul", {}, ...res.problems.map((p) => el("li", { class: p.error ? "bad" : "warn" },
+      el("strong", { text: `${p.error ? "Error" : "Warning"}${p.step ? ` (step ${p.step})` : ""}: ` }), p.message))));
+  return res.ok;
+}
+
+let planCheckTimer = null;
+function schedulePlanCheck() {
+  clearTimeout(planCheckTimer);
+  if (state.mode !== "plan") return;
+  planCheckTimer = setTimeout(() => checkPlan($("#composer-input").value).catch(() => {}), 900);
 }
 
 // ---------- health and knowledge ----------
@@ -688,6 +780,30 @@ async function loadOps() {
     [el("li", { class: "empty" }, "Nothing yet. Try the ", el("strong", { text: "discover" }), " playbook on an existing project.")]));
 }
 
+async function loadSkills() {
+  const res = await api("/api/skills");
+  $("#skills-summary").textContent = `Skills (${res.skills.length})`;
+  $("#skill-list").replaceChildren(...res.skills.map((s) => el("li", {},
+    el("button", { type: "button", class: "run-open", onclick: () => openSkill(s.name), "aria-label": `Open skill ${s.name}` },
+      el("span", { class: "task-title", text: s.name }),
+      el("span", { class: `badge ${s.source === "profile" ? "ok" : "neutral"}`, text: s.source })),
+    el("div", { class: "muted small", text: s.description }))));
+}
+
+async function openSkill(name) {
+  try {
+    const res = await api(`/api/skills/${encodeURIComponent(name)}`);
+    $("#run-h").textContent = `Skill: ${name}`;
+    $("#run-verdict").textContent = "";
+    $("#run-signatures").replaceChildren();
+    $("#run-report").replaceChildren(renderMarkdown(res.text.replace(/^---[\s\S]*?\n---\n/, "")));
+    $("#run-dialog").showModal();
+    $("#run-close").focus();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
 async function openTopic(topic) {
   try {
     const res = await api(`/api/kb/${encodeURIComponent(topic)}`);
@@ -699,6 +815,158 @@ async function openTopic(topic) {
     $("#run-close").focus();
   } catch (err) {
     toast(err.message, "error");
+  }
+}
+
+// ---------- GitHub ----------
+let github = null;
+async function loadGithub() {
+  github = await api("/api/github");
+  const box = $("#github");
+  box.replaceChildren();
+  const signedIn = github.account && (github.account.user || github.account.owner);
+  $("#link-repo-btn").hidden = !signedIn;
+  if (!signedIn) {
+    box.append(el("p", { class: "muted small", text: "Sign in to clone your repositories, let agents work on them on their own branches, and open pull requests." }),
+      el("button", { type: "button", class: "btn small primary", onclick: openGithubLogin }, "Sign in to GitHub"));
+    return;
+  }
+  box.append(el("p", { class: "small" }, github.account.user
+    ? ["Signed in as ", el("strong", { text: `${github.account.user}@${github.account.host}` })]
+    : `Uses ${github.account.owner}'s GitHub account (digital worker)`));
+  if (!github.serving) box.append(el("p", { class: "muted small", text: "This agent doesn't run peers' tasks (start it with --serve) so linked repositories are for your own use." }));
+  if (!github.repos.length) box.append(el("p", { class: "muted small", text: "No linked repositories yet." }));
+  for (const r of github.repos) {
+    const branches = r.branches.slice(0, 5).map((b) => el("li", { class: "branch" },
+      el("span", { class: "mono small", text: b.name }),
+      el("span", { class: "muted small", text: ` ${clock(b.unix * 1000)} · ${b.subject}` }),
+      el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR")));
+    box.append(el("div", { class: "repo" },
+      el("div", { class: "task-top" },
+        el("span", { class: "task-title", text: `${r.name} · ${r.slug}` }),
+        el("span", { class: "badge neutral", text: r.branch })),
+      el("div", { class: "repo-actions" },
+        el("button", { type: "button", class: "btn small", onclick: (e) => syncRepo(r, e.currentTarget) }, "Sync"),
+        el("button", { type: "button", class: "btn small danger", onclick: () => unlinkRepo(r) }, "Unlink")),
+      branches.length ? el("ul", { class: "branch-list" }, ...branches)
+        : el("p", { class: "muted small", text: "No task branches yet: agents' editing tasks in this folder commit to p2p/… branches." })));
+  }
+}
+
+function openGithubLogin() {
+  $("#github-error").textContent = "";
+  const accounts = github?.accounts ?? [];
+  $("#github-accounts").replaceChildren(...(accounts.length
+    ? accounts.map((a, i) => el("label", { class: "check" },
+      el("input", { type: "radio", name: "gh-account", value: `${a.login}@${a.host}`, checked: (a.active || i === 0) || undefined }),
+      el("span", { text: `${a.login} on ${a.host}${a.active ? " (active)" : ""}` })))
+    : [el("span", { class: "muted small", text: "No GitHub CLI account found. Run gh auth login in a terminal, then try again." })]));
+  $("#github-dialog").showModal();
+}
+
+async function submitGithubLogin(e) {
+  e.preventDefault();
+  const picked = document.querySelector("input[name=gh-account]:checked")?.value;
+  if (!picked) return;
+  const at = picked.lastIndexOf("@");
+  try {
+    await api("/api/github/login", { method: "POST", body: JSON.stringify({ user: picked.slice(0, at), host: picked.slice(at + 1) }) });
+    $("#github-dialog").close();
+    toast("Signed in to GitHub");
+    await loadGithub();
+  } catch (err) {
+    $("#github-error").textContent = err.message;
+  }
+}
+
+function openRepoDialog() {
+  $("#repo-form").reset();
+  $("#repo-error").textContent = "";
+  const peers = state.trusted.filter((t) => t.can_delegate);
+  $("#repo-grant").replaceChildren(...(peers.length
+    ? peers.map((t) => el("label", { class: "check" }, el("input", { type: "checkbox", value: t.name }), el("span", { text: `${t.name} (${ACCESS_SHORT[t.access] ?? t.access})` })))
+    : [el("span", { class: "muted small", text: "No peer may delegate tasks to this agent yet; grant the folder later." })]));
+  $("#repo-dialog").showModal();
+  $("#repo-slug").focus();
+}
+
+async function submitRepo(e) {
+  e.preventDefault();
+  const button = $("#repo-submit");
+  button.disabled = true;
+  $("#repo-error").textContent = "Cloning…";
+  try {
+    const res = await api("/api/repos", {
+      method: "POST",
+      body: JSON.stringify({
+        repo: $("#repo-slug").value.trim(),
+        name: $("#repo-name").value.trim() || null,
+        access: $("#repo-access").value,
+        checks: $("#repo-checks").value.split("\n"),
+        grant: [...document.querySelectorAll("#repo-grant input:checked")].map((i) => i.value),
+      }),
+    });
+    $("#repo-dialog").close();
+    toast(`Linked as folder ${res.name} (${res.branch})`);
+    await loadGithub();
+  } catch (err) {
+    $("#repo-error").textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function syncRepo(r, button) {
+  button.disabled = true;
+  try {
+    const res = await api(`/api/repos/${encodeURIComponent(r.name)}/sync`, { method: "POST" });
+    toast(`${r.name}: ${res.branch} at ${res.head}`);
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function unlinkRepo(r) {
+  if (!confirm(`Stop sharing ${r.slug} as folder ${r.name}? The clone stays on disk.`)) return;
+  try {
+    await api(`/api/repos/${encodeURIComponent(r.name)}`, { method: "DELETE" });
+    await loadGithub();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+let prTarget = null;
+function openPr(r, b) {
+  prTarget = { repo: r, branch: b.name };
+  $("#pr-desc").textContent = `${b.name} → ${r.branch} in ${r.slug}`;
+  $("#pr-title").value = b.subject.replace(/^p2pagents: /, "");
+  $("#pr-body").value = `Made by p2pagents (branch ${b.name}). See the evidence run for checks and sign-offs.`;
+  $("#pr-error").textContent = "";
+  $("#pr-dialog").showModal();
+  $("#pr-title").focus();
+}
+
+async function submitPr(e) {
+  e.preventDefault();
+  if (!prTarget) return;
+  const button = $("#pr-submit");
+  button.disabled = true;
+  $("#pr-error").textContent = "Pushing…";
+  try {
+    const res = await api(`/api/repos/${encodeURIComponent(prTarget.repo.name)}/pr`, {
+      method: "POST",
+      body: JSON.stringify({ branch: prTarget.branch, title: $("#pr-title").value, body: $("#pr-body").value }),
+    });
+    $("#pr-dialog").close();
+    toast(`Pull request opened: ${res.url}`);
+    window.open(res.url, "_blank", "noopener");
+  } catch (err) {
+    $("#pr-error").textContent = err.message;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -768,7 +1036,7 @@ function renderShareOptions() {
   if (shares.some((s) => s.name === prev)) sel.value = prev;
 }
 
-const PLAN_EXAMPLE = "claim: C-1 The parser handles empty input\nfix @alice:repo verify=test attempts=3 claims=C-1 Make the parser accept empty input\nreview after fix #qa:repo apply=fix verify=test claims=C-1 Check the fix\nsignoff after review approve @me claims=C-1 Approve the change";
+const PLAN_EXAMPLE = "fix @alice:app skill=implement-change verify=test claims=C-1 Make the parser accept empty input";
 
 function updateComposer() {
   const task = state.mode === "task";
@@ -779,7 +1047,7 @@ function updateComposer() {
   $("#playbook-opts").hidden = !plan;
   input.rows = plan ? 6 : 2;
   input.placeholder = plan
-    ? `claim: ID statement, then one step per line: id [after a,b] [approve] @peer[:folder]|#squad [using claude] [verify=a,b attempts=N claims=ID apply=step] prompt\n${PLAN_EXAMPLE}`
+    ? `Pick a playbook above and press Use, or write a plan: claim lines, then one step per line, e.g.\nclaim: C-1 The parser handles empty input\n${PLAN_EXAMPLE}`
     : task
       ? noProviders
         ? "No provider available: enable one with --providers, or connect a peer that serves one"
@@ -804,8 +1072,13 @@ async function submitComposer(e) {
       const res = await api("/api/chat", { method: "POST", body: JSON.stringify({ text }) });
       if (res.sent === 0) toast("No peers connected; nobody received the message");
     } else if (state.mode === "plan") {
+      if (!(await checkPlan(text))) {
+        toast("Fix the plan's errors first (listed under the editor)", "error");
+        return;
+      }
       const res = await api("/api/plans", { method: "POST", body: JSON.stringify({ text }) });
       toast(`Plan started: ${Object.keys(res.steps).length} steps`);
+      $("#plan-problems").hidden = true;
     } else {
       const task = await api("/api/tasks", {
         method: "POST",
@@ -981,7 +1254,17 @@ function init() {
   $("#playbook-use").addEventListener("click", openPlaybook);
   $("#playbook-cancel").addEventListener("click", () => $("#playbook-dialog").close());
   $("#playbook-form").addEventListener("submit", submitPlaybook);
+  $("#composer-input").addEventListener("input", schedulePlanCheck);
   loadPlaybooks().catch((err) => toast(err.message, "error"));
+  loadSkills().catch((err) => toast(err.message, "error"));
+  loadGithub().catch((err) => toast(err.message, "error"));
+  $("#link-repo-btn").addEventListener("click", openRepoDialog);
+  $("#repo-form").addEventListener("submit", submitRepo);
+  $("#repo-cancel").addEventListener("click", () => $("#repo-dialog").close());
+  $("#github-form").addEventListener("submit", submitGithubLogin);
+  $("#github-cancel").addEventListener("click", () => $("#github-dialog").close());
+  $("#pr-form").addEventListener("submit", submitPr);
+  $("#pr-cancel").addEventListener("click", () => $("#pr-dialog").close());
   // Monitors run in the background: refresh the health panel now and then.
   setInterval(() => { if (!document.hidden) loadOps().catch(() => {}); }, 20000);
   $("#run-close").addEventListener("click", () => $("#run-dialog").close());

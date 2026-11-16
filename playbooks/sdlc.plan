@@ -8,12 +8,12 @@ claim: SDLC-3 The security scan passes and a reviewer accepted the security revi
 claim: SDLC-4 The privacy champion accepted how the change handles personal data
 claim: SDLC-5 Dependency licenses and the secret scan pass
 claim: SDLC-6 The change was approved for release
-design @{{peer}}:{{folder}} context=architecture,risks save=design-{{change_id}} Write a short design for this change: {{change}}. Cover the affected components, data touched, risks, rollout and the test plan.
-impl after design @{{peer}}:{{folder}} context=architecture verify={{test}},{{lint}} attempts=3 claims=SDLC-1 Implement this change: {{change}}. Follow the design above and add or update tests.
-verify after impl #{{reviewers}}:{{folder}} apply=impl verify={{test}} claims=SDLC-2 Review this change independently: read the diff, run the tests and report any problem.
-security after impl #{{reviewers}}:{{folder}} apply=impl verify={{secscan}} claims=SDLC-3 Security review of this change: injection, authentication and authorization, secrets, unsafe input handling, dependencies. List findings with severity, or say "No high-severity findings".
+design @{{peer}}:{{folder}} skill=design-doc context=architecture,risks save=design-{{change_id}} Write a short design for this change: {{change}}. Cover the affected components, data touched, risks, rollout and the test plan.
+impl after design @{{peer}}:{{folder}} skill=implement-change context=architecture verify={{test}},{{lint}} attempts=3 claims=SDLC-1 Implement this change: {{change}}. Follow the design above and add or update tests.
+verify after impl #{{reviewers}}:{{folder}} skill=code-review apply=impl verify={{test}} claims=SDLC-2 Review this change independently: read the diff, run the tests and report any problem.
+security after impl #{{reviewers}}:{{folder}} skill=security-review apply=impl verify={{secscan}} claims=SDLC-3 Security review of this change: injection, authentication and authorization, secrets, unsafe input handling, dependencies. List findings with severity, or say "No high-severity findings".
 security-ok after security approve @{{approver}} claims=SDLC-3 Accept the security review of: {{change}}.
-privacy after impl #{{reviewers}}:{{folder}} apply=impl context=risks save=privacy-{{change_id}} Privacy review of this change: which personal data it collects, stores, logs or sends; the purpose, retention and who can access it; anything unnecessary.
+privacy after impl #{{reviewers}}:{{folder}} skill=privacy-review apply=impl context=risks save=privacy-{{change_id}} Privacy review of this change: which personal data it collects, stores, logs or sends; the purpose, retention and who can access it; anything unnecessary.
 privacy-ok after privacy approve @{{privacy_approver}} claims=SDLC-4 Accept the privacy review of: {{change}}.
-compliance after impl #{{reviewers}}:{{folder}} apply=impl verify={{licenses}},{{secrets}} claims=SDLC-5 Check the dependency licenses and that no secrets are committed; summarize.
+compliance after impl #{{reviewers}}:{{folder}} skill=compliance-check apply=impl verify={{licenses}},{{secrets}} claims=SDLC-5 Check the dependency licenses and that no secrets are committed; summarize.
 release after verify,security-ok,privacy-ok,compliance approve @{{approver}} claims=SDLC-6 Approve releasing: {{change}}.

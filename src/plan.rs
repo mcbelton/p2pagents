@@ -34,6 +34,7 @@ use crate::evidence::Evidence;
 use crate::knowledge::{KnowledgeBase, check_topics};
 use crate::llm::{LlmTask, Provider};
 use crate::profile::validate_name;
+use crate::skills::Skills;
 
 /// Longest prerequisite result passed on to a dependent step.
 const MAX_DEP_CHARS: usize = 8_000;
@@ -146,6 +147,9 @@ pub struct Step {
     /// Knowledge base topic the step's verified result is saved as (`save=topic`).
     #[serde(default)]
     pub save: Option<String>,
+    /// Skills (instructions) put in the prompt (`skill=a,b`).
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 /// A statement the plan must prove with evidence (`claim: ID text`).
@@ -288,6 +292,25 @@ impl Plan {
 }
 
 impl Plan {
+    /// The plan as it is sent: each step's `skill=` instructions and `context=`
+    /// knowledge put in front of its prompt. Fails if a skill or topic doesn't exist.
+    pub fn prepare(&self, kb: &KnowledgeBase, skills: &Skills) -> Result<Plan> {
+        let mut plan = self.with_knowledge(kb)?;
+        for step in &mut plan.steps {
+            if step.skills.is_empty() {
+                continue;
+            }
+            let instructions = skills
+                .instructions(&step.skills)
+                .with_context(|| format!("step '{}'", step.id))?;
+            step.prompt = format!(
+                "Follow these instructions:\n{instructions}\n---\n{}",
+                step.prompt
+            );
+        }
+        Ok(plan)
+    }
+
     /// The plan with each step's `context=` knowledge put in front of its prompt.
     /// Fails if a topic doesn't exist.
     pub fn with_knowledge(&self, kb: &KnowledgeBase) -> Result<Plan> {
@@ -397,7 +420,7 @@ fn parse_step(line: &str) -> Result<Step> {
     };
     let mut provider = Provider::Copilot;
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
-    let (mut context, mut save) = (Vec::new(), None);
+    let (mut context, mut save, mut skills) = (Vec::new(), None, Vec::new());
     loop {
         match words.peek().copied() {
             Some("using") => {
@@ -425,6 +448,7 @@ fn parse_step(line: &str) -> Result<Step> {
                     "claims" | "claim" => claims = list(value),
                     "apply" => apply = Some(value.to_owned()).filter(|v| !v.is_empty()),
                     "context" => context = list(value),
+                    "skill" | "skills" => skills = list(value),
                     "save" => {
                         validate_name(value)
                             .map_err(|_| anyhow!("save= needs a topic name, got {value:?}"))?;
@@ -455,6 +479,7 @@ fn parse_step(line: &str) -> Result<Step> {
         approve,
         context,
         save,
+        skills,
     })
 }
 
@@ -534,6 +559,161 @@ impl StepState {
             verified: d.verified,
         }
     }
+}
+
+/// A problem `preflight` found: errors stop the plan from running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    pub step: Option<String>,
+    pub error: bool,
+    pub message: String,
+}
+
+/// Why `peer` can't run `step`, if it can't: provider, folder, checks, access.
+fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
+    use crate::llm::Access;
+    if !peer.capabilities.contains(&step.provider) {
+        return Some(format!("{} doesn't serve {}", peer.name, step.provider));
+    }
+    let folder = step.share.as_deref().unwrap_or(crate::shares::DATA_SHARE);
+    let Some(share) = peer.shares.iter().find(|s| s.name == folder) else {
+        let shared: Vec<&str> = peer.shares.iter().map(|s| s.name.as_str()).collect();
+        return Some(format!(
+            "{} shares no folder '{folder}' with you (it shares: {})",
+            peer.name,
+            if shared.is_empty() {
+                "none".into()
+            } else {
+                shared.join(", ")
+            }
+        ));
+    };
+    let missing: Vec<&str> = step
+        .checks
+        .iter()
+        .filter(|c| !share.checks.contains(c))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "folder '{folder}' on {} has no check {} (it has: {}); its owner adds checks with share add --check NAME=COMMAND",
+            peer.name,
+            missing.join(", "),
+            if share.checks.is_empty() {
+                "none".into()
+            } else {
+                share.checks.join(", ")
+            }
+        ));
+    }
+    if !step.checks.is_empty() && share.access < Access::Full {
+        return Some(format!(
+            "verify= needs full access, you have {} in '{folder}' on {}",
+            share.access, peer.name
+        ));
+    }
+    if step.apply.is_some() && !(share.worktrees && share.access >= Access::WorkspaceWrite) {
+        return Some(format!(
+            "apply= needs edit access in a folder shared with --worktrees; '{folder}' on {} isn't",
+            peer.name
+        ));
+    }
+    None
+}
+
+/// Checks `plan` against what is known now (connected peers, their folders, checks
+/// and access, squads, knowledge and skills) so problems show before anything runs.
+pub fn preflight(
+    plan: &Plan,
+    peers: &[PeerInfo],
+    squads: &SquadStore,
+    kb: &KnowledgeBase,
+    skills: &Skills,
+) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let mut report = |step: Option<&Step>, error: bool, message: String| {
+        problems.push(Problem {
+            step: step.map(|s| s.id.clone()),
+            error,
+            message,
+        })
+    };
+    for step in &plan.steps {
+        if let Err(e) = skills.instructions(&step.skills) {
+            report(Some(step), true, format!("{e:#}"));
+        }
+        if let Err(e) = check_topics(kb, &step.context) {
+            report(Some(step), true, format!("{e:#}"));
+        }
+        let candidates: Vec<&PeerInfo> = match &step.target {
+            Target::Peer(name) if name == "me" => {
+                if !step.approve {
+                    report(
+                        Some(step),
+                        true,
+                        "@me can only approve (approve @me); tasks run on peers".into(),
+                    );
+                }
+                continue;
+            }
+            Target::Peer(name) => {
+                let found: Vec<&PeerInfo> = peers.iter().filter(|p| &p.name == name).collect();
+                if found.is_empty() {
+                    report(Some(step), true, format!("{name} is not connected"));
+                    continue;
+                }
+                found
+            }
+            Target::Squad(name) => match squads.get(name) {
+                None => {
+                    report(Some(step), true, format!("there is no squad #{name}"));
+                    continue;
+                }
+                Some(squad) => {
+                    let online: Vec<&PeerInfo> = peers
+                        .iter()
+                        .filter(|p| squad.members.contains(&p.name))
+                        .collect();
+                    if online.is_empty() {
+                        report(Some(step), true, format!("no member of #{name} is online"));
+                        continue;
+                    }
+                    online
+                }
+            },
+        };
+        if step.approve {
+            continue;
+        }
+        let reasons: Vec<String> = candidates.iter().filter_map(|p| unable(step, p)).collect();
+        if reasons.len() == candidates.len() {
+            report(Some(step), true, reasons.join("; "));
+        }
+    }
+    for claim in &plan.claims {
+        let proving: Vec<&Step> = plan
+            .steps
+            .iter()
+            .filter(|s| s.claims.contains(&claim.id))
+            .collect();
+        if proving.is_empty() {
+            report(
+                None,
+                false,
+                format!("no step proves claim {}: it will be unverified", claim.id),
+            );
+        } else if proving.iter().any(|s| !s.approve && s.checks.is_empty()) {
+            report(
+                None,
+                false,
+                format!(
+                    "claim {} is claimed by a step without checks (verify=): that step can only leave it unverified",
+                    claim.id
+                ),
+            );
+        }
+    }
+    problems
 }
 
 /// Picks the peer for `step`: the named peer, or the least busy online squad member
@@ -951,6 +1131,112 @@ mod tests {
         assert_eq!(
             SquadStore::load(&dir.path().join("none")).unwrap(),
             SquadStore::default()
+        );
+    }
+
+    #[test]
+    fn steps_follow_named_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let plan =
+            Plan::parse("review @x skill=security-review,code-review Review the diff").unwrap();
+        assert_eq!(plan.steps[0].skills, ["security-review", "code-review"]);
+        let ready = plan.prepare(&kb, &skills).unwrap();
+        let prompt = &ready.steps[0].prompt;
+        assert!(prompt.starts_with("Follow these instructions:\n\n### Skill: security-review"));
+        assert!(
+            prompt.contains("### Skill: code-review") && prompt.ends_with("---\nReview the diff")
+        );
+        let unknown = Plan::parse("a @x skill=nope do").unwrap();
+        assert!(
+            unknown
+                .prepare(&kb, &skills)
+                .unwrap_err()
+                .to_string()
+                .contains("step 'a'")
+        );
+    }
+
+    #[test]
+    fn preflight_finds_what_would_fail_before_anything_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let share = |name: &str, access: Access, checks: &[&str], worktrees: bool| ShareInfo {
+            name: name.into(),
+            access,
+            checks: checks.iter().map(|c| (*c).to_owned()).collect(),
+            worktrees,
+        };
+        let peer = |name: &str, shares: Vec<ShareInfo>| PeerInfo {
+            name: name.into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: vec![Provider::Copilot],
+            shares,
+            owner: None,
+            role: None,
+        };
+        let peers = vec![
+            peer("alice", vec![share("app", Access::Full, &["test"], true)]),
+            peer(
+                "bob",
+                vec![share("app", Access::WorkspaceWrite, &["test"], false)],
+            ),
+        ];
+        let mut squads = SquadStore::default();
+        squads
+            .set("qa", vec!["bob".into(), "carol".into()])
+            .unwrap();
+        let check = |text: &str| {
+            preflight(&Plan::parse(text).unwrap(), &peers, &squads, &kb, &skills)
+                .into_iter()
+                .map(|p| {
+                    format!(
+                        "{}{}: {}",
+                        if p.error { "E " } else { "W " },
+                        p.step.unwrap_or_default(),
+                        p.message
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let good = "claim: C-1 tests pass\nfix @alice:app verify=test skill=implement-change claims=C-1 Fix it\nok after fix approve @me claims=C-1 Approve";
+        assert!(check(good).is_empty(), "{:?}", check(good));
+
+        let bad = check(
+            "a @zed do\nb @alice:web do\nc @alice:app verify=lint do\nd @bob:app verify=test do\n\
+             e after c #qa:app apply=c do\nf #ops do\ng @me do\nh @alice:app skill=nope context=gone do",
+        );
+        let expect = [
+            "E a: zed is not connected",
+            "E b: alice shares no folder 'web' with you (it shares: app)",
+            "E c: folder 'app' on alice has no check lint (it has: test)",
+            "E d: verify= needs full access, you have workspace-write in 'app' on bob",
+            "E e: apply= needs edit access in a folder shared with --worktrees; 'app' on bob isn't",
+            "E f: there is no squad #ops",
+            "E g: @me can only approve",
+            "E h: there is no skill 'nope'",
+            "E h: the knowledge base has no topic 'gone'",
+        ];
+        for e in expect {
+            assert!(
+                bad.iter().any(|b| b.starts_with(e)),
+                "missing {e:?} in {bad:#?}"
+            );
+        }
+        let claims = check("claim: C-1 x\nclaim: C-2 y\na @alice:app claims=C-1 do");
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.starts_with("W : no step proves claim C-2")),
+            "{claims:?}"
+        );
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.contains("claim C-1 is claimed by a step without checks")),
+            "{claims:?}"
         );
     }
 

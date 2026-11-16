@@ -67,6 +67,16 @@
         <ul class="list" id="squad-list"></ul>
       </section>
 
+      <section class="card" aria-labelledby="github-h">
+        <div class="card-head">
+          <h2 id="github-h">GitHub</h2>
+          <button type="button" class="btn small" id="link-repo-btn" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Link repo
+          </button>
+        </div>
+        <div id="github"></div>
+      </section>
+
       <section class="card" aria-labelledby="ticket-h">
         <div class="card-head"><h2 id="ticket-h">Your ticket</h2></div>
         <p class="muted small">Give this to peers so they can allowlist this agent.</p>
@@ -122,6 +132,7 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-8-6 16-2-7-8-1z"></path></svg><span>Send</span>
           </button>
         </div>
+        <div id="plan-problems" class="plan-problems" role="status" aria-live="polite" hidden></div>
         <p class="hint" id="composer-hint">Enter to send · Shift+Enter for a new line</p>
       </form>
     </main>
@@ -156,6 +167,11 @@
         </div>
         <p class="muted small">What agents learned about your systems: saved by plan steps (<span class="mono">save=</span>), used by them (<span class="mono">context=</span>). TSGs fix incidents automatically.</p>
         <ul class="kb-list" id="kb-list"></ul>
+        <details class="skills-box">
+          <summary id="skills-summary">Skills</summary>
+          <p class="muted small">Instructions agents follow in plan steps (<span class="mono">skill=name</span>). Add or replace with <span class="mono">p2pagents skill add</span>.</p>
+          <ul class="kb-list" id="skill-list"></ul>
+        </details>
       </section>
       <section class="runs-panel" aria-labelledby="runs-h">
         <div class="card-head panel-head">
@@ -259,6 +275,56 @@
       <div class="dialog-actions">
         <button type="button" class="btn" id="playbook-cancel">Cancel</button>
         <button type="submit" class="btn primary">Fill in the plan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="github-dialog" aria-labelledby="github-dialog-h">
+    <form method="dialog" id="github-form" novalidate>
+      <h2 id="github-dialog-h">Sign in to GitHub</h2>
+      <p class="muted small">Pick an account of the GitHub CLI on this machine. Its token is fetched from <span class="mono">gh</span> when needed and never stored by p2pagents. Add accounts with <span class="mono">gh auth login</span>.</p>
+      <fieldset class="field"><legend>Account</legend><div id="github-accounts" class="share-checks"></div></fieldset>
+      <p class="form-error" id="github-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="github-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Sign in</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="repo-dialog" aria-labelledby="repo-h">
+    <form method="dialog" id="repo-form" novalidate>
+      <h2 id="repo-h">Link a GitHub repository</h2>
+      <p class="muted small">It is cloned with your GitHub account and shared with the peers you pick. Each editing task runs on its own branch (<span class="mono">p2p/…</span>), and you open pull requests from them here.</p>
+      <label class="field"><span>Repository</span><input id="repo-slug" type="text" placeholder="owner/repo or https://github.com/owner/repo" spellcheck="false" required></label>
+      <label class="field"><span>Folder name <span class="muted">(default: the repository name)</span></span><input id="repo-name" type="text" maxlength="64" spellcheck="false"></label>
+      <label class="field"><span>Most peers' tasks may do</span>
+        <select id="repo-access">
+          <option value="read-only">Read only</option>
+          <option value="workspace-write" selected>Edit files</option>
+          <option value="full">Full: also run commands and checks (trusted peers)</option>
+        </select>
+      </label>
+      <label class="field"><span>Checks <span class="muted">(one per line: name=command)</span></span><textarea id="repo-checks" rows="3" class="mono" spellcheck="false" placeholder="test=npm test&#10;lint=npm run lint"></textarea></label>
+      <fieldset class="field"><legend>Share with</legend><div id="repo-grant" class="share-checks"></div></fieldset>
+      <p class="form-error" id="repo-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="repo-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="repo-submit">Link</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="pr-dialog" aria-labelledby="pr-h">
+    <form method="dialog" id="pr-form" novalidate>
+      <h2 id="pr-h">Open a pull request</h2>
+      <p class="muted small" id="pr-desc"></p>
+      <label class="field"><span>Title</span><input id="pr-title" type="text" maxlength="200" required></label>
+      <label class="field"><span>Description</span><textarea id="pr-body" rows="4"></textarea></label>
+      <p class="form-error" id="pr-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="pr-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="pr-submit">Push and open</button>
       </div>
     </form>
   </dialog>

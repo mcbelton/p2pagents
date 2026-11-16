@@ -127,6 +127,13 @@ pub enum CodexAuth {
     Login,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub enum GithubAuth {
+    /// An account signed in to the GitHub CLI; its token is fetched when needed.
+    Gh { user: String, host: String },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +142,9 @@ pub struct ProfileConfig {
     pub claude: Option<ClaudeAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexAuth>,
+    /// GitHub account for repositories (clone, sync, push branches, open PRs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubAuth>,
     /// Set for a digital worker: the profile whose accounts it runs on (see
     /// [`Profile::account_profile`]). It has no sign-ins of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +408,11 @@ impl Profile {
         crate::knowledge::KnowledgeBase::new(self.dir.join("knowledge"))
     }
 
+    /// Built-in skills plus this profile's own (`skills/`).
+    pub fn skills(&self) -> crate::skills::Skills {
+        crate::skills::Skills::new(self.dir.join("skills"))
+    }
+
     /// Metrics and incident logs.
     pub fn ops_store(&self) -> crate::ops::OpsStore {
         crate::ops::OpsStore::new(self.dir.join("ops"))
@@ -405,6 +420,58 @@ impl Profile {
 
     pub fn monitors_path(&self) -> PathBuf {
         self.dir.join("monitors.json")
+    }
+
+    /// Where this profile's linked repositories are cloned: next to the data folder,
+    /// outside the profiles folder, like task worktrees.
+    pub fn repos_dir(&self) -> PathBuf {
+        self.outside_base().join(".p2prepos").join(&self.name)
+    }
+
+    /// The profile as saved now (another process or the web UI may have changed it).
+    pub fn reload(&self) -> Result<Profile> {
+        let root = self.dir.parent().context("profile folder has no parent")?;
+        Profile::open_in(root, &self.name)
+    }
+
+    /// Uses GitHub CLI account `user@host` for this profile's repositories, after
+    /// checking GitHub accepts its token; returns the login.
+    pub fn github_login(&mut self, user: &str, host: &str) -> Result<String> {
+        if self.config.owner.is_some() {
+            bail!("digital workers use their owner's GitHub account");
+        }
+        let token = gh_token(user, host)?;
+        let login = github_login(&token, host)
+            .with_context(|| format!("GitHub didn't accept {user}'s token on {host}"))?;
+        self.config.github = Some(GithubAuth::Gh {
+            user: user.to_owned(),
+            host: host.to_owned(),
+        });
+        self.save()?;
+        Ok(login)
+    }
+
+    pub fn repos_path(&self) -> PathBuf {
+        self.dir.join("repos.json")
+    }
+
+    /// The GitHub account for repositories (a digital worker uses its owner's).
+    pub fn github(&self) -> Result<crate::github::GithubCredentials> {
+        if self.config.owner.is_some() {
+            return self.account_profile()?.github();
+        }
+        match &self.config.github {
+            Some(GithubAuth::Gh { user, host }) => Ok(crate::github::GithubCredentials {
+                user: user.clone(),
+                host: host.clone(),
+                token: gh_token(user, host)?,
+            }),
+            None => bail!(
+                "profile '{}' is not signed in to GitHub; run: p2pagents github login --gh-user <login> --profile {}",
+                self.name,
+                self.name
+            ),
+        }
     }
 
     /// Where per-task git worktrees are created: outside the profiles folder (like

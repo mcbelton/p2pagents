@@ -673,5 +673,76 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     let unknown = post("/api/plans", r#"{"text":"a @alice context=nope do it"}"#).await;
     assert_eq!(unknown.status, 400);
     assert!(unknown.body.contains("no topic 'nope'"), "{}", unknown.body);
+
+    // The plan check lists every problem without running anything.
+    let checked = post(
+        "/api/plans/check",
+        r#"{"text":"claim: C-1 x\na @alice skill=nope do it"}"#,
+    )
+    .await
+    .json();
+    assert_eq!(checked["ok"], false);
+    let messages: Vec<String> = checked["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("alice is not connected")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("no skill 'nope'")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("no step proves claim C-1")),
+        "{messages:?}"
+    );
+    let ok = post(
+        "/api/plans/check",
+        r#"{"text":"ok approve @me Approve it"}"#,
+    )
+    .await
+    .json();
+    assert_eq!(ok["ok"], true, "{ok}");
+    let broken = post("/api/plans/check", r#"{"text":"nonsense"}"#)
+        .await
+        .json();
+    assert_eq!(broken["ok"], false);
+
+    // Skills: built-in ones, viewable.
+    let skills = get("/api/skills").await.json();
+    assert!(
+        skills["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "security-review")
+    );
+    let skill = get("/api/skills/security-review").await.json();
+    assert!(
+        skill["text"]
+            .as_str()
+            .unwrap()
+            .contains("# Security review")
+    );
+    assert_eq!(get("/api/skills/nope").await.status, 404);
+
+    // GitHub: not signed in yet, so repositories can't be linked.
+    let github = get("/api/github").await.json();
+    assert!(github["account"].is_null() && github["repos"].as_array().unwrap().is_empty());
+    let link = post("/api/repos", r#"{"repo":"acme/app"}"#).await;
+    assert_eq!(link.status, 400);
+    assert!(
+        link.body.contains("not signed in to GitHub"),
+        "{}",
+        link.body
+    );
     agent.shutdown().await;
 }

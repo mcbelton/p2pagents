@@ -150,6 +150,16 @@ mod tests {
                     claim.id
                 );
             }
+            // Every model step follows a skill that exists.
+            let skills = crate::skills::Skills::new(std::env::temp_dir().join("p2p-no-skills"));
+            for step in plan.steps.iter().filter(|s| !s.approve) {
+                assert!(
+                    !step.skills.is_empty(),
+                    "{name}: step {} has no skill",
+                    step.id
+                );
+                skills.instructions(&step.skills).unwrap();
+            }
             // Every claim is backed by runtime checks or a sign-off, never a model alone.
             for step in plan.steps.iter().filter(|s| !s.claims.is_empty()) {
                 assert!(

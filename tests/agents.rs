@@ -1293,3 +1293,90 @@ async fn plans_save_verified_results_as_knowledge_and_use_it_later() {
     }
     let _ = worker;
 }
+
+#[tokio::test]
+async fn requests_are_resent_on_a_new_connection_and_run_only_once() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    let (low, high) = if boss.id() < worker.id() {
+        (&boss, &worker)
+    } else {
+        (&worker, &boss)
+    };
+    high.connect(low.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+    wait_for_peers(&worker, 1).await;
+    let task = tokio::spawn({
+        let (boss, id) = (boss.clone(), worker.id());
+        async move {
+            boss.delegate(id, LlmTask::new(Provider::Copilot, "slow"))
+                .await
+        }
+    });
+    next_matching(&mut worker_events, |e| {
+        matches!(e, Event::TaskReceived { .. })
+    })
+    .await;
+    // A new connection: the boss sends its pending request again over it.
+    low.reconnect(high.id()).await.unwrap();
+    let out = timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.unwrap(), "slow done");
+    // The worker ran it once: no second TaskReceived for the re-sent request.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut received = 0;
+    while let Ok(e) = worker_events.try_recv() {
+        if matches!(e, Event::TaskReceived { .. }) {
+            received += 1;
+        }
+    }
+    assert_eq!(received, 0, "the re-sent request was not run again");
+}
+
+#[tokio::test]
+async fn tasks_delegated_while_peers_dial_each_other_are_not_lost() {
+    let mut pending = Vec::new();
+    for round in 0..8 {
+        let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+        let mut boss = Node::new("boss");
+        mutual(&mut worker, &mut boss);
+        let (worker, _we) = worker.start().await;
+        let (boss, _be) = boss.start().await;
+        // Both dial at once; delegate as soon as the boss has any connection, while
+        // the two connections are still converging on one.
+        let (a, b) = tokio::join!(boss.connect(worker.addr()), worker.connect(boss.addr()));
+        let _ = (a, b);
+        timeout(Duration::from_secs(10), async {
+            while boss.peers().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let id = worker.id();
+        let job = tokio::spawn({
+            let boss = boss.clone();
+            async move {
+                boss.delegate(
+                    id,
+                    LlmTask::new(Provider::Copilot, format!("round {round}")),
+                )
+                .await
+            }
+        });
+        pending.push((round, job, boss, worker));
+    }
+    for (round, job, _boss, _worker) in pending {
+        let out = timeout(Duration::from_secs(15), job)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the task was lost"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, format!("copilot did: round {round}"));
+    }
+}

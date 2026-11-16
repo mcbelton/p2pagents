@@ -363,6 +363,15 @@ pub async fn start(
         .route("/api/playbooks", get(list_playbooks))
         .route("/api/playbooks/{name}", post(render_playbook))
         .route("/api/kb/{topic}", get(kb_topic))
+        .route("/api/plans/check", post(check_plan))
+        .route("/api/github", get(github_state))
+        .route("/api/github/login", post(github_sign_in))
+        .route("/api/repos", post(link_repo))
+        .route("/api/repos/{name}", delete(unlink_repo))
+        .route("/api/repos/{name}/sync", post(sync_repo))
+        .route("/api/repos/{name}/pr", post(open_pr))
+        .route("/api/skills", get(list_skills))
+        .route("/api/skills/{name}", get(skill_text))
         .route("/api/squads", post(save_squad))
         .route("/api/squads/{name}", delete(remove_squad))
         .route("/api/trust", post(allow_peer))
@@ -684,8 +693,25 @@ async fn create_plan(
 ) -> Result<Json<Value>, ApiError> {
     let plan = Plan::parse(&body.text).map_err(|e| bad_request(format!("{e:#}")))?;
     let kb = s.info.profile.knowledge();
+    let skills = s.info.profile.skills();
+    let squads_now = s.squads.lock().unwrap().clone();
+    let errors: Vec<String> =
+        crate::plan::preflight(&plan, &s.agent.peers(), &squads_now, &kb, &skills)
+            .into_iter()
+            .filter(|p| p.error)
+            .map(|p| match p.step {
+                Some(step) => format!("step {step}: {}", p.message),
+                None => p.message,
+            })
+            .collect();
+    if !errors.is_empty() {
+        return Err(bad_request(format!(
+            "the plan was not started:\n{}",
+            errors.join("\n")
+        )));
+    }
     let ready = plan
-        .with_knowledge(&kb)
+        .prepare(&kb, &skills)
         .map_err(|e| bad_request(format!("{e:#}")))?;
     let plan_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
     let mut ids = HashMap::new();
@@ -898,6 +924,235 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         "runs": { "total": runs.len(), "passed": runs.iter().filter(|r| r.passed).count() },
         "knowledge": profile.knowledge().list(),
     })))
+}
+
+/// Parses a plan and checks it against the connected peers, their folders and
+/// checks, squads, knowledge and skills, without running it.
+async fn check_plan(State(s): State<AppState>, Json(body): Json<PlanBody>) -> Json<Value> {
+    let plan = match Plan::parse(&body.text) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Json(json!({
+                "ok": false,
+                "problems": [{ "step": null, "error": true, "message": format!("{e:#}") }],
+            }));
+        }
+    };
+    let squads = s.squads.lock().unwrap().clone();
+    let problems = crate::plan::preflight(
+        &plan,
+        &s.agent.peers(),
+        &squads,
+        &s.info.profile.knowledge(),
+        &s.info.profile.skills(),
+    );
+    Json(json!({
+        "ok": !problems.iter().any(|p| p.error),
+        "problems": problems,
+        "steps": plan.steps.len(),
+        "claims": plan.claims.len(),
+    }))
+}
+
+/// GitHub: the profile's account, the GitHub CLI accounts it could use, and the
+/// linked repositories with the branches agents' tasks made.
+async fn github_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    use crate::github::{RepoStore, gh_accounts, task_branches};
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let account = match &profile.config.github {
+        Some(crate::profile::GithubAuth::Gh { user, host }) => {
+            json!({ "user": user, "host": host })
+        }
+        None if profile.config.owner.is_some() => json!({ "owner": profile.config.owner }),
+        None => Value::Null,
+    };
+    let accounts: Vec<Value> = tokio::task::spawn_blocking(gh_accounts)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(login, host, active)| json!({ "login": login, "host": host, "active": active }))
+        .collect();
+    let mut repos = Vec::new();
+    for repo in RepoStore::load(&profile.repos_path())
+        .map_err(internal)?
+        .repos
+    {
+        let branches = task_branches(&repo).await.unwrap_or_default();
+        repos.push(json!({
+            "name": repo.name, "slug": repo.slug, "host": repo.host, "branch": repo.branch,
+            "path": repo.path.display().to_string(), "branches": branches,
+        }));
+    }
+    Ok(Json(json!({
+        "account": account,
+        "accounts": accounts,
+        "repos": repos,
+        "serving": s.info.serving,
+    })))
+}
+
+#[derive(Deserialize)]
+struct GithubLoginBody {
+    user: String,
+    host: String,
+}
+
+async fn github_sign_in(
+    State(s): State<AppState>,
+    Json(body): Json<GithubLoginBody>,
+) -> Result<Json<Value>, ApiError> {
+    let mut profile = s.info.profile.reload().map_err(internal)?;
+    let login = tokio::task::spawn_blocking(move || {
+        profile
+            .github_login(&body.user, &body.host)
+            .map(|l| (l, body.host))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.system(
+        "info",
+        format!("Signed in to GitHub as {}@{}", login.0, login.1),
+    );
+    Ok(Json(json!({ "login": login.0 })))
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    repo: String,
+    name: Option<String>,
+    #[serde(default)]
+    access: Access,
+    /// `name=command` lines.
+    #[serde(default)]
+    checks: Vec<String>,
+    /// Allowlisted peers to grant the folder to.
+    #[serde(default)]
+    grant: Vec<String>,
+}
+
+async fn link_repo(
+    State(s): State<AppState>,
+    Json(body): Json<LinkBody>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let checks: Vec<String> = body
+        .checks
+        .into_iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    let checks = crate::shares::parse_checks(&checks).map_err(|e| bad_request(format!("{e:#}")))?;
+    let name = body.name.filter(|n| !n.trim().is_empty());
+    let (repo, shares) =
+        crate::github::link(&profile, &body.repo, name.as_deref(), body.access, checks)
+            .await
+            .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.agent.set_shares(shares);
+    for peer in &body.grant {
+        let Some(mut entry) = s.agent.trusted().get_by_name(peer).cloned() else {
+            continue;
+        };
+        if !entry.shares.contains(&repo.name) {
+            entry.shares.push(repo.name.clone());
+        }
+        s.agent.allow(entry);
+    }
+    s.save_trust()?;
+    s.system(
+        "info",
+        format!(
+            "Linked {} as folder {} (a worktree per task)",
+            repo.slug, repo.name
+        ),
+    );
+    s.broadcast_peers();
+    Ok(Json(json!({ "name": repo.name, "branch": repo.branch })))
+}
+
+async fn unlink_repo(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let shares =
+        crate::github::unlink(&profile, &name, false).map_err(|e| bad_request(format!("{e:#}")))?;
+    s.agent.set_shares(shares);
+    s.system("info", format!("Unlinked {name} (the clone stays on disk)"));
+    Ok(Json(json!({ "unlinked": name })))
+}
+
+fn linked(
+    s: &Shared,
+    name: &str,
+) -> Result<(crate::github::Repo, crate::github::GithubCredentials), ApiError> {
+    let profile = s.info.profile.reload().map_err(internal)?;
+    let repo = crate::github::RepoStore::load(&profile.repos_path())
+        .map_err(internal)?
+        .get(name)
+        .map_err(|e| bad_request(format!("{e:#}")))?
+        .clone();
+    let creds = profile
+        .github()
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok((repo, creds))
+}
+
+async fn sync_repo(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (repo, creds) = linked(&s, &name)?;
+    let head = creds
+        .sync(&repo)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({ "head": head, "branch": repo.branch })))
+}
+
+#[derive(Deserialize)]
+struct PrBody {
+    branch: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn open_pr(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<PrBody>,
+) -> Result<Json<Value>, ApiError> {
+    let (repo, creds) = linked(&s, &name)?;
+    if body.title.trim().is_empty() {
+        return Err(bad_request("the pull request needs a title"));
+    }
+    creds
+        .push(&repo, &body.branch)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let url = creds
+        .create_pr(&repo, &body.branch, body.title.trim(), &body.body)
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.system("info", format!("Opened pull request {url}"));
+    Ok(Json(json!({ "url": url })))
+}
+
+async fn list_skills(State(s): State<AppState>) -> Json<Value> {
+    Json(json!({ "skills": s.info.profile.skills().list() }))
+}
+
+async fn skill_text(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let text = s.info.profile.skills().text(&name).map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    Ok(Json(json!({ "name": name, "text": text })))
 }
 
 async fn list_playbooks() -> Result<Json<Value>, ApiError> {

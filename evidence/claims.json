@@ -71,8 +71,12 @@
     {
       "id": "NET-6",
       "area": "network",
-      "claim": "A task in flight survives its connection being replaced (e.g. both peers dialed each other at once): it keeps running and its result arrives over the connection that is kept.",
-      "tests": ["agents::delegated_tasks_survive_a_connection_being_replaced"],
+      "claim": "A task in flight survives its connection being replaced (e.g. both peers dialed each other at once): it keeps running and its result arrives over the connection that is kept. Requests sent while connections converge are re-sent on the kept connection and run exactly once.",
+      "tests": [
+        "agents::delegated_tasks_survive_a_connection_being_replaced",
+        "agents::requests_are_resent_on_a_new_connection_and_run_only_once",
+        "agents::tasks_delegated_while_peers_dial_each_other_are_not_lost"
+      ],
       "live": ["digital worker ran boss's task on its owner's account"]
     },
     {
@@ -408,6 +412,38 @@
         "lib::ops::a_confident_verified_diagnosis_becomes_a_new_tsg"
       ],
       "live": ["kb learn wrote the ops summary into the knowledge base"]
+    },
+    {
+      "id": "SKL-1",
+      "area": "knowledge",
+      "claim": "Plan steps follow named skills (skill=): built-in instructions cover every playbook step (bootstrap, reverse engineering, design, implementation, review, security, privacy, compliance, ops insights, TSG writing) and the debugging agent follows incident-debugging; a profile's own skills add to or replace them, and unknown skills are refused before anything runs.",
+      "tests": [
+        "lib::skills::built_in_skills_are_listed_and_profile_skills_replace_them",
+        "lib::plan::steps_follow_named_skills",
+        "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
+        "lib::ops::a_confident_verified_diagnosis_becomes_a_new_tsg"
+      ]
+    },
+    {
+      "id": "PRE-1",
+      "area": "squads",
+      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type.",
+      "tests": [
+        "lib::plan::preflight_finds_what_would_fail_before_anything_runs",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ],
+      "live": ["a plan with errors was refused before anything ran"]
+    },
+    {
+      "id": "GH-1",
+      "area": "github",
+      "claim": "A profile signs in to GitHub with a GitHub CLI account. Linking a repository clones it with that account (the token never reaches a command line or the clone's config) into a folder outside the profiles, shared with a worktree per task; the clone syncs, task branches are listed and pushed (only p2p/... ones), and pull requests open with the profile's account. Linking needs a sign-in.",
+      "tests": [
+        "lib::github::repository_names_are_parsed_strictly",
+        "github::linked_repositories_clone_share_sync_push_and_open_pull_requests",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
+      ],
+      "live": ["linked a GitHub repository with the profile's GitHub sign-in"]
     },
     {
       "id": "BRG-1",

@@ -196,7 +196,16 @@ struct PeerHandle {
 struct PendingTask {
     peer: EndpointId,
     reply: oneshot::Sender<Result<Delivered, String>>,
+    /// The request, re-sent over every new connection to `peer` until answered: a
+    /// request queued on a connection that is then replaced would otherwise be lost.
+    request: Option<Message>,
 }
+
+/// How long a served task's result is kept to answer a re-sent request.
+const RECENT_RESULTS: Duration = Duration::from_secs(600);
+
+/// A served task, the result sent for it, and when.
+type RecentResult = (LlmTask, Message, Instant);
 
 /// What serving a peer's task produced.
 struct Served {
@@ -250,6 +259,9 @@ struct Inner {
     /// Cancel senders of tasks peers asked us to run, by (peer, task id); dropping
     /// one cancels its task.
     serving: Mutex<HashMap<(EndpointId, u64), oneshot::Sender<()>>>,
+    /// Results of recently served tasks, with the task, by (peer, task id): a re-sent
+    /// request for a task already done gets its result again instead of a re-run.
+    recent: Mutex<HashMap<(EndpointId, u64), RecentResult>>,
     /// Peers reported via `PeerConnected` and not yet via `PeerDisconnected`.
     announced: Mutex<HashSet<EndpointId>>,
     next_task_id: AtomicU64,
@@ -301,6 +313,7 @@ impl Agent {
             task_log: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             serving: Mutex::new(HashMap::new()),
+            recent: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashSet::new()),
             next_task_id: AtomicU64::new(1),
             worktrees_dir: config.worktrees_dir,
@@ -415,6 +428,19 @@ impl Agent {
         self.inner.trust.lock().unwrap().clone()
     }
 
+    /// Replaces the shared folders (e.g. a newly linked repository); connected peers
+    /// learn what they may now use right away. Persisting them is up to the caller.
+    pub fn set_shares(&self, shares: ShareStore) {
+        *self.inner.shares.lock().unwrap() = shares;
+        let ids: Vec<EndpointId> = self.inner.peers.lock().unwrap().keys().copied().collect();
+        for id in ids {
+            let shares = self.inner.shares_for(&id);
+            if let Some(handle) = self.inner.peers.lock().unwrap().get(&id) {
+                let _ = handle.tx.send(Message::Shares { shares });
+            }
+        }
+    }
+
     /// Adds or updates an allowlisted peer and dials it. Persisting the allowlist
     /// is up to the caller.
     pub fn allow(&self, peer: TrustedPeer) {
@@ -495,16 +521,16 @@ impl Agent {
             if !handle.capabilities.contains(&task.provider) {
                 bail!("{} does not serve {}", handle.name, task.provider);
             }
-            self.inner
-                .pending
-                .lock()
-                .unwrap()
-                .insert(task_id, PendingTask { peer, reply });
-            if handle
-                .tx
-                .send(Message::TaskRequest { task_id, task })
-                .is_err()
-            {
+            let request = Message::TaskRequest { task_id, task };
+            self.inner.pending.lock().unwrap().insert(
+                task_id,
+                PendingTask {
+                    peer,
+                    reply,
+                    request: Some(request.clone()),
+                },
+            );
+            if handle.tx.send(request).is_err() {
                 self.inner.pending.lock().unwrap().remove(&task_id);
                 bail!("connection to {} closed", handle.name);
             }
@@ -547,25 +573,30 @@ impl Agent {
         let (reply, rx) = oneshot::channel();
         let me = self.id();
         let target = peer.unwrap_or(me);
+        let request = (target != me).then(|| Message::ApprovalRequest {
+            task_id,
+            title: title.to_owned(),
+            text: text.to_owned(),
+        });
         self.inner.pending.lock().unwrap().insert(
             task_id,
             PendingTask {
                 peer: target,
                 reply,
+                request: request.clone(),
             },
         );
         if target == me {
             self.inner
                 .add_approval(me, self.inner.name.clone(), task_id, title, text);
         } else {
-            let sent = self.inner.peers.lock().unwrap().get(&target).map(|h| {
-                h.tx.send(Message::ApprovalRequest {
-                    task_id,
-                    title: title.to_owned(),
-                    text: text.to_owned(),
-                })
-                .is_ok()
-            });
+            let sent = self
+                .inner
+                .peers
+                .lock()
+                .unwrap()
+                .get(&target)
+                .map(|h| request.clone().is_some_and(|r| h.tx.send(r).is_ok()));
             if sent != Some(true) {
                 self.inner.pending.lock().unwrap().remove(&task_id);
                 bail!("not connected to {}", target.fmt_short());
@@ -834,6 +865,13 @@ impl Inner {
         let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
         {
             let mut approvals = self.approvals.lock().unwrap();
+            // A re-sent request (after a connection was replaced) is already queued.
+            if approvals
+                .values()
+                .any(|a| a.requester == requester && a.task_id == task_id)
+            {
+                return true;
+            }
             if approvals
                 .values()
                 .filter(|a| a.requester == requester)
@@ -1266,6 +1304,19 @@ async fn run_connection(
         }
     });
     let _ = tx.send(Message::Peers { addrs: known });
+    // Requests still waiting for this peer may have been queued on a connection that
+    // was replaced: send them again (the peer ignores ones it already has).
+    let resend: Vec<Message> = inner
+        .pending
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|p| p.peer == peer_id)
+        .filter_map(|p| p.request.clone())
+        .collect();
+    for msg in resend {
+        let _ = tx.send(msg);
+    }
 
     let result = async {
         loop {
@@ -1288,7 +1339,24 @@ async fn run_connection(
                     }
                 }
                 Message::TaskRequest { task_id, task } => {
+                    let key = (peer_id, task_id);
+                    // A re-sent request: it's running, or its result is sent again.
+                    if inner.serving.lock().unwrap().contains_key(&key) {
+                        continue;
+                    }
+                    let done = inner
+                        .recent
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .filter(|(t, _, at)| t == &task && at.elapsed() < RECENT_RESULTS)
+                        .map(|(_, msg, _)| msg.clone());
+                    if let Some(msg) = done {
+                        let _ = tx.send(msg);
+                        continue;
+                    }
                     let (inner, from) = (inner.clone(), name.clone());
+                    let original = task.clone();
                     let (cancel_tx, cancel_rx) = oneshot::channel();
                     inner
                         .serving
@@ -1299,7 +1367,6 @@ async fn run_connection(
                         let result = inner
                             .serve_task(&peer_id, &from, task_id, task, cancel_rx)
                             .await;
-                        inner.serving.lock().unwrap().remove(&(peer_id, task_id));
                         let msg = match result {
                             Ok(served) => Message::TaskResult {
                                 task_id,
@@ -1316,6 +1383,17 @@ async fn run_connection(
                                 patch: None,
                             },
                         };
+                        {
+                            // Remember the result before the task stops counting as
+                            // running, so a re-sent request never runs it twice.
+                            let mut recent = inner.recent.lock().unwrap();
+                            recent.retain(|_, (_, _, at)| at.elapsed() < RECENT_RESULTS);
+                            recent.insert(
+                                (peer_id, task_id),
+                                (original, msg.clone(), Instant::now()),
+                            );
+                        }
+                        inner.serving.lock().unwrap().remove(&(peer_id, task_id));
                         inner.deliver(peer_id, msg).await;
                     });
                 }
@@ -1405,6 +1483,11 @@ async fn run_connection(
             }
             inner.fail_pending(&peer_id);
             inner.cancel_served(&peer_id);
+            inner
+                .recent
+                .lock()
+                .unwrap()
+                .retain(|(p, _), _| p != &peer_id);
             let gone_requests: Vec<(EndpointId, u64)> = inner
                 .approvals
                 .lock()

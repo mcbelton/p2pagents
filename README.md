@@ -562,6 +562,8 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `attempts=N` | While checks fail, the model tries again (up to 5 times), each time given the failing output. |
 | `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
+| `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
+| `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 
 **3. Agents do the work, and each result comes back with signed evidence.**
@@ -644,6 +646,61 @@ In the web UI: **Plan** mode, pick a playbook, then **Use**.
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
 your folder's checks (`share add --check ...`); rename them with `--set test=unit` etc.
+In the web UI the playbook dialog only offers what exists: peers that run tasks, the
+folders they share with you, those folders' checks, your squads and approvers.
+
+**Skills.** Every playbook step names a **skill** (`skill=security-review`). A skill is a
+set of instructions the agent follows: the procedure, rules and output format. It is
+put in the step's prompt, so every peer and provider works the same way. Built-in skills:
+
+| Skill | For |
+| --- | --- |
+| `bootstrap-project` | Setting up a fresh project: toolchain, README, tests, CI, claims |
+| `reverse-engineer`, `build-run-discovery`, `risk-review` | Learning an existing codebase: architecture and data flows, how to build/test/run, security/privacy/reliability hotspots |
+| `design-doc`, `implement-change`, `code-review` | Designing, implementing and independently reviewing a change |
+| `security-review`, `privacy-review`, `compliance-check` | SDLC gates: vulnerability classes, personal data handling, licenses and secrets |
+| `ops-insights`, `tsg-writing`, `incident-debugging` | Learning from operations, writing troubleshooting guides, the debugging agent |
+
+Add your team's own, or replace a built-in one with the same name:
+
+```powershell
+p2pagents skill list --profile boss
+p2pagents skill show security-review --profile boss
+p2pagents skill add security-review .\our-security-checklist.md --profile boss   # front matter: name, description
+```
+
+**Plan check.** Before a plan runs, it is checked against what exists now:
+
+- connected peers, and the folders they share with you (each folder's checks, your access
+  there, worktrees);
+- your squads;
+- knowledge topics and skills.
+
+`verify=` needs full access, `apply=` a `--worktrees` folder, and approvers must be
+connected. A plan with errors is not started, and every reason is listed. The web UI
+checks plans as you type and shows the problems under the editor.
+
+**GitHub repositories.** Sign a profile in with one of your GitHub CLI accounts, then link
+repositories. Each is cloned with that account into `~/.p2prepos/<profile>/<name>` and
+shared as a folder with a worktree per task. The token is fetched from `gh` when needed.
+It reaches git only as an HTTP header in the environment: never on a command line or in
+the clone's config.
+
+```powershell
+gh auth login                                           # once, if you haven't
+p2pagents github login --gh-user alice --profile alice  # github status / logout
+p2pagents repo link acme/shop --access full --check test="npm test" --check lint="npm run lint" --profile alice
+p2pagents peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
+p2pagents repo sync shop --profile alice                # fetch + fast-forward
+p2pagents repo branches shop --profile alice            # p2p/... branches agents' tasks committed
+p2pagents repo pr shop p2p/boss/12-1794781234 --title "Add CSV export" --profile alice
+```
+
+`repo pr` pushes the task branch (only `p2p/...` branches) and opens a pull request into
+the repository's default branch with the profile's account. In the web UI the **GitHub**
+card does the same: **Sign in to GitHub** (pick a GitHub CLI account), **Link repo**
+(with checks, and which peers to share it with), **Sync**, and **Open PR** on each task
+branch. Digital workers use their owner's GitHub account.
 
 **Knowledge base.** Each profile has a private knowledge base of Markdown topics.
 
@@ -716,7 +773,8 @@ monitors against their SLOs, open incidents, the incident log and task statistic
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
 `p2pagents share add|list|remove`, `p2pagents worker create|list`,
 `p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
-`p2pagents playbook list|show`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
+`p2pagents playbook list|show`, `p2pagents skill list|show|add|remove`, `p2pagents github login|status|logout`,
+`p2pagents repo link|list|sync|branches|pr|unlink`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
 (and uses a separate credential store namespace).
 
 ## Web UI
@@ -982,6 +1040,8 @@ Workflow for a change:
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
 - [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc and learn plan templates
 - [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
+- [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
+- [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)
 - [src/llm/changes.rs](src/llm/changes.rs): workspace snapshots and the "files changed" report on task results
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases

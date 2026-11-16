@@ -322,6 +322,23 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .incident-log .incident.resolved strong, .incident-log .incident.learned strong { color: var(--success); }
 .incident-log .incident.opened strong, .incident-log .incident.escalated strong { color: var(--danger); }
 .count.alert { background: var(--danger-soft); color: var(--danger); }
+.playbook-vars select { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; }
+.plan-problems { margin: 8px 0 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); font-size: 12.5px; max-height: 180px; overflow: auto; }
+.plan-problems p { margin: 0 0 4px; font-weight: 600; }
+.plan-problems ul { margin: 0; padding-left: 18px; }
+.plan-problems .ok { color: var(--success); }
+.plan-problems .bad { color: var(--danger); }
+.plan-problems .warn { color: var(--warn); }
+.plan-problems li { overflow-wrap: anywhere; }
+.skills-box { margin-top: 8px; }
+.skills-box summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.skills-box li .muted { margin-top: 2px; }
+.repo { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin-top: 8px; background: var(--surface); }
+.repo-actions { display: flex; gap: 6px; margin-top: 6px; }
+.branch-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.branch { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.branch .btn { margin-left: auto; }
+dialog textarea, dialog select, dialog input[type=text] { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; }
 
 /* Dialog */
 dialog {

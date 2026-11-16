@@ -156,6 +156,22 @@ try:
         allow("intruder", "worker1"),  # worker1 does NOT allow intruder
     ])
     check("allowlists written", ok)
+    print("== GitHub: worker1 signs in with its GitHub CLI account and links a public repository")
+    if acct1[1] == "github.com":
+        _, out = cli("github", "login", "--gh-user", acct1[0], "--host", acct1[1], "--profile", "worker1")
+        print(f"  {out.strip()}")
+        code, out = cli("repo", "link", "mcbelton/p2pagents", "--as", "p2pclone", "--profile", "worker1")
+        print(f"  {out.strip()}")
+        clone = os.path.join(HOME, ".p2prepos", "worker1", "p2pclone")
+        config = open(os.path.join(clone, ".git", "config")).read() if os.path.isdir(clone) else ""
+        sync_code, sync_out = cli("repo", "sync", "p2pclone", "--profile", "worker1")
+        print(f"  {sync_out.strip()}")
+        check("linked a GitHub repository with the profile's GitHub sign-in",
+              code == 0 and os.path.isfile(os.path.join(clone, "Cargo.toml"))
+              and "AUTHORIZATION" not in config.upper() and sync_code == 0,
+              out.strip())
+    else:
+        check("linked a GitHub repository with the profile's GitHub sign-in", False, "needs a github.com account in gh")
     print("== digital worker: worker1's owner creates 'helper', which runs on worker1's account")
     _, out = cli("worker", "create", "helper", "--owner", "worker1", "--role", "release note writer")
     print(f"  {out.strip()}")
@@ -293,10 +309,20 @@ try:
           lines[-12:])
 
     print("== EDD plan: claims proven by a check worker2's runtime runs, and worker1's signed approval")
+    broken = os.path.join(HOME, "broken.plan")
+    with open(broken, "w") as f:
+        f.write("ghost @nobody do it\nwrong @worker2:app verify=deploy do it\n")
+    boss.cursor = len(boss.lines)
+    boss.send(f"/plan {broken}")
+    refused = boss.wait_for(r"the plan was not started", 20)
+    text = "\n".join(boss.lines[boss.cursor:])
+    check("a plan with errors was refused before anything ran",
+          refused and "step ghost: nobody is not connected" in text and "has no check deploy" in text
+          and "running plan" not in text, text)
     with open(plan_file, "w") as f:
         f.write("claim: LIVE-1 worker2 adds evidence.txt and its owner's check passes\n"
                 "claim: LIVE-2 a teammate signs off the change\n"
-                "make @worker2:app verify=has-file attempts=2 claims=LIVE-1 save=evidence-notes Create a file named evidence.txt "
+                "make @worker2:app skill=implement-change verify=has-file attempts=2 claims=LIVE-1 save=evidence-notes Create a file named evidence.txt "
                 "in the current folder containing exactly: proven by p2p. Reply DONE.\n"
                 "signoff after make approve @worker1 claims=LIVE-2 Approve if the change looks right.\n")
     boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)

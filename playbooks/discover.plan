@@ -4,8 +4,8 @@ claim: KB-1 The architecture, components and data flows of {{project}} are docum
 claim: KB-2 How to build, test and run it is documented, and the owner's test check passes as documented
 claim: KB-3 Security, privacy and reliability hotspots are listed with file references
 claim: KB-4 Someone who knows {{project}} confirmed the knowledge
-architecture @{{peer}}:{{folder}} save=architecture Reverse-engineer this codebase. Describe its purpose, architecture, main components and their responsibilities, entry points, data stores, external services and dependencies, and the main data flows, with file paths. Concise Markdown.
-build @{{peer}}:{{folder}} verify={{test}} claims=KB-2 save=build-and-run Find out how to build, test and run this project: commands, prerequisites, configuration and environment variables. Don't change any file. Concise Markdown.
-risks after architecture @{{peer}}:{{folder}} save=risks List security, privacy (which personal data is handled, where it is stored, who can access it, how long it is kept) and reliability hotspots, each with file references, severity and a suggested next step.
-glossary after architecture @{{peer}}:{{folder}} save=glossary Write a glossary of the domain terms and code names used in this system.
+architecture @{{peer}}:{{folder}} skill=reverse-engineer save=architecture Reverse-engineer this codebase. Describe its purpose, architecture, main components and their responsibilities, entry points, data stores, external services and dependencies, and the main data flows, with file paths. Concise Markdown.
+build @{{peer}}:{{folder}} skill=build-run-discovery verify={{test}} claims=KB-2 save=build-and-run Find out how to build, test and run this project: commands, prerequisites, configuration and environment variables. Don't change any file. Concise Markdown.
+risks after architecture @{{peer}}:{{folder}} skill=risk-review save=risks List security, privacy (which personal data is handled, where it is stored, who can access it, how long it is kept) and reliability hotspots, each with file references, severity and a suggested next step.
+glossary after architecture @{{peer}}:{{folder}} skill=reverse-engineer save=glossary Write a glossary of the domain terms and code names used in this system.
 confirm after architecture,build,risks approve @{{approver}} claims=KB-1,KB-3,KB-4 Check that this knowledge about {{project}} is right: architecture, build and run, risks.

@@ -5,8 +5,8 @@ claim: BOOT-2 The repository has a README with prerequisites, setup, build, test
 claim: BOOT-3 There is a unit test, and CI builds and tests every push and pull request
 claim: BOOT-4 The project's claims file lists what must be true and the checks that prove it
 claim: BOOT-5 The team lead approved the setup
-prereqs @{{peer}}:{{folder}} verify={{build}} attempts=3 claims=BOOT-1 save=setup For {{project}}: detect (or, for an empty folder, choose) the language and toolchain, add the package manifest and lock file, and make a minimal program that builds. List the exact tool versions and commands you used.
-readme after prereqs @{{peer}}:{{folder}} verify={{build}} claims=BOOT-2 Add a README.md (purpose, prerequisites with versions, setup, build, test, run) and a .gitignore for this toolchain.
-ci after readme @{{peer}}:{{folder}} verify={{test}} attempts=3 claims=BOOT-3 Add one meaningful unit test and a CI workflow (.github/workflows/ci.yml) that builds and runs the tests on pushes and pull requests.
-claims after ci @{{peer}}:{{folder}} verify={{test}} claims=BOOT-4 save=claims Create evidence/claims.json: the project's first claims (id, statement, and the tests or checks that prove each), matching the code as it is now.
+prereqs @{{peer}}:{{folder}} skill=bootstrap-project verify={{build}} attempts=3 claims=BOOT-1 save=setup For {{project}}: detect (or, for an empty folder, choose) the language and toolchain, add the package manifest and lock file, and make a minimal program that builds. List the exact tool versions and commands you used.
+readme after prereqs @{{peer}}:{{folder}} skill=bootstrap-project verify={{build}} claims=BOOT-2 Add a README.md (purpose, prerequisites with versions, setup, build, test, run) and a .gitignore for this toolchain.
+ci after readme @{{peer}}:{{folder}} skill=bootstrap-project verify={{test}} attempts=3 claims=BOOT-3 Add one meaningful unit test and a CI workflow (.github/workflows/ci.yml) that builds and runs the tests on pushes and pull requests.
+claims after ci @{{peer}}:{{folder}} skill=bootstrap-project verify={{test}} claims=BOOT-4 save=claims Create evidence/claims.json: the project's first claims (id, statement, and the tests or checks that prove each), matching the code as it is now.
 signoff after claims approve @{{approver}} claims=BOOT-5 Review the setup of {{project}}: toolchain, README, CI and claims.

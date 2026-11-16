@@ -475,6 +475,8 @@ pub struct Ops {
     pub shares: ShareStore,
     pub store: OpsStore,
     pub kb: KnowledgeBase,
+    /// Skills; the debugging agent follows `incident-debugging`.
+    pub skills: crate::skills::Skills,
     /// The agent's own model, for the debugging agent (None: escalate instead).
     pub executor: Option<Arc<dyn Executor>>,
     /// Called for every incident event (alerting).
@@ -641,13 +643,17 @@ impl Ops {
             return false;
         };
         let knowledge = self.kb.context(&["all".into()]).unwrap_or_default();
+        let skill = self
+            .skills
+            .instructions(&["incident-debugging".into()])
+            .unwrap_or_default();
         let checks: Vec<String> = share
             .checks
             .iter()
             .map(|(name, cmd)| format!("- `{name}`: `{cmd}`"))
             .collect();
         let prompt = format!(
-            "You are the debugging agent of a running service. Monitor `{}` (check `{}`) is failing.\n\
+            "You are the debugging agent of a running service.\n{skill}\n---\nMonitor `{}` (check `{}`) is failing.\n\
              Its latest output:\n```text\n{}\n```\n\
              Knowledge about this system:\n{}\n\n\
              Investigate (read-only: inspect files and logs in this folder; change nothing). \
@@ -902,6 +908,10 @@ mod tests {
                 "the debugging agent only reads"
             );
             assert!(task.prompt.contains("disk full"), "it sees the failure");
+            assert!(
+                task.prompt.contains("### Skill: incident-debugging"),
+                "it follows the skill"
+            );
             Ok(self.0.clone())
         }
     }
@@ -949,6 +959,7 @@ mod tests {
             shares,
             store,
             kb,
+            skills: crate::skills::Skills::new(std::env::temp_dir().join("p2p-no-skills")),
             executor: doctor.map(|d| Arc::new(Doctor(d.into())) as Arc<dyn Executor>),
             notify: Arc::new(move |e: &IncidentEvent| log.lock().unwrap().push(e.kind)),
         };

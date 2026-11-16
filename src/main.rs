@@ -74,6 +74,16 @@ enum Command {
     /// Ready-made plans: bootstrap, discover, sdlc, learn.
     #[command(subcommand)]
     Playbook(PlaybookCommand),
+    /// Skills: instructions agents follow in plan steps (skill=name). Built-in ones
+    /// ship with p2pagents; a profile's own replace or add to them.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+    /// Sign a profile in to GitHub (an account of the GitHub CLI) for repositories.
+    #[command(subcommand)]
+    Github(GithubCommand),
+    /// Link GitHub repositories: clone, share with peers, sync, open pull requests.
+    #[command(subcommand)]
+    Repo(RepoCommand),
     /// Monitors: a folder's check run on a schedule; failures open incidents that
     /// TSGs or the debugging agent try to fix.
     #[command(subcommand)]
@@ -211,6 +221,126 @@ enum KbCommand {
     Learn {
         #[arg(long, default_value_t = 168)]
         hours: u64,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubCommand {
+    /// Use a GitHub CLI account (see `gh auth status`) for this profile's repositories.
+    Login {
+        #[arg(long)]
+        gh_user: String,
+        #[arg(long, default_value = DEFAULT_GITHUB_HOST)]
+        host: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Show the profile's GitHub account and the GitHub CLI accounts on this machine.
+    Status {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    Logout {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Clone a repository with the profile's GitHub account and share it with peers
+    /// (a git worktree per task).
+    #[command(after_help = "\
+examples:
+  p2pagents github login --gh-user alice --profile alice
+  p2pagents repo link acme/shop --access full --check test=\"npm test\" --check lint=\"npm run lint\" --profile alice
+  p2pagents peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
+Agents' tasks commit on p2p/... branches; review them with repo branches and open a
+pull request with repo pr.")]
+    Link {
+        /// owner/repo, host/owner/repo or an https URL.
+        repo: String,
+        /// Folder name peers use (default: the repository name).
+        #[arg(long = "as")]
+        name: Option<String>,
+        #[arg(long, value_enum, default_value_t = Access::WorkspaceWrite)]
+        access: Access,
+        #[arg(long = "check", value_name = "NAME=COMMAND")]
+        checks: Vec<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Fetch and fast-forward the clone.
+    Sync {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Branches agents' tasks committed to, newest first.
+    Branches {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Push a task branch and open a pull request into the repository's branch.
+    Pr {
+        name: String,
+        branch: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Stop sharing a repository and forget it (--delete also removes the clone).
+    Unlink {
+        name: String,
+        #[arg(long)]
+        delete: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// List skills (built-in and the profile's own).
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Print a skill.
+    Show {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Add a skill, or replace a built-in one, from a Markdown file (`-` for stdin).
+    #[command(after_help = "\
+A skill file starts with front matter:
+  ---
+  name: security-review
+  description: Our security review checklist
+  ---
+  # Security review
+  ...
+Use it in a plan step with skill=security-review.")]
+    Add {
+        name: String,
+        file: PathBuf,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Remove a profile skill (a built-in one of the same name applies again).
+    Remove {
+        name: String,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -565,6 +695,9 @@ async fn main() -> Result<()> {
         Some(Command::Runs(command)) => run_runs(command),
         Some(Command::Kb(command)) => run_kb(command),
         Some(Command::Playbook(command)) => run_playbook(command),
+        Some(Command::Skill(command)) => run_skill(command),
+        Some(Command::Github(command)) => run_github(command),
+        Some(Command::Repo(command)) => run_repo(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
         Some(Command::Ops(command)) => run_ops(command),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
@@ -787,6 +920,7 @@ fn start_monitors(
         shares: shares.clone(),
         store: profile.ops_store(),
         kb: profile.knowledge(),
+        skills: profile.skills(),
         executor,
         notify: Arc::new(notify),
     });
@@ -905,6 +1039,180 @@ fn run_kb(command: KbCommand) -> Result<()> {
                 profile.name,
                 report.chars().count()
             );
+        }
+    }
+    Ok(())
+}
+
+/// Signs `profile` in to GitHub with GitHub CLI account `user@host`; returns the
+/// verified login.
+fn github_login(profile: &mut Profile, user: &str, host: &str) -> Result<String> {
+    profile.github_login(user, host)
+}
+
+fn run_github(command: GithubCommand) -> Result<()> {
+    match command {
+        GithubCommand::Login {
+            gh_user,
+            host,
+            profile,
+        } => {
+            let mut profile = Profile::open(&profile.name)?;
+            let login = github_login(&mut profile, &gh_user, &host)?;
+            println!(
+                "profile '{}': GitHub repositories as {login}@{host}",
+                profile.name
+            );
+        }
+        GithubCommand::Status { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            match profile.github() {
+                Ok(c) => println!(
+                    "profile '{}': GitHub as {}@{}",
+                    profile.name, c.user, c.host
+                ),
+                Err(e) => println!("{e:#}"),
+            }
+            println!("GitHub CLI accounts on this machine:");
+            for (login, host, active) in p2pagents::github::gh_accounts() {
+                println!("  {login}@{host}{}", if active { " (active)" } else { "" });
+            }
+        }
+        GithubCommand::Logout { profile } => {
+            let mut profile = Profile::open(&profile.name)?;
+            profile.config.github = None;
+            profile.save()?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_repo(command: RepoCommand) -> Result<()> {
+    use p2pagents::github::{RepoStore, link, task_branches, unlink};
+    match command {
+        RepoCommand::Link {
+            repo,
+            name,
+            access,
+            checks,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let checks = p2pagents::shares::parse_checks(&checks)?;
+            let (repo, _) = link(&profile, &repo, name.as_deref(), access, checks).await?;
+            println!(
+                "profile '{}': linked {} ({}) as folder '{}' at {} (at most {access}, a worktree per task)",
+                profile.name,
+                repo.slug,
+                repo.branch,
+                repo.name,
+                repo.path.display()
+            );
+            println!(
+                "grant it to a peer: p2pagents peers allow <peer> --profile {} --delegate --access {access} --share data,{}",
+                profile.name, repo.name
+            );
+        }
+        RepoCommand::List { profile } => {
+            for r in RepoStore::load(&Profile::open(&profile.name)?.repos_path())?.repos {
+                println!(
+                    "  {:<14} {}/{} ({})  {}",
+                    r.name,
+                    r.host,
+                    r.slug,
+                    r.branch,
+                    r.path.display()
+                );
+            }
+        }
+        RepoCommand::Sync { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let repo = RepoStore::load(&profile.repos_path())?.get(&name)?.clone();
+            let head = profile.github()?.sync(&repo).await?;
+            println!("{name}: {} at {head}", repo.branch);
+        }
+        RepoCommand::Branches { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let repo = RepoStore::load(&profile.repos_path())?.get(&name)?.clone();
+            for b in task_branches(&repo).await? {
+                println!(
+                    "  {:<36} {}  {}",
+                    b.name,
+                    p2pagents::runs::utc(b.unix),
+                    b.subject
+                );
+            }
+        }
+        RepoCommand::Pr {
+            name,
+            branch,
+            title,
+            body,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let repo = RepoStore::load(&profile.repos_path())?.get(&name)?.clone();
+            let creds = profile.github()?;
+            let title = match title {
+                Some(t) => t,
+                None => task_branches(&repo)
+                    .await?
+                    .into_iter()
+                    .find(|b| b.name == branch)
+                    .map(|b| b.subject)
+                    .with_context(|| {
+                        format!("{name} has no branch {branch} (see repo branches)")
+                    })?,
+            };
+            creds.push(&repo, &branch).await?;
+            println!("{}", creds.create_pr(&repo, &branch, &title, &body).await?);
+        }
+        RepoCommand::Unlink {
+            name,
+            delete,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            unlink(&profile, &name, delete)?;
+            println!("profile '{}': unlinked {name}", profile.name);
+        }
+    }
+    Ok(())
+}
+
+fn read_input(file: &std::path::Path) -> Result<String> {
+    if file.as_os_str() == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        Ok(text)
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))
+    }
+}
+
+fn run_skill(command: SkillCommand) -> Result<()> {
+    match command {
+        SkillCommand::List { profile } => {
+            for s in Profile::open(&profile.name)?.skills().list() {
+                println!("  {:<22} {:<9} {}", s.name, s.source, s.description);
+            }
+        }
+        SkillCommand::Show { name, profile } => {
+            print!("{}", Profile::open(&profile.name)?.skills().text(&name)?)
+        }
+        SkillCommand::Add {
+            name,
+            file,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            profile.skills().add(&name, &read_input(&file)?)?;
+            println!("profile '{}': saved skill {name}", profile.name);
+        }
+        SkillCommand::Remove { name, profile } => {
+            if !Profile::open(&profile.name)?.skills().remove(&name)? {
+                bail!("profile has no skill '{name}' of its own");
+            }
         }
     }
     Ok(())
@@ -1645,9 +1953,32 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let text = std::fs::read_to_string(file)
                     .with_context(|| format!("reading plan file {file:?}"));
                 let kb = profile.knowledge();
+                let skills = profile.skills();
+                let squads_now = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                 let parsed = text.and_then(|text| {
                     let plan = Plan::parse(&text)?;
-                    let ready = plan.with_knowledge(&kb)?;
+                    let problems = p2pagents::plan::preflight(
+                        &plan,
+                        &agent.peers(),
+                        &squads_now,
+                        &kb,
+                        &skills,
+                    );
+                    for p in &problems {
+                        println!(
+                            "  {} {}{}",
+                            if p.error { "error:" } else { "warning:" },
+                            p.step
+                                .as_ref()
+                                .map(|s| format!("step {s}: "))
+                                .unwrap_or_default(),
+                            p.message
+                        );
+                    }
+                    if problems.iter().any(|p| p.error) {
+                        bail!("the plan was not started: fix the errors above");
+                    }
+                    let ready = plan.prepare(&kb, &skills)?;
                     Ok((text, plan, ready))
                 });
                 match parsed {
