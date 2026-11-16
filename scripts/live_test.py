@@ -120,6 +120,21 @@ try:
     print(f"  {check_out.strip()}")
     check("spec init scaffolds a spec package that passes every spec check",
           code == 0 and check_code == 0 and "spec:trace: passed" in check_out, out + check_out)
+    code, out = cli("design", "init", "Todo done", "--dir", ws)
+    check_code, check_out = cli("spec", "check", "--dir", ws)
+    print(f"  {check_out.strip()}")
+    check("design init scaffolds a design package and review pack that pass every check",
+          code == 0 and check_code == 0 and "design:threats: passed" in check_out
+          and "review:decks: passed" in check_out, out + check_out)
+    site = os.path.join(HOME, "review-site")
+    code, out = cli("design", "render", "--dir", ws, "--out", site)
+    print(f"  {out.strip()}")
+    deck = os.path.join(site, "review", "leadership.html")
+    deck_html = open(deck, encoding="utf-8").read() if os.path.isfile(deck) else ""
+    check("design render wrote the review pack as HTML slide shows and pages",
+          code == 0 and os.path.isfile(os.path.join(site, "index.html"))
+          and deck_html.count('<section class="slide') == 6
+          and os.path.isfile(os.path.join(site, "design", "threat-model.html")), out)
     print("== EDD: worker2 shares a git repo as 'app' (a worktree per task) with a check it defines")
     app = tempfile.mkdtemp(prefix="p2p-live-app-")
     for args in (["init", "-q"], ["config", "core.autocrlf", "false"]):
@@ -361,9 +376,9 @@ try:
 
     print("== spec-driven: built-in spec checks on worker2 (edit access is enough) and a prototype for the approver")
     with open(plan_file, "w") as f:
-        f.write("claim: LIVE-3 worker2's runtime proved the spec package with the built-in spec checks\n"
+        f.write("claim: LIVE-3 worker2's runtime proved the spec and design packages and the review pack with the built-in checks\n"
                 "claim: LIVE-4 a teammate accepted the prototype a worker2 step created\n"
-                "read @worker2:code skill=spec-to-claims verify=spec:spec,spec:api,spec:ux,spec:trace claims=LIVE-3 "
+                "read @worker2:code skill=spec-to-claims verify=spec:spec,spec:api,spec:ux,spec:trace,design:arch,design:data,design:threats,design:tests,design:ops,review:decks claims=LIVE-3 "
                 "Read spec/SPEC.md and reply with only the ids of its acceptance criteria.\n"
                 "proto @worker2:app skill=prototype-ux Create the file prototype/index.html: a small self-contained page "
                 "with the heading Live prototype and one button. Reply DONE.\n"
@@ -379,6 +394,10 @@ try:
     text = "\n".join(boss.lines[boss.cursor:])
     check("worker2 proved the spec package with the built-in checks, without full access",
           all(f"✅ `spec:{part}`: passed" in text for part in ("spec", "api", "ux", "trace")), text[-1500:])
+    check("worker2 proved the design package and review pack with the built-in checks",
+          all(f"✅ `{name}`: passed" in text for name in
+              ("design:arch", "design:data", "design:threats", "design:tests", "design:ops", "review:decks")),
+          text[-1500:])
     check("the approver got the prototype a worker2 step created",
           any("comes with a UX prototype" in l for l in w1.lines[w1.cursor:]), w1.lines[w1.cursor:][-12:])
     check("boss's spec-driven run proved its claims", finished and "PASS: 2/2 claims proven" in finished, finished)

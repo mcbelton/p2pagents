@@ -1,0 +1,30 @@
+// Design a feature from its accepted spec package (spec/SPEC.md, spec/openapi.json and
+// prototype/, merged into the folder): the SDLC design artifacts (architecture with
+// context, component, UML and workflow diagrams, ADRs, data dictionary and data
+// flows, threat model, test plan, operations plan), each proven by built-in checks,
+// then a review pack: a deck per audience (technical, product, leadership) and a
+// customer feedback document. Each step builds on the one before (share the folder
+// with --worktrees). The tech lead, the security and privacy champions and the
+// product owner review it; leadership reviews last. Every approver can open the
+// review pack (decks as slide shows, design documents) from the request.
+// Vars: peer, folder, change (the feature), change_id, tech_lead, security_champion,
+//       privacy_approver, product_owner, leader
+claim: DSN-1 The architecture has context, component, UML and workflow diagrams, and its decisions are recorded as ADRs
+claim: DSN-2 The data dictionary covers every field of the API with its classification, purpose and retention, and the data flows show the trust boundaries
+claim: DSN-3 The threat model covers every STRIDE category and every flow across a trust boundary, with no high risk left unmitigated
+claim: DSN-4 The test plan proves every acceptance criterion and high-risk threat, and the operations plan has rollout, rollback, SLOs, alerts and runbooks
+claim: DSN-5 The review pack has technical, product and leadership decks and a customer feedback document, each in its audience's form
+claim: DSN-6 The tech lead accepted the design in the technical review
+claim: DSN-7 The security and privacy champions accepted the threat model and the handling of personal data
+claim: DSN-8 The product owner accepted the product review and approved sharing the customer feedback document
+claim: DSN-9 Leadership accepted the plan in the leadership review
+arch @{{peer}}:{{folder}} skill=architecture-design,adr context=all verify=design:arch attempts=3 save=architecture-{{change_id}} claims=DSN-1 Design the architecture of this feature from its spec: {{change}}. Read spec/SPEC.md, spec/openapi.json and prototype/. Write design/architecture.md, design/workflows.md and an ADR for each significant decision in design/adr/.
+data after arch @{{peer}}:{{folder}} apply=arch skill=data-design verify=design:data attempts=3 claims=DSN-2 Write the data dictionary (design/data-dictionary.md) and the data flows with their trust boundaries (design/dataflow.md) for: {{change}}.
+threats after data @{{peer}}:{{folder}} apply=data skill=threat-modeling verify=design:threats attempts=3 claims=DSN-3 Threat-model this design with STRIDE in design/threat-model.md: every flow across a trust boundary, every asset.
+plans after threats @{{peer}}:{{folder}} apply=threats skill=test-strategy,operability-design verify=design:tests,design:ops attempts=3 claims=DSN-4 Write the test plan (design/test-plan.md) and the operations plan (design/operations.md) for: {{change}}.
+pack after plans @{{peer}}:{{folder}} apply=plans skill=review-technical,review-product,review-leadership,review-customer verify=design:arch,design:data,design:threats,design:tests,design:ops,review:decks attempts=3 claims=DSN-5 Prepare the review pack for: {{change}}. Write review/technical.md, review/product.md and review/leadership.md (Marp decks) and review/customer-feedback.md, each in its audience's tone.
+tech-review after pack approve @{{tech_lead}} claims=DSN-6 Technical review of: {{change}}. Open the review pack: the technical deck and the design documents.
+security-review after pack approve @{{security_champion}} claims=DSN-7 Accept the threat model of: {{change}} (design/threat-model.md in the review pack).
+privacy-review after pack approve @{{privacy_approver}} claims=DSN-7 Accept how {{change}} handles personal data (the data dictionary and data flows in the review pack).
+product-review after pack approve @{{product_owner}} claims=DSN-8 Product review of: {{change}}. Open the product deck, and approve sharing the customer feedback document.
+lt-review after tech-review,security-review,privacy-review,product-review approve @{{leader}} claims=DSN-9 Leadership review of: {{change}}. Open the leadership deck in the review pack.

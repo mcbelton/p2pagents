@@ -10,6 +10,8 @@
 //! - `learn`: insights and troubleshooting guide drafts from how the system runs;
 //! - `spec`: spec-driven development: a feature's spec, REST API contract and UX
 //!   prototype, proven by built-in checks and accepted before any code;
+//! - `design`: the feature's SDLC design artifacts and a review pack (a deck per
+//!   audience and a customer feedback document), reviewed by each audience;
 //! - `implement-spec`: the feature built from its accepted spec, a test per criterion.
 
 use std::collections::BTreeMap;
@@ -43,6 +45,11 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
         include_str!("../playbooks/spec.plan"),
     ),
     (
+        "design",
+        "A feature's SDLC design (architecture, ADRs, diagrams, data, threats, tests, operations) and review decks per audience",
+        include_str!("../playbooks/design.plan"),
+    ),
+    (
         "implement-spec",
         "Implement a feature from its accepted spec package, with a test proving each acceptance criterion",
         include_str!("../playbooks/implement-spec.plan"),
@@ -72,7 +79,8 @@ fn default(playbook: &str, var: &str) -> Option<&'static str> {
         "folder" if playbook == "learn" => "data",
         "folder" => "app",
         "project" => "the project",
-        "approver" | "privacy_approver" | "product_owner" | "tech_lead" => "me",
+        "approver" | "privacy_approver" | "product_owner" | "tech_lead" | "security_champion"
+        | "leader" => "me",
         "reviewers" => "qa",
         "change_id" => "change",
         "build" => "build",
@@ -438,6 +446,24 @@ mod tests {
             impl_.contains("the folder's `test`, `lint` checks and the built-in `spec:api`, `spec:trace` checks must pass"),
             "{impl_}"
         );
+        let design = outline("design").unwrap();
+        assert_eq!(design.claims.len(), 9);
+        let pack = design
+            .steps
+            .iter()
+            .find(|s| s.starts_with("**pack** (after plans)"))
+            .unwrap();
+        assert!(
+            pack.contains("following the review-technical and review-product and review-leadership and review-customer skill")
+                && pack.contains("`review:decks`"),
+            "{pack}"
+        );
+        let lt = design.steps.last().unwrap();
+        assert!(
+            lt.starts_with("**lt-review** (after tech-review, security-review, privacy-review, product-review): you sign off"),
+            "{lt}"
+        );
+        assert!(!design.needs.iter().any(|n| n.contains("Full access")));
         assert!(
             sdlc.needs
                 .iter()

@@ -155,16 +155,17 @@ pub struct ApprovalInfo {
     pub from: String,
     pub title: String,
     pub text: String,
-    /// It comes with a UX prototype to preview (see [`Agent::approval_prototype`]).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub prototype: bool,
+    /// It comes with something to preview: "prototype" or "review pack" (see
+    /// [`Agent::approval_preview`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<&'static str>,
 }
 
 struct IncomingApproval {
     info: ApprovalInfo,
     requester: EndpointId,
     task_id: u64,
-    prototype: crate::preview::Files,
+    preview: crate::preview::Sources,
 }
 
 /// Most open approval requests one peer may have with this agent.
@@ -578,14 +579,15 @@ impl Agent {
             .await
     }
 
-    /// Like [`Agent::request_approval`], with a UX prototype (path under
-    /// `prototype/` -> content) the approver can preview before answering.
+    /// Like [`Agent::request_approval`], with what the approver can preview before
+    /// answering: the UX prototype, review decks and design documents, by path in the
+    /// project (see [`crate::preview`]).
     pub async fn request_approval_with(
         &self,
         peer: Option<EndpointId>,
         title: &str,
         text: &str,
-        prototype: BTreeMap<String, String>,
+        preview: BTreeMap<String, String>,
     ) -> Result<Delivered> {
         let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
@@ -595,7 +597,8 @@ impl Agent {
             task_id,
             title: title.to_owned(),
             text: text.to_owned(),
-            prototype: prototype.clone(),
+            preview: preview.clone(),
+            prototype: BTreeMap::new(),
         });
         self.inner.pending.lock().unwrap().insert(
             task_id,
@@ -607,7 +610,7 @@ impl Agent {
         );
         if target == me {
             self.inner
-                .add_approval(me, self.inner.name.clone(), task_id, title, text, prototype);
+                .add_approval(me, self.inner.name.clone(), task_id, title, text, preview);
         } else {
             let sent = self
                 .inner
@@ -635,15 +638,16 @@ impl Agent {
             .collect()
     }
 
-    /// The UX prototype that came with open approval request `id`, if any.
-    pub fn approval_prototype(&self, id: u64) -> Option<crate::preview::Files> {
-        self.inner
+    /// The preview site of what came with open approval request `id`, if anything.
+    pub fn approval_preview(&self, id: u64) -> Option<crate::preview::Files> {
+        let sources = self
+            .inner
             .approvals
             .lock()
             .unwrap()
             .get(&id)
-            .map(|a| a.prototype.clone())
-            .filter(|files| files.contains_key("index.html"))
+            .map(|a| a.preview.clone())?;
+        crate::preview::label(&sources).map(|_| crate::preview::site(&sources))
     }
 
     /// Approves or rejects request `id`; the answer is signed with this agent's key.
@@ -883,7 +887,8 @@ impl Inner {
     }
 
     /// Queues an approval request for this agent's user; false if `requester` has
-    /// too many open requests. A prototype over the preview limits is left out.
+    /// too many open requests. A preview over the limits, or of files that aren't
+    /// previewable, is left out.
     fn add_approval(
         &self,
         requester: EndpointId,
@@ -891,18 +896,19 @@ impl Inner {
         task_id: u64,
         title: &str,
         text: &str,
-        prototype: BTreeMap<String, String>,
+        preview: BTreeMap<String, String>,
     ) -> bool {
         let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        let size: usize = prototype.iter().map(|(k, v)| k.len() + v.len()).sum();
-        let prototype: crate::preview::Files =
-            if size <= crate::preview::MAX_BYTES && prototype.len() <= crate::preview::MAX_FILES {
-                prototype
+        let size: usize = preview.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let preview: crate::preview::Sources =
+            if size <= crate::preview::MAX_BYTES && preview.len() <= crate::preview::MAX_FILES {
+                preview
                     .into_iter()
+                    .filter(|(path, _)| crate::preview::previewable(path))
                     .map(|(path, text)| (path, text.into_bytes()))
                     .collect()
             } else {
-                crate::preview::Files::new()
+                crate::preview::Sources::new()
             };
         {
             let mut approvals = self.approvals.lock().unwrap();
@@ -929,11 +935,11 @@ impl Inner {
                         from: from.clone(),
                         title: title.chars().take(200).collect(),
                         text: text.chars().take(20_000).collect(),
-                        prototype: prototype.contains_key("index.html"),
+                        preview: crate::preview::label(&preview),
                     },
                     requester,
                     task_id,
-                    prototype,
+                    preview,
                 },
             );
         }
@@ -1461,10 +1467,18 @@ async fn run_connection(
                     task_id,
                     title,
                     text,
+                    mut preview,
                     prototype,
                 } => {
-                    if !inner.add_approval(peer_id, name.clone(), task_id, &title, &text, prototype)
-                    {
+                    if preview.is_empty() {
+                        preview = prototype
+                            .into_iter()
+                            .map(|(path, text)| {
+                                (format!("{}{path}", crate::preview::PROTOTYPE_DIR), text)
+                            })
+                            .collect();
+                    }
+                    if !inner.add_approval(peer_id, name.clone(), task_id, &title, &text, preview) {
                         let msg = Message::TaskResult {
                             task_id,
                             ok: false,

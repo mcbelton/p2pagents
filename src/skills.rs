@@ -68,6 +68,37 @@ const BUILT_IN: &[(&str, &str)] = &[
         "spec-to-claims",
         include_str!("../skills/spec-to-claims.md"),
     ),
+    (
+        "architecture-design",
+        include_str!("../skills/architecture-design.md"),
+    ),
+    ("adr", include_str!("../skills/adr.md")),
+    ("data-design", include_str!("../skills/data-design.md")),
+    (
+        "threat-modeling",
+        include_str!("../skills/threat-modeling.md"),
+    ),
+    ("test-strategy", include_str!("../skills/test-strategy.md")),
+    (
+        "operability-design",
+        include_str!("../skills/operability-design.md"),
+    ),
+    (
+        "review-technical",
+        include_str!("../skills/review-technical.md"),
+    ),
+    (
+        "review-product",
+        include_str!("../skills/review-product.md"),
+    ),
+    (
+        "review-leadership",
+        include_str!("../skills/review-leadership.md"),
+    ),
+    (
+        "review-customer",
+        include_str!("../skills/review-customer.md"),
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

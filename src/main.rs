@@ -71,7 +71,7 @@ enum Command {
     /// The knowledge base: what agents learned about your systems (topics, TSGs).
     #[command(subcommand)]
     Kb(KbCommand),
-    /// Ready-made plans: bootstrap, discover, sdlc, learn, spec, implement-spec.
+    /// Ready-made plans: bootstrap, discover, sdlc, learn, spec, design, implement-spec.
     #[command(subcommand)]
     Playbook(PlaybookCommand),
     /// Skills: instructions agents follow in plan steps (skill=name). Built-in ones
@@ -79,9 +79,15 @@ enum Command {
     #[command(subcommand)]
     Skill(SkillCommand),
     /// Spec-driven development: check a feature's spec, REST API contract and UX
-    /// prototype (the checks plan steps run as verify=spec:spec,spec:api,...).
+    /// prototype, its design and its review pack (the checks plan steps run as
+    /// verify=spec:api,design:threats,...).
     #[command(subcommand)]
     Spec(SpecCommand),
+    /// The design package (architecture, ADRs, diagrams, data dictionary, data flows,
+    /// threat model, test and operations plans) and the review pack (decks per
+    /// audience, customer feedback document).
+    #[command(subcommand)]
+    Design(DesignCommand),
     /// Sign a profile in to GitHub (an account of the GitHub CLI) for repositories.
     #[command(subcommand)]
     Github(GithubCommand),
@@ -352,8 +358,17 @@ Use it in a plan step with skill=security-review.")]
 
 #[derive(Subcommand)]
 enum SpecCommand {
-    /// Check the spec package in a folder: spec, api, ux, trace or all.
+    /// Run built-in checks on a folder: a check (api, threats, review:decks, ...), a
+    /// group (spec, design, review) or all.
     #[command(after_help = "\
+checks:
+  spec:spec spec:api spec:ux spec:trace              the spec package (spec/, prototype/, evidence/claims.json)
+  design:arch design:data design:threats             the design package (design/)
+  design:tests design:ops
+  review:decks                                       the review pack (review/)
+'all' (the default) runs the spec checks, and the design and review checks when
+design/ and review/ exist; name a check or a group (spec, design, review) to run it
+anyway. Short names work too: api, threats, decks.
 A spec package is:
   spec/SPEC.md          user stories (US-1: ...) and acceptance criteria (AC-1 (US-1): Given/When/Then)
   spec/openapi.json     the REST API contract; operations list their criteria in x-acceptance
@@ -361,9 +376,10 @@ A spec package is:
   evidence/claims.json  a claim per acceptance criterion, proven later by tests
 examples:
   p2pagents spec check
-  p2pagents spec check api --dir D:\\src\\shop")]
+  p2pagents spec check api --dir D:\\src\\shop
+  p2pagents spec check design")]
     Check {
-        /// Which check: spec, api, ux, trace or all.
+        /// A check, a group (spec, design, review) or all.
         #[arg(default_value = "all")]
         part: String,
         /// The folder holding the package.
@@ -379,6 +395,49 @@ examples:
         /// Replace an existing spec package.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignCommand {
+    /// Create a starter design package and review pack (an example that, with the
+    /// spec starter, passes every check) to edit.
+    #[command(after_help = "\
+It writes:
+  design/architecture.md      context, components, domain model, deployment, quality attributes, decisions
+  design/workflows.md         UML sequence and state diagrams, a workflow per user story
+  design/adr/ADR-0001-*.md    architecture decision records
+  design/data-dictionary.md   every field with type, classification, purpose and retention
+  design/dataflow.md          the data flow diagram with trust boundaries, and the flows (DF-1)
+  design/threat-model.md      STRIDE threats (TM-1) with mitigations, risk and status
+  design/test-plan.md         a test for every acceptance criterion and high-risk threat
+  design/operations.md        rollout, rollback, SLOs, metrics, dashboards, alerts, runbooks
+  review/technical.md         technical review deck (Marp)
+  review/product.md           product review deck (Marp)
+  review/leadership.md        leadership review deck (Marp)
+  review/customer-feedback.md customer feedback document
+Check them with: p2pagents spec check design (and review)")]
+    Init {
+        /// The feature's title.
+        title: String,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Replace an existing design package.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Render the review pack and design documents as self-contained HTML: decks as
+    /// slide shows (speaker notes, print to PDF), documents as pages.
+    #[command(after_help = "\
+Open <out>/index.html in a browser. For PowerPoint, the decks are Marp Markdown:
+  npx @marp-team/marp-cli review/leadership.md --pptx")]
+    Render {
+        /// The folder holding design/, review/ and prototype/.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Where to write the HTML (default: <dir>/review/html).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -735,6 +794,7 @@ async fn main() -> Result<()> {
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
         Some(Command::Spec(command)) => run_spec(command),
+        Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command),
         Some(Command::Repo(command)) => run_repo(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
@@ -1229,20 +1289,59 @@ fn read_input(file: &std::path::Path) -> Result<String> {
     }
 }
 
+/// The built-in checks `part` names: a check (full or short name), a group or all.
+fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
+    use p2pagents::spec::BUILT_IN_CHECKS;
+    let group = |prefix: &str| -> Vec<&'static str> {
+        BUILT_IN_CHECKS
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with(prefix))
+            .collect()
+    };
+    Ok(match part {
+        "all" => {
+            let mut names = group("spec:");
+            for (folder, prefix) in [("design", "design:"), ("review", "review:")] {
+                if dir.join(folder).is_dir() {
+                    names.extend(group(prefix));
+                } else {
+                    println!("{folder}/: not started (p2pagents design init writes a starter)");
+                }
+            }
+            names
+        }
+        "design" | "review" => group(&format!("{part}:")),
+        name if BUILT_IN_CHECKS.contains(&name) => {
+            vec![
+                *BUILT_IN_CHECKS
+                    .iter()
+                    .find(|n| **n == name)
+                    .expect("listed"),
+            ]
+        }
+        short => {
+            let found: Vec<&'static str> = BUILT_IN_CHECKS
+                .iter()
+                .copied()
+                .filter(|n| n.split_once(':').is_some_and(|(_, s)| s == short))
+                .collect();
+            if found.len() != 1 {
+                bail!(
+                    "there is no check '{short}' (checks: {}; groups: spec, design, review, all)",
+                    BUILT_IN_CHECKS.join(", ")
+                );
+            }
+            found
+        }
+    })
+}
+
 fn run_spec(command: SpecCommand) -> Result<()> {
     use p2pagents::spec;
     match command {
         SpecCommand::Check { part, dir } => {
-            let names: Vec<&str> = match part.trim_start_matches("spec:") {
-                "all" => spec::BUILT_IN_CHECKS.to_vec(),
-                one => match spec::BUILT_IN_CHECKS
-                    .iter()
-                    .find(|n| n.strip_prefix("spec:") == Some(one))
-                {
-                    Some(name) => vec![*name],
-                    None => bail!("there is no spec check '{one}' (spec, api, ux, trace or all)"),
-                },
-            };
+            let names = spec_checks(part.trim(), &dir)?;
             let mut failed = Vec::new();
             for name in names {
                 let report = spec::run(name, &dir);
@@ -1272,6 +1371,46 @@ fn run_spec(command: SpecCommand) -> Result<()> {
                 "Edit them, then: p2pagents spec check --dir {}\n\
                  Or let peers write them: pick the 'spec' playbook in Plan mode.",
                 dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_design(command: DesignCommand) -> Result<()> {
+    use p2pagents::{design, preview};
+    match command {
+        DesignCommand::Init { title, dir, force } => {
+            for path in design::init(&dir, &title, force)? {
+                println!("created {path}");
+            }
+            println!(
+                "Edit them, then: p2pagents spec check design --dir {0} (and review)\n\
+                 See the review pack: p2pagents design render --dir {0}\n\
+                 Or let peers write them: pick the 'design' playbook in Plan mode.",
+                dir.display()
+            );
+        }
+        DesignCommand::Render { dir, out } => {
+            let out = out.unwrap_or_else(|| dir.join("review").join("html"));
+            let sources = preview::sources_from_dir(&dir);
+            if preview::label(&sources) != Some("review pack") {
+                bail!(
+                    "{} has no review/ decks or design/ documents to render (p2pagents design init writes a starter)",
+                    dir.display()
+                );
+            }
+            let files = preview::site(&sources);
+            for (path, content) in &files {
+                let target = out.join(path);
+                std::fs::create_dir_all(target.parent().expect("has a parent"))?;
+                std::fs::write(&target, content)
+                    .with_context(|| format!("writing {}", target.display()))?;
+            }
+            println!(
+                "wrote {} files; open {}",
+                files.len(),
+                out.join("index.html").display()
             );
         }
     }
@@ -2163,10 +2302,14 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         a.from,
                         a.title,
                         a.text,
-                        if a.prototype {
-                            "(it comes with a UX prototype: open it from this request in the web UI, --ui)\n"
-                        } else {
-                            ""
+                        match a.preview {
+                            Some("prototype") => {
+                                "(it comes with a UX prototype: open it from this request in the web UI, --ui)\n"
+                            }
+                            Some(_) => {
+                                "(it comes with a review pack, decks and design documents: open it from this request in the web UI, --ui)\n"
+                            }
+                            None => "",
                         },
                         a.id,
                         a.id

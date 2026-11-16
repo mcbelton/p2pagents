@@ -1,11 +1,12 @@
 // Implement a feature from its accepted spec package (spec/SPEC.md, spec/openapi.json,
-// prototype/ and the claims in evidence/claims.json, merged into the folder): the
-// API as the contract says, the UI as the prototype shows, and a test proving every
-// acceptance criterion, verified independently and signed off.
+// prototype/ and the claims in evidence/claims.json, merged into the folder) and, if
+// there is one, its reviewed design (design/): the API as the contract says, the UI
+// as the prototype shows, the mitigations and operations as designed, and a test
+// proving every acceptance criterion, verified independently and signed off.
 // Vars: peer, folder, change (the feature), reviewers (a squad), test, lint, approver
 claim: IMPL-1 The feature is implemented as specified; the owner's tests and lint pass and every criterion is still traced
 claim: IMPL-2 Another peer applied the change on its own copy; the tests and the spec checks pass there too
 claim: IMPL-3 The implementation was accepted against the spec and the prototype
-impl @{{peer}}:{{folder}} skill=implement-change,spec-to-claims context=all verify={{test}},{{lint}},spec:api,spec:trace attempts=3 claims=IMPL-1 Implement this feature from its spec: {{change}}. Read spec/SPEC.md, spec/openapi.json and prototype/. Build the API exactly as the contract says (paths, schemas, status codes, errors) and the UI as the prototype shows. Add a test for every acceptance criterion and name it in that criterion's claim in evidence/claims.json.
+impl @{{peer}}:{{folder}} skill=implement-change,spec-to-claims context=all verify={{test}},{{lint}},spec:api,spec:trace attempts=3 claims=IMPL-1 Implement this feature from its spec: {{change}}. Read spec/SPEC.md, spec/openapi.json, prototype/ and design/ if present (architecture, ADRs, data dictionary, threat model, test plan, operations). Build the API exactly as the contract says (paths, schemas, status codes, errors) and the UI as the prototype shows, with the threat model's mitigations and the operations plan's flag, metrics and logs. Add the test plan's tests (a test for every acceptance criterion) and name each in that criterion's claim in evidence/claims.json.
 verify after impl #{{reviewers}}:{{folder}} skill=code-review apply=impl verify={{test}},spec:trace claims=IMPL-2 Review this change against spec/SPEC.md and spec/openapi.json: does every acceptance criterion have a test that really proves it, and does the API follow the contract? Report each gap.
 signoff after verify approve @{{approver}} claims=IMPL-3 Accept: {{change}}, implemented as specified.

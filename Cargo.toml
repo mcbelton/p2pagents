@@ -1,6 +1,6 @@
 [package]
 name = "p2pagents"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Peer-to-peer LLM agents: delegate coding tasks across agents over the internet using the GitHub Copilot, Claude Agent and Codex SDKs"
 license = "MIT OR Apache-2.0"
@@ -16,6 +16,7 @@ futures-util = "0.3.34"
 github-copilot-sdk = { version = "1.0.34", default-features = false, features = ["runtime"] }
 iroh = "1.4.1"
 keyring = "4.2.0"
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 rpassword = "7.5.5"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

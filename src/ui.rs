@@ -73,9 +73,12 @@ struct TaskView {
     /// For peers' results: "verified" (signed by the peer for this output) or "unverified".
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<&'static str>,
-    /// The sandboxed preview of the UX prototype the task created, if any.
+    /// The sandboxed preview of what the task created (a UX prototype, or a review
+    /// pack of decks and design documents), and which of the two it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_label: Option<&'static str>,
 }
 
 impl TaskView {
@@ -228,7 +231,8 @@ impl Shared {
         })
     }
 
-    /// This agent's shared folders, each marked if it holds a UX prototype to preview.
+    /// This agent's shared folders, each with what it can preview ("prototype" or
+    /// "review pack"), if anything.
     fn shares_json(&self) -> Value {
         let shares: Vec<Value> = self
             .agent
@@ -237,8 +241,17 @@ impl Shared {
             .iter()
             .map(|share| {
                 let mut v = json!(share);
-                let index = share.path.join("prototype").join("index.html");
-                v["prototype"] = json!(std::fs::symlink_metadata(index).is_ok_and(|m| m.is_file()));
+                let is = |rel: &str, dir: bool| {
+                    std::fs::symlink_metadata(share.path.join(rel))
+                        .is_ok_and(|m| if dir { m.is_dir() } else { m.is_file() })
+                };
+                v["preview"] = if is("review", true) || is("design", true) {
+                    json!("review pack")
+                } else if is("prototype/index.html", false) {
+                    json!("prototype")
+                } else {
+                    Value::Null
+                };
                 v
             })
             .collect();
@@ -509,24 +522,25 @@ fn serve_preview(s: &Shared, cap: &str, path: &str) -> Response {
 
 #[derive(Deserialize)]
 struct PreviewBody {
-    /// A folder this agent shares: its `prototype/` now.
+    /// A folder this agent shares: its prototype, decks and design documents now.
     share: Option<String>,
-    /// A saved run and step: the prototype files the step's patch created.
+    /// A saved run and step: what the step's patch created.
     run: Option<String>,
     step: Option<String>,
-    /// An open approval request that came with a prototype.
+    /// An open approval request that came with something to preview.
     approval: Option<u64>,
 }
 
-/// Opens a sandboxed preview of a UX prototype; returns its capability URL.
+/// Opens a sandboxed preview of a UX prototype or a review pack; returns its
+/// capability URL.
 async fn create_preview(
     State(s): State<AppState>,
     Json(body): Json<PreviewBody>,
 ) -> Result<Json<Value>, ApiError> {
     let files = if let Some(id) = body.approval {
         s.agent
-            .approval_prototype(id)
-            .ok_or_else(|| bad_request("that approval request has no prototype"))?
+            .approval_preview(id)
+            .ok_or_else(|| bad_request("that approval request has nothing to preview"))?
     } else if let (Some(run), Some(step)) = (&body.run, &body.step) {
         validate_name(run)
             .and(validate_name(step))
@@ -539,7 +553,7 @@ async fn create_preview(
             .join(format!("{step}.patch"));
         let patch = std::fs::read_to_string(path)
             .map_err(|_| bad_request(format!("run {run} has no patch for step {step}")))?;
-        crate::preview::from_patch(&patch)
+        crate::preview::site(&crate::preview::sources_from_patch(&patch))
     } else if let Some(name) = &body.share {
         let path = s
             .agent
@@ -547,16 +561,19 @@ async fn create_preview(
             .get(name)
             .map(|share| share.path.clone())
             .ok_or_else(|| bad_request(format!("this agent shares no folder '{name}'")))?;
-        tokio::task::spawn_blocking(move || crate::preview::from_dir(&path))
-            .await
-            .map_err(internal)?
+        tokio::task::spawn_blocking(move || {
+            crate::preview::site(&crate::preview::sources_from_dir(&path))
+        })
+        .await
+        .map_err(internal)?
     } else {
         return Err(bad_request("give a share, a run and step, or an approval"));
     };
-    let cap = s
-        .previews
-        .add(files)
-        .ok_or_else(|| bad_request("there is no prototype/index.html to preview"))?;
+    let cap = s.previews.add(files).ok_or_else(|| {
+        bad_request(
+            "there is nothing to preview (no prototype/index.html, review/ decks or design/ documents)",
+        )
+    })?;
     Ok(Json(json!({ "url": format!("/preview/{cap}/") })))
 }
 
@@ -714,6 +731,7 @@ async fn create_task(
         approval: false,
         evidence: None,
         preview: None,
+        preview_label: None,
     };
     s.tasks.lock().unwrap().push(view.clone());
     s.send(json!({ "type": "task", "task": view }));
@@ -871,6 +889,7 @@ async fn create_plan(
             approval: step.approve,
             evidence: None,
             preview: None,
+            preview_label: None,
         };
         s.tasks.lock().unwrap().push(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -907,10 +926,14 @@ async fn create_plan(
                     t.evidence = evidence
                         .as_ref()
                         .map(|_| if *verified { "verified" } else { "unverified" });
-                    t.preview = patch
-                        .as_deref()
-                        .and_then(|p| shared.previews.add(crate::preview::from_patch(p)))
-                        .map(|cap| format!("/preview/{cap}/"));
+                    if let Some(patch) = patch.as_deref() {
+                        let sources = crate::preview::sources_from_patch(patch);
+                        t.preview_label = crate::preview::label(&sources);
+                        t.preview = t
+                            .preview_label
+                            .and_then(|_| shared.previews.add(crate::preview::site(&sources)))
+                            .map(|cap| format!("/preview/{cap}/"));
+                    }
                 }
                 StepState::Failed {
                     error,
@@ -1377,14 +1400,16 @@ async fn get_run(
             Err(e) => json!({ "step": step, "ok": false, "text": format!("{e:#}") }),
         })
         .collect();
-    // Steps whose patch created a UX prototype (POST /api/previews opens one).
-    let prototypes: Vec<&str> = run
+    // Steps whose patch created something to preview (POST /api/previews opens it).
+    let previews: Vec<Value> = run
         .steps
         .iter()
         .map(|s| s.step.id.as_str())
-        .filter(|step| {
-            std::fs::read_to_string(dir.join(&run.id).join(format!("{step}.patch")))
-                .is_ok_and(|p| crate::preview::from_patch(&p).contains_key("index.html"))
+        .filter_map(|step| {
+            let patch =
+                std::fs::read_to_string(dir.join(&run.id).join(format!("{step}.patch"))).ok()?;
+            let label = crate::preview::label(&crate::preview::sources_from_patch(&patch))?;
+            Some(json!({ "step": step, "label": label }))
         })
         .collect();
     Ok(Json(json!({
@@ -1392,7 +1417,7 @@ async fn get_run(
         "verdict": run.verdict_line(),
         "report": run.render_markdown(),
         "signatures": checks,
-        "prototypes": prototypes,
+        "previews": previews,
     })))
 }
 

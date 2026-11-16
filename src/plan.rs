@@ -608,7 +608,7 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
     }
     if step.checks.iter().any(|c| !crate::spec::is_built_in(c)) && share.access < Access::Full {
         return Some(format!(
-            "verify= with the folder's own checks needs full access, you have {} in '{folder}' on {} (built-in spec:* checks need only read access)",
+            "verify= with the folder's own checks needs full access, you have {} in '{folder}' on {} (built-in spec:, design: and review: checks need only read access)",
             share.access, peer.name
         ));
     }
@@ -790,6 +790,22 @@ pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
     prompt
 }
 
+/// The steps `id` waits for, directly or through others.
+fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let mut todo = vec![id.to_owned()];
+    while let Some(current) = todo.pop() {
+        if let Some(step) = plan.steps.iter().find(|s| s.id == current) {
+            for dep in &step.after {
+                if found.insert(dep.clone()) {
+                    todo.push(dep.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
 /// returns each step's final state. Dropping the future cancels running steps.
 pub async fn run_plan(
@@ -849,16 +865,21 @@ pub async fn run_plan(
                     })
                     .collect();
                 let prompt = step_prompt(step, &deps);
-                // An approver sees the UX prototype its earlier steps created.
-                let prototype: BTreeMap<String, String> = if step.approve {
-                    crate::preview::from_patches(step.after.iter().filter_map(|d| {
-                        match &states[d] {
-                            StepState::Done {
-                                patch: Some(patch), ..
-                            } => Some(patch.as_str()),
-                            _ => None,
-                        }
-                    }))
+                // An approver sees what the steps before it created (directly or
+                // through other approvals): the prototype, decks and design documents.
+                let preview: BTreeMap<String, String> = if step.approve {
+                    let earlier = ancestors(plan, &step.id);
+                    crate::preview::sources_from_patches(
+                        plan.steps
+                            .iter()
+                            .filter(|s| earlier.contains(&s.id))
+                            .filter_map(|s| match &states[&s.id] {
+                                StepState::Done {
+                                    patch: Some(patch), ..
+                                } => Some(patch.as_str()),
+                                _ => None,
+                            }),
+                    )
                     .into_iter()
                     .map(|(path, bytes)| (path, String::from_utf8_lossy(&bytes).into_owned()))
                     .collect()
@@ -923,7 +944,7 @@ pub async fn run_plan(
                         (Some(peer), Some(task)) => agent.delegate_verified(peer, task).await,
                         (approver, _) => {
                             agent
-                                .request_approval_with(approver, &title, &prompt, prototype)
+                                .request_approval_with(approver, &title, &prompt, preview)
                                 .await
                         }
                     };

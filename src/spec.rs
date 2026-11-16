@@ -14,15 +14,32 @@
 //!   which development then proves.
 //!
 //! Plan steps run them as checks named `spec:spec`, `spec:api`, `spec:ux` and
-//! `spec:trace`. They only read files, so peers may ask for them at any access level.
+//! `spec:trace`; the design package and the review pack have their own (see
+//! [`crate::design`]). They only read files, so peers may ask for them at any access
+//! level.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::Value;
 
-/// The checks this module provides, by check name.
-pub const BUILT_IN_CHECKS: &[&str] = &["spec:spec", "spec:api", "spec:ux", "spec:trace"];
+/// The spec package's checks.
+pub const SPEC_CHECKS: &[&str] = &["spec:spec", "spec:api", "spec:ux", "spec:trace"];
+
+/// Every built-in check, by name: the spec package's, the design package's and the
+/// review pack's.
+pub const BUILT_IN_CHECKS: &[&str] = &[
+    "spec:spec",
+    "spec:api",
+    "spec:ux",
+    "spec:trace",
+    "design:arch",
+    "design:data",
+    "design:threats",
+    "design:tests",
+    "design:ops",
+    "review:decks",
+];
 
 pub fn is_built_in(check: &str) -> bool {
     BUILT_IN_CHECKS.contains(&check)
@@ -64,6 +81,9 @@ pub fn run(name: &str, dir: &Path) -> Report {
         "spec:api" => check_api(dir),
         "spec:ux" => check_ux(dir),
         "spec:trace" => check_trace(dir),
+        _ if name.starts_with("design:") || name.starts_with("review:") => {
+            crate::design::run(name, dir)
+        }
         _ => Report {
             problems: vec![format!("unknown built-in check {name}")],
             notes: vec![],
@@ -81,14 +101,14 @@ pub struct Spec {
     pub duplicates: Vec<String>,
 }
 
-fn id_with(prefix: &str, text: &str) -> Option<String> {
+pub(crate) fn id_with(prefix: &str, text: &str) -> Option<String> {
     let rest = text.strip_prefix(prefix)?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     (!digits.is_empty()).then(|| format!("{prefix}{digits}"))
 }
 
 /// Ids like `US-3` mentioned anywhere in `text`.
-fn mentions(prefix: &str, text: &str) -> Vec<String> {
+pub(crate) fn mentions(prefix: &str, text: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut rest = text;
     while let Some(i) = rest.find(prefix) {
@@ -147,11 +167,11 @@ pub fn parse_spec(text: &str) -> Spec {
 }
 
 /// Largest file the checks read.
-const MAX_FILE: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_FILE: u64 = 2 * 1024 * 1024;
 
 /// Reads `rel` inside `dir` without following symbolic links (built-in checks run in
 /// this process, outside any sandbox, so a link must not lead them out of the folder).
-fn read_inside(dir: &Path, rel: &str) -> Result<String, String> {
+pub(crate) fn read_inside(dir: &Path, rel: &str) -> Result<String, String> {
     let mut path = dir.to_path_buf();
     for part in Path::new(rel).components() {
         path.push(part);
@@ -171,7 +191,7 @@ fn read_inside(dir: &Path, rel: &str) -> Result<String, String> {
     }
 }
 
-fn read(dir: &Path, rel: &str, report: &mut Report) -> Option<String> {
+pub(crate) fn read(dir: &Path, rel: &str, report: &mut Report) -> Option<String> {
     match read_inside(dir, rel) {
         Ok(text) => Some(text),
         Err(problem) => {
@@ -181,7 +201,7 @@ fn read(dir: &Path, rel: &str, report: &mut Report) -> Option<String> {
     }
 }
 
-fn load_spec(dir: &Path, report: &mut Report) -> Option<Spec> {
+pub(crate) fn load_spec(dir: &Path, report: &mut Report) -> Option<Spec> {
     read(dir, "spec/SPEC.md", report).map(|t| parse_spec(&t))
 }
 
@@ -378,7 +398,7 @@ fn check_media(media: &Value, root: &Value, at: &str, r: &mut Report) {
 }
 
 /// The API contract's operations: (method path, operation).
-fn operations(api: &Value) -> Vec<(String, &Value)> {
+pub(crate) fn operations(api: &Value) -> Vec<(String, &Value)> {
     let mut ops = Vec::new();
     for (path, item) in api
         .get("paths")
@@ -395,7 +415,7 @@ fn operations(api: &Value) -> Vec<(String, &Value)> {
     ops
 }
 
-fn load_api(dir: &Path, r: &mut Report) -> Option<Value> {
+pub(crate) fn load_api(dir: &Path, r: &mut Report) -> Option<Value> {
     let text = read(dir, "spec/openapi.json", r)?;
     match serde_json::from_str(&text) {
         Ok(v) => Some(v),
@@ -701,7 +721,7 @@ const STARTER_SPEC: &str = include_str!("../spec-starter/SPEC.md");
 const STARTER_API: &str = include_str!("../spec-starter/openapi.json");
 const STARTER_PROTOTYPE: &str = include_str!("../spec-starter/index.html");
 
-fn escape_html(text: &str) -> String {
+pub(crate) fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -835,7 +855,7 @@ mod tests {
     #[test]
     fn a_complete_spec_package_passes_every_check() {
         let dir = package();
-        for name in BUILT_IN_CHECKS {
+        for name in SPEC_CHECKS {
             let report = run(name, dir.path());
             assert!(report.passed(), "{name}: {}", report.text());
         }
@@ -937,7 +957,7 @@ mod tests {
                 .any(|w| w == "evidence/claims.json (4 claims added)"),
             "{written:?}"
         );
-        for name in BUILT_IN_CHECKS {
+        for name in SPEC_CHECKS {
             let report = run(name, p);
             assert!(report.passed(), "{name}: {}", report.text());
         }

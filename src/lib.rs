@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod audit;
 pub mod auth;
+pub mod design;
 pub mod evidence;
 pub mod github;
 pub mod knowledge;
@@ -17,6 +18,7 @@ pub mod playbooks;
 pub mod preview;
 pub mod profile;
 pub mod protocol;
+pub mod render;
 pub mod runs;
 pub mod setup;
 pub mod shares;

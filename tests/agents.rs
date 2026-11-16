@@ -47,7 +47,17 @@ impl Executor for FakeExecutor {
     }
 
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
-        if let Some(file) = task.prompt.strip_prefix("write ") {
+        // "create <file>" as a plan step's own task (after the earlier steps' results).
+        let own = task
+            .prompt
+            .rsplit("Your task:\n")
+            .next()
+            .unwrap_or(&task.prompt);
+        if let Some(file) = task
+            .prompt
+            .strip_prefix("write ")
+            .or_else(|| own.strip_prefix("create "))
+        {
             let path = ctx.workspace.join(file);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1070,7 +1080,7 @@ async fn built_in_spec_checks_prove_a_spec_package_with_read_only_access() {
     boss.connect(worker.addr()).await.unwrap();
     wait_for_peers(&boss, 1).await;
 
-    let all: Vec<String> = p2pagents::spec::BUILT_IN_CHECKS
+    let all: Vec<String> = p2pagents::spec::SPEC_CHECKS
         .iter()
         .map(|c| (*c).to_owned())
         .collect();
@@ -1182,7 +1192,7 @@ async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch()
 }
 
 #[tokio::test]
-async fn approvers_preview_the_prototype_an_earlier_step_created() {
+async fn approvers_preview_the_prototype_and_review_pack_earlier_steps_created() {
     let repo = git_repo();
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let (mut boss, mut alice) = (Node::new("boss"), Node::new("alice"));
@@ -1208,29 +1218,46 @@ async fn approvers_preview_the_prototype_an_earlier_step_created() {
     wait_for_peers(&boss, 2).await;
 
     let plan = Plan::parse(
-        "ux @worker:repo write prototype/index.html\n\
-         product-ok after ux approve @alice Accept the prototype",
+        "ux @worker:repo create prototype/index.html\n\
+         pack after ux @worker:repo apply=ux create review/leadership.md\n\
+         product-ok after ux approve @alice Accept the prototype\n\
+         lt-ok after pack,product-ok approve @alice Accept the plan",
     )
     .unwrap();
     let reviewer = {
         let alice = alice.clone();
         tokio::spawn(async move {
-            let Event::ApprovalRequested { id, .. } = next_matching(&mut alice_events, |e| {
-                matches!(e, Event::ApprovalRequested { .. })
-            })
-            .await
-            else {
-                unreachable!()
-            };
-            let request = alice.approvals().into_iter().find(|a| a.id == id).unwrap();
-            assert!(request.prototype, "{request:?}");
-            let files = alice.approval_prototype(id).unwrap();
-            assert_eq!(files["index.html"], b"made by the model\n");
-            alice
-                .answer_approval(id, true, "clicked through it")
-                .await
-                .unwrap();
-            assert!(alice.approval_prototype(id).is_none(), "gone once answered");
+            for _ in 0..2 {
+                let Event::ApprovalRequested { id, title, .. } =
+                    next_matching(&mut alice_events, |e| {
+                        matches!(e, Event::ApprovalRequested { .. })
+                    })
+                    .await
+                else {
+                    unreachable!()
+                };
+                let request = alice.approvals().into_iter().find(|a| a.id == id).unwrap();
+                let site = alice.approval_preview(id).unwrap();
+                if title.ends_with("product-ok") {
+                    assert_eq!(request.preview, Some("prototype"), "{request:?}");
+                    assert_eq!(site["index.html"], b"made by the model\n");
+                } else {
+                    // Through product-ok too: everything the earlier steps created.
+                    assert_eq!(request.preview, Some("review pack"), "{request:?}");
+                    let index = String::from_utf8_lossy(&site["index.html"]).into_owned();
+                    assert!(
+                        index.contains("href=\"review/leadership.html\"")
+                            && index.contains("href=\"prototype/index.html\""),
+                        "{index}"
+                    );
+                    assert!(site.contains_key("review/leadership.html"));
+                }
+                alice
+                    .answer_approval(id, true, "clicked through it")
+                    .await
+                    .unwrap();
+                assert!(alice.approval_preview(id).is_none(), "gone once answered");
+            }
         })
     };
     let states = timeout(
@@ -1240,11 +1267,13 @@ async fn approvers_preview_the_prototype_an_earlier_step_created() {
     .await
     .expect("the plan finished");
     reviewer.await.unwrap();
-    assert!(
-        matches!(&states["product-ok"], StepState::Done { output, .. } if output.starts_with("Approved by alice")),
-        "{:?}",
-        states["product-ok"]
-    );
+    for step in ["product-ok", "lt-ok"] {
+        assert!(
+            matches!(&states[step], StepState::Done { output, .. } if output.starts_with("Approved by alice")),
+            "{step}: {:?}",
+            states[step]
+        );
+    }
 }
 
 #[tokio::test]

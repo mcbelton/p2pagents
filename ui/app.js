@@ -251,8 +251,8 @@ async function copy(text, what) {
   }
 }
 
-// A UX prototype opens in a new tab. The server sandboxes it (opaque origin, no
-// network), and the tab is cut off from this page before it loads.
+// A UX prototype or a review pack opens in a new tab. The server sandboxes it
+// (opaque origin, no network), and the tab is cut off from this page before it loads.
 async function openPreview(body, button) {
   const tab = window.open("", "_blank");
   if (tab) tab.opener = null;
@@ -271,6 +271,11 @@ async function openPreview(body, button) {
 
 function previewLink(href, label = "Open prototype") {
   return el("a", { class: "btn small", href, target: "_blank", rel: "noopener noreferrer" }, label);
+}
+
+/// Button text for a preview: "prototype" or "review pack".
+function previewText(label) {
+  return label === "review pack" ? "Open review pack" : "Open prototype";
 }
 
 // ---------- rendering ----------
@@ -307,11 +312,13 @@ function renderMe() {
         ...me.shares.map((s) => el("li", {},
           el("strong", { text: s.name }), ` · at most ${ACCESS_SHORT[s.max_access] ?? s.max_access}`,
           el("div", { class: "mono small", text: s.path }),
-          s.prototype ? el("button", {
+          s.preview ? el("button", {
             type: "button", class: "btn small link",
-            title: "Preview prototype/index.html of this folder in a sandboxed tab",
+            title: s.preview === "review pack"
+              ? "Preview this folder's review decks, design documents and prototype in a sandboxed tab"
+              : "Preview prototype/index.html of this folder in a sandboxed tab",
             onclick: (e) => openPreview({ share: s.name }, e.currentTarget),
-          }, "Preview prototype") : null))));
+          }, s.preview === "review pack" ? "Preview review pack" : "Preview prototype") : null))));
     }
   } else {
     fact("Providers", "None (delegates only)");
@@ -436,9 +443,15 @@ function taskNode(t) {
     el("p", { class: "task-prompt", text: t.prompt }),
     meta);
   if (t.preview) {
+    const pack = t.preview_label === "review pack";
     node.append(el("div", { class: "task-actions" },
-      previewLink(t.preview, "Open prototype"),
-      el("span", { class: "task-meta", text: "Sandboxed preview of the UX prototype this step created" })));
+      previewLink(t.preview, previewText(t.preview_label)),
+      el("span", {
+        class: "task-meta",
+        text: pack
+          ? "Sandboxed preview of the decks, design documents and prototype this step created"
+          : "Sandboxed preview of the UX prototype this step created",
+      })));
   }
   if (t.status === "running" || (t.plan && t.status === "waiting")) {
     node.append(el("button", {
@@ -595,9 +608,14 @@ function renderApprovals() {
         el("span", { class: "status waiting", text: "Needs you" })),
       el("details", {}, el("summary", { text: "What you're approving" }),
         el("div", { class: "result", tabindex: "0" }, renderMarkdown(a.text))),
-      a.prototype ? el("div", { class: "task-actions" },
-        el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ approval: a.id }, e.currentTarget) }, "Open prototype"),
-        el("span", { class: "task-meta", text: "Click through the UX prototype before you answer" })) : null,
+      a.preview ? el("div", { class: "task-actions" },
+        el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ approval: a.id }, e.currentTarget) }, previewText(a.preview)),
+        el("span", {
+          class: "task-meta",
+          text: a.preview === "review pack"
+            ? "Read the decks and design documents, and click through the prototype, before you answer"
+            : "Click through the UX prototype before you answer",
+        })) : null,
       note,
       error,
       el("div", { class: "approval-actions" },
@@ -634,9 +652,9 @@ async function openRun(id) {
     $("#run-verdict").dataset.pass = String(run.summary.passed);
     $("#run-signatures").replaceChildren(...run.signatures.map((s) => el("li", { class: s.ok ? "ok" : "bad" },
       el("strong", { text: `${s.ok ? "✓" : "✗"} ${s.step}: ` }), s.text)));
-    $("#run-prototypes").replaceChildren(...(run.prototypes ?? []).map((step) =>
-      el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ run: id, step }, e.currentTarget) },
-        `Open prototype of step ${step}`)));
+    $("#run-prototypes").replaceChildren(...(run.previews ?? []).map((p) =>
+      el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ run: id, step: p.step }, e.currentTarget) },
+        `${previewText(p.label)} of step ${p.step}`)));
     $("#run-report").replaceChildren(renderMarkdown(run.report));
     $("#run-dialog").showModal();
     $("#run-close").focus();
@@ -699,15 +717,17 @@ function renderPlanExplain() {
 }
 
 const CHECK_VARS = new Set(["build", "test", "lint", "secscan", "licenses", "secrets"]);
-const APPROVER_VARS = new Set(["approver", "privacy_approver", "product_owner", "tech_lead"]);
+const APPROVER_VARS = new Set(["approver", "privacy_approver", "product_owner", "tech_lead", "security_champion", "leader"]);
 const VAR_HELP = {
   peer: "The peer that does the work (connected peers that run tasks)",
   folder: "A folder that peer shares with you",
   reviewers: "A squad whose members review independently",
   approver: "Who signs off",
-  privacy_approver: "Who accepts the privacy review",
-  product_owner: "Who accepts the spec and clicks through the prototype",
-  tech_lead: "Who accepts the REST API contract",
+  privacy_approver: "Who accepts the privacy review (data dictionary and data flows)",
+  product_owner: "Who accepts the spec, the prototype and the product review",
+  tech_lead: "Who accepts the API contract and the technical review",
+  security_champion: "Who accepts the threat model",
+  leader: "Who accepts the plan in the leadership review",
   change: "What to change, in a sentence",
   change_id: "A short id for this change (letters, digits, -)",
   project: "The project's name",

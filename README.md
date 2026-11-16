@@ -634,6 +634,7 @@ p2pagents playbook show discover  --set peer=alice --set folder=repo > discover.
 p2pagents playbook show sdlc --set peer=alice --set change="Add CSV export" --set change_id=csv > csv.plan
 p2pagents playbook show learn --set peer=alice > learn.plan                           # learn from operations
 p2pagents playbook show spec --set peer=alice --set change="Wishlist" --set change_id=wish > wish.plan  # spec first
+p2pagents playbook show design --set peer=alice --set change="Wishlist" --set change_id=wish > design.plan  # then design and reviews
 ```
 
 In the web UI: **Plan** mode, pick a playbook, then **Use**.
@@ -645,7 +646,8 @@ In the web UI: **Plan** mode, pick a playbook, then **Use**.
 | `sdlc` | Design, then implementation (`test`, `lint`), then independent verification by a reviewer squad applying the patch. Security scan plus accepted review, privacy review accepted by the privacy champion, license and secret scans (`licenses`, `secrets`), then release approval |
 | `learn` | Insights about usage, health and recurring failures, plus TSG drafts for failures without one, accepted by a person |
 | `spec` | Spec-driven: a feature's spec (user stories, testable acceptance criteria, security and privacy), its REST API contract with examples, a clickable UX prototype and a claim per criterion. Each is proven by built-in checks, then the product owner (who clicks through the prototype) and the tech lead accept it. See [Spec-driven development](#spec-driven-development) |
-| `implement-spec` | The accepted spec built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
+| `design` | The SDLC design of an accepted spec: architecture with context, component, UML and workflow diagrams, ADRs, data dictionary and data flows, threat model, test and operations plans, then a review pack with a deck per audience and a customer feedback document. Each is proven by built-in checks, then the tech lead, security and privacy champions, product owner and leadership review it. See [Design and reviews](#design-and-reviews) |
+| `implement-spec` | The accepted spec (and design) built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
 your folder's checks (`share add --check ...`); rename them with `--set test=unit` etc.
@@ -664,6 +666,8 @@ put in the step's prompt, so every peer and provider works the same way. Built-i
 | `security-review`, `privacy-review`, `compliance-check` | SDLC gates: vulnerability classes, personal data handling, licenses and secrets |
 | `ops-insights`, `tsg-writing`, `incident-debugging` | Learning from operations, writing troubleshooting guides, the debugging agent |
 | `write-spec`, `api-contract`, `prototype-ux`, `spec-to-claims` | Spec-driven development: a testable spec, a REST API contract, a self-contained UX prototype, and claims from acceptance criteria |
+| `architecture-design`, `adr`, `data-design`, `threat-modeling`, `test-strategy`, `operability-design` | The design package: architecture and diagrams, decision records, data dictionary and flows, STRIDE threat model, test plan, operations plan |
+| `review-technical`, `review-product`, `review-leadership`, `review-customer` | The review pack, each in its audience's tone: technical, product (PM), leadership (LT) decks and the customer feedback document |
 
 Add your team's own, or replace a built-in one with the same name:
 
@@ -680,8 +684,8 @@ p2pagents skill add security-review .\our-security-checklist.md --profile boss  
 - your squads;
 - knowledge topics and skills.
 
-`verify=` with the folder's own checks needs full access (the built-in `spec:*` checks
-need only read access), `apply=` a `--worktrees` folder, and approvers must be
+`verify=` with the folder's own checks needs full access (the built-in `spec:`, `design:`
+and `review:` checks need only read access), `apply=` a `--worktrees` folder, and approvers must be
 connected. A plan with errors is not started, and every reason is listed. The web UI
 checks plans as you type and shows the problems under the editor.
 
@@ -816,6 +820,77 @@ p2pagents playbook show spec --set peer=alice --set folder=shop --set change="Sh
   --set change_id=wish --set product_owner=carol --set tech_lead=me > wish.plan
 p2pagents playbook show implement-spec --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > build.plan
 ```
+
+### Design and reviews
+
+Between an accepted spec and its implementation, the `design` playbook produces the
+SDLC artifacts reviewers need. Every artifact is proven by a built-in check and traced
+to the spec. Then each audience reviews it in its own form.
+
+**The design package** lives in `design/`. Diagrams are Mermaid: they render on GitHub
+(in the pull request) and in VS Code.
+
+| File | What it holds | Checked by |
+| --- | --- | --- |
+| `architecture.md` | Context diagram, components (table and component diagram), domain model (UML class or ER diagram), deployment, quality attributes with targets, and the list of decisions | `design:arch` |
+| `workflows.md` | A UML sequence diagram per workflow, each named after the user story it implements (all stories covered); state or activity diagrams | `design:arch` |
+| `adr/ADR-0001-*.md` | Architecture decision records: status (Proposed, Accepted, ...), context, decision, alternatives considered, consequences | `design:arch` |
+| `data-dictionary.md` | Every field (every property of the API's schemas, and what is stored besides): type, classification (Public, Internal, Confidential, Personal, Sensitive) and, for personal data, purpose and retention | `design:data` |
+| `dataflow.md` | The data flow diagram with every trust boundary as a subgraph, and a table of flows (`DF-1`): what data moves, whether it crosses a boundary, how it is protected. Every entity with personal data is in a flow | `design:data` |
+| `threat-model.md` | Assets, trust boundaries and STRIDE threats (`TM-1`): element, category, threat, mitigation, risk, status. All six categories, every boundary flow covered, no open high risk | `design:threats` |
+| `test-plan.md` | A test for every acceptance criterion and every high-risk threat, at a level that proves it (criteria the API serves need contract, integration or e2e tests), plus how performance and security are tested | `design:tests` |
+| `operations.md` | Rollout (flag, rings), rollback, an SLO with a target, metrics, dashboard, an alert table with actions, and runbooks | `design:ops` |
+
+**The review pack** lives in `review/`. The decks are [Marp](https://marp.app) Markdown:
+slides separated by `---`, speaker notes in `<!-- -->` comments.
+
+| File | Audience and tone | `review:decks` holds it to |
+| --- | --- | --- |
+| `technical.md` | Engineers and architects: precise, evidence-backed, decision-focused | at most 30 slides; architecture, ADRs, API, data, threats, tests, operations, open questions; cites existing ADR and threat ids |
+| `product.md` | Product owner and PMs: user value, prototype walkthrough, scope, measurable success | at most 20 slides; problem, every user story, prototype, scope, success metrics, release plan, decisions needed |
+| `leadership.md` | Leadership team: bottom line up front, outcomes, risks, one clear ask | at most 12 slides; summary first, then impact, timeline, risks and ask; under 91 words a slide; no code, diagrams source or internal ids |
+| `customer-feedback.md` | Customers: warm, plain, about them, honest about scope | what we heard, what we're building, how it helps, what's not included, at least 3 questions, next steps; no internal ids, security details or email addresses |
+
+Start from a working example, or let agents write it:
+
+```powershell
+p2pagents spec init "Wishlist" --dir D:\src\shop
+p2pagents design init "Wishlist" --dir D:\src\shop     # design/ and review/ starters that pass every check
+p2pagents spec check design --dir D:\src\shop          # or: spec check (everything present), threats, review
+p2pagents design render --dir D:\src\shop              # review/html/index.html: decks as slide shows, documents as pages
+npx @marp-team/marp-cli D:\src\shop\review\leadership.md --pptx   # a PowerPoint, if your reviewers want one
+p2pagents playbook show design --set peer=alice --set folder=shop --set change="Wishlist" --set change_id=wish `
+  --set tech_lead=bob --set security_champion=sam --set privacy_approver=pat --set product_owner=carol --set leader=lee > design.plan
+```
+
+The `design` playbook runs on a peer, in the folder's worktree, each step building on
+the previous one's commit:
+
+1. **arch**: `architecture-design` and `adr` skills, `verify=design:arch`.
+2. **data**: `data-design`, `verify=design:data`.
+3. **threats**: `threat-modeling`, `verify=design:threats`.
+4. **plans**: `test-strategy` and `operability-design`, `verify=design:tests,design:ops`.
+5. **pack**: the four review skills, all six checks.
+
+Then the reviews:
+
+- The tech lead accepts the design (technical deck).
+- The security champion accepts the threat model.
+- The privacy approver accepts the data handling.
+- The product owner accepts the product review and approves sharing the customer
+  document.
+- Leadership reviews last.
+
+Every approval request carries the **review pack**. The approver opens it from the
+request (**Open review pack**), or from the step or saved run in the web UI:
+
+- the decks as slide shows: arrow keys, **Speaker notes**, **All slides**, **Print / PDF**;
+- the design documents;
+- the prototype.
+
+It is served in the same sandbox as prototypes. Decks and documents are rendered
+without their raw HTML, so a model's or a peer's Markdown can't run script. Shared
+folders with `design/` or `review/` offer **Preview review pack** too.
 
 ### Options
 
@@ -1105,7 +1180,9 @@ Workflow for a change:
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
 - [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec and implement-spec plan templates
 - [src/spec.rs](src/spec.rs) and [spec-starter/](spec-starter): the built-in spec checks (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) and the `spec init` starter package
-- [src/preview.rs](src/preview.rs): sandboxed previews of UX prototypes (from a step's patch, a shared folder or an approval request)
+- [src/design.rs](src/design.rs) and [design-starter/](design-starter): the design and review checks (`design:arch`, `design:data`, `design:threats`, `design:tests`, `design:ops`, `review:decks`) and the `design init` starter
+- [src/render.rs](src/render.rs): Markdown to self-contained HTML: Marp decks as slide shows, documents as pages, without raw HTML
+- [src/preview.rs](src/preview.rs): sandboxed previews of UX prototypes and review packs (from a step's patch, a shared folder or an approval request)
 - [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
 - [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)

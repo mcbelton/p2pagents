@@ -651,6 +651,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             "sdlc",
             "learn",
             "spec",
+            "design",
             "implement-spec"
         ]
     );
@@ -766,7 +767,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
 }
 
 #[tokio::test]
-async fn ui_previews_prototypes_in_a_sandbox_by_capability() {
+async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
     let home = tempfile::tempdir().unwrap();
     let app = tempfile::tempdir().unwrap();
     p2pagents::spec::init(app.path(), "Wishlist", false).unwrap();
@@ -811,20 +812,18 @@ async fn ui_previews_prototypes_in_a_sandbox_by_capability() {
     let state = request(port, "GET", "/api/state", &host, Some(token), None)
         .await
         .json();
-    let marked: Vec<(String, bool)> = state["me"]["shares"]
+    let marked: Vec<(String, Value)> = state["me"]["shares"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|s| {
-            (
-                s["name"].as_str().unwrap().to_owned(),
-                s["prototype"] == true,
-            )
-        })
+        .map(|s| (s["name"].as_str().unwrap().to_owned(), s["preview"].clone()))
         .collect();
     assert_eq!(
         marked,
-        [("data".to_owned(), false), ("app".to_owned(), true)],
+        [
+            ("data".to_owned(), Value::Null),
+            ("app".to_owned(), Value::from("prototype"))
+        ],
         "folders holding a prototype are marked for preview"
     );
 
@@ -902,8 +901,55 @@ async fn ui_previews_prototypes_in_a_sandbox_by_capability() {
     .await;
     assert_eq!(escape.status, 404, "only prototype files are served");
 
+    // With a design package, the folder previews as a review pack: decks as slide
+    // shows, design documents as pages, the prototype, all in the same sandbox.
+    p2pagents::design::init(app.path(), "Wishlist", false).unwrap();
+    let made = request(
+        port,
+        "POST",
+        "/api/previews",
+        &host,
+        Some(token),
+        Some(share),
+    )
+    .await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    let pack = made.json()["url"].as_str().unwrap().to_owned();
+    let index = request(port, "GET", &pack, &host, None, None).await;
+    for link in [
+        "href=\"prototype/index.html\"",
+        "href=\"review/leadership.html\">Leadership review (deck)",
+        "href=\"design/threat-model.html\"",
+        "href=\"design/adr/ADR-0001-cursor-paging.html\"",
+    ] {
+        assert!(index.body.contains(link), "{link} in {}", index.body);
+    }
+    let deck = request(
+        port,
+        "GET",
+        &format!("{pack}review/leadership.html"),
+        &host,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(deck.status, 200);
+    assert!(
+        deck.headers
+            .contains("content-security-policy: sandbox allow-scripts")
+    );
+    assert_eq!(deck.body.matches("<section class=\"slide").count(), 6);
+    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    assert_eq!(state["me"]["shares"][1]["preview"], "review pack");
+
     // An approval that comes with a prototype can be previewed before answering.
-    let files = [("index.html".to_owned(), "<h1>Proto</h1>".to_owned())].into();
+    let files = [(
+        "prototype/index.html".to_owned(),
+        "<h1>Proto</h1>".to_owned(),
+    )]
+    .into();
     let asker = agent.clone();
     let waiting = tokio::spawn(async move {
         asker
@@ -923,7 +969,7 @@ async fn ui_previews_prototypes_in_a_sandbox_by_capability() {
     })
     .await
     .unwrap();
-    assert_eq!(approval["prototype"], true);
+    assert_eq!(approval["preview"], "prototype");
     let body = format!(r#"{{"approval":{}}}"#, approval["id"]);
     let made = request(
         port,

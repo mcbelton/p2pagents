@@ -61,8 +61,12 @@ pub enum Message {
         task_id: u64,
         title: String,
         text: String,
-        /// A UX prototype to look at before answering (path under `prototype/` ->
-        /// content), shown in a sandboxed preview.
+        /// What to look at before answering, by path in the project: the UX
+        /// prototype (`prototype/...`), review decks and design documents
+        /// (`review/*.md`, `design/*.md`), shown in a sandboxed preview.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        preview: std::collections::BTreeMap<String, String>,
+        /// The same for a UX prototype only, by path under `prototype/` (v0.5.0 peers).
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         prototype: std::collections::BTreeMap<String, String>,
     },

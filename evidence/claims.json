@@ -483,23 +483,66 @@
     {
       "id": "PREV-1",
       "area": "spec-driven",
-      "claim": "UX prototypes are previewed from the web UI at an unguessable, expiring capability URL, in a CSP sandbox (opaque origin, no network, no form posts), behind the Host check; only the prototype files a step's patch created (or a shared folder holds, without following links) are served, within size limits.",
+      "claim": "UX prototypes and review packs are previewed from the web UI at an unguessable, expiring capability URL, in a CSP sandbox (opaque origin, no network, no form posts), behind the Host check; only the prototype files and design and review documents a step's patch created (or a shared folder holds, without following links) are served, within size limits.",
       "tests": [
-        "lib::preview::previews_take_only_new_prototype_files_from_a_patch",
+        "lib::preview::previews_take_only_new_prototype_and_review_files_from_a_patch",
         "lib::preview::previews_are_served_by_capability_only_and_expire",
         "lib::preview::folder_previews_are_capped_and_do_not_follow_links",
-        "ui::ui_previews_prototypes_in_a_sandbox_by_capability"
+        "ui::ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability"
       ]
     },
     {
       "id": "PREV-2",
       "area": "spec-driven",
-      "claim": "An approval step sends the approver (this agent's user or a teammate) the UX prototype its earlier steps created, so they click through it before they answer.",
+      "claim": "An approval step sends the approver (this agent's user or a teammate) what the steps before it created, directly or through other approvals: the UX prototype, or the review pack of decks, design documents and prototype, so they look before they answer.",
       "tests": [
-        "agents::approvers_preview_the_prototype_an_earlier_step_created",
-        "ui::ui_previews_prototypes_in_a_sandbox_by_capability"
+        "agents::approvers_preview_the_prototype_and_review_pack_earlier_steps_created",
+        "ui::ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability"
       ],
       "live": ["the approver got the prototype a worker2 step created"]
+    },
+    {
+      "id": "DSN-1",
+      "area": "design",
+      "claim": "Built-in checks prove a feature's SDLC design package, traced to its spec: design:arch (context, component, UML class or ER and sequence/state diagrams in valid Mermaid; a workflow per user story; ADRs with status, context, decision, alternatives and consequences, all listed in the architecture), design:data (a data dictionary covering every API schema property with classification, and purpose and retention for personal data; a data flow diagram with trust boundaries and protected boundary flows carrying all personal data), design:threats (STRIDE threats with mitigations, all six categories, every boundary flow covered, no open high risk), design:tests (a test for every acceptance criterion and high-risk threat, API-served criteria tested at contract, integration or e2e level) and design:ops (rollout, rollback, an SLO with a target, metrics, dashboard, alerts with actions, runbooks). design init writes a starter that passes them all.",
+      "tests": [
+        "lib::design::a_complete_design_package_passes_every_check",
+        "lib::design::architecture_checks_find_missing_diagrams_decisions_and_workflows",
+        "lib::design::data_and_threat_checks_find_privacy_and_security_gaps",
+        "lib::design::test_and_ops_checks_find_unproven_criteria_and_missing_operations"
+      ],
+      "live": ["design init scaffolds a design package and review pack that pass every check"]
+    },
+    {
+      "id": "DSN-2",
+      "area": "design",
+      "claim": "The design playbook takes an accepted spec through architecture and ADRs, data, threats, test and operations plans and a review pack, each step following its skills (architecture-design, adr, data-design, threat-modeling, test-strategy, operability-design, review-*) and proven by built-in checks that need only read access; then the tech lead, the security and privacy champions and the product owner review it, and leadership last.",
+      "tests": [
+        "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
+        "lib::playbooks::outlines_say_what_a_playbook_does_before_it_is_filled_in",
+        "lib::skills::built_in_skills_are_listed_and_profile_skills_replace_them"
+      ],
+      "live": ["worker2 proved the design package and review pack with the built-in checks"]
+    },
+    {
+      "id": "REV-1",
+      "area": "design",
+      "claim": "review:decks holds each review document to its audience's form: Marp decks for the technical review (at most 30 slides; architecture, ADRs, API, data, threats, tests, operations, open questions; cites existing ADR and threat ids), the product review (at most 20; problem, every user story, prototype, scope, success metrics, release plan, decisions) and the leadership review (at most 12; summary first, impact, timeline, risks, ask; under 91 words a slide, no code or internal ids), and a customer feedback document (what we heard, what we're building, benefits, what's not included, at least 3 questions, next steps; no internal ids, security details or email addresses).",
+      "tests": [
+        "lib::design::review_check_enforces_each_audiences_form",
+        "lib::design::a_complete_design_package_passes_every_check"
+      ]
+    },
+    {
+      "id": "REV-2",
+      "area": "design",
+      "claim": "Review decks render as self-contained slide shows (speaker notes from comments, keyboard navigation, all-slides view, print to PDF, light and dark) and design documents as pages, from the CLI (design render) and in previews; raw HTML is shown as text and links can't run script.",
+      "tests": [
+        "lib::render::decks_render_to_self_contained_slides_with_notes",
+        "lib::render::markdown_is_rendered_without_raw_html_or_script_links",
+        "lib::preview::review_packs_render_decks_documents_and_the_prototype"
+      ],
+      "live": ["design render wrote the review pack as HTML slide shows and pages"]
     },
     {
       "id": "BRG-1",
