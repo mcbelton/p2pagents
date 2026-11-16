@@ -73,6 +73,9 @@ struct TaskView {
     /// For peers' results: "verified" (signed by the peer for this output) or "unverified".
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<&'static str>,
+    /// The sandboxed preview of the UX prototype the task created, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
 }
 
 impl TaskView {
@@ -95,6 +98,7 @@ struct Shared {
     next_task_id: AtomicU64,
     squads: Mutex<SquadStore>,
     tx: broadcast::Sender<String>,
+    previews: crate::preview::Previews,
 }
 
 type AppState = Arc<Shared>;
@@ -219,9 +223,26 @@ impl Shared {
             "workspace": self.info.workspace.display().to_string(),
             "providers": self.info.providers,
             "accounts": accounts,
-            "shares": if self.info.serving { json!(self.agent.shares().shares) } else { json!([]) },
+            "shares": if self.info.serving { self.shares_json() } else { json!([]) },
             "ticket": ticket,
         })
+    }
+
+    /// This agent's shared folders, each marked if it holds a UX prototype to preview.
+    fn shares_json(&self) -> Value {
+        let shares: Vec<Value> = self
+            .agent
+            .shares()
+            .shares
+            .iter()
+            .map(|share| {
+                let mut v = json!(share);
+                let index = share.path.join("prototype").join("index.html");
+                v["prototype"] = json!(std::fs::symlink_metadata(index).is_ok_and(|m| m.is_file()));
+                v
+            })
+            .collect();
+        json!(shares)
     }
 
     fn update_task(&self, id: u64, f: impl FnOnce(&mut TaskView)) {
@@ -278,6 +299,7 @@ pub async fn start(
         running: Mutex::new(HashMap::new()),
         next_task_id: AtomicU64::new(1),
         tx,
+        previews: crate::preview::Previews::default(),
     });
 
     let pump = shared.clone();
@@ -358,6 +380,7 @@ pub async fn start(
         .route("/api/plans", post(create_plan))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
+        .route("/api/previews", post(create_preview))
         .route("/api/approvals/{id}", post(answer_approval))
         .route("/api/ops", get(ops_state))
         .route("/api/playbooks", get(list_playbooks))
@@ -393,6 +416,11 @@ pub async fn start(
             "/app.js",
             get(|| async { asset("text/javascript; charset=utf-8", APP_JS) }),
         )
+        // Outside the token check: the unguessable capability in the path is the
+        // authorization, and the content runs in a CSP sandbox (see crate::preview).
+        .route("/preview/{cap}", get(preview_root))
+        .route("/preview/{cap}/", get(preview_index))
+        .route("/preview/{cap}/{*path}", get(preview_file))
         .merge(api)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
@@ -428,6 +456,108 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
         body,
     )
         .into_response()
+}
+
+fn is_capability(cap: &str) -> bool {
+    cap.len() == 32 && cap.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn no_preview() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "There is no such preview (previews expire after 2 hours).",
+    )
+        .into_response()
+}
+
+async fn preview_root(Path(cap): Path<String>) -> Response {
+    if !is_capability(&cap) {
+        return no_preview();
+    }
+    axum::response::Redirect::permanent(&format!("/preview/{cap}/")).into_response()
+}
+
+async fn preview_index(State(s): State<AppState>, Path(cap): Path<String>) -> Response {
+    serve_preview(&s, &cap, "")
+}
+
+async fn preview_file(
+    State(s): State<AppState>,
+    Path((cap, path)): Path<(String, String)>,
+) -> Response {
+    serve_preview(&s, &cap, &path)
+}
+
+/// A prototype file, in a CSP sandbox: an opaque origin without network access, so
+/// it can't reach this UI's API or token.
+fn serve_preview(s: &Shared, cap: &str, path: &str) -> Response {
+    match s.previews.file(cap, path) {
+        Some((kind, body)) => (
+            [
+                (header::CONTENT_TYPE, kind),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CONTENT_SECURITY_POLICY, crate::preview::PREVIEW_CSP),
+                (header::REFERRER_POLICY, "no-referrer"),
+            ],
+            body,
+        )
+            .into_response(),
+        None => no_preview(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    /// A folder this agent shares: its `prototype/` now.
+    share: Option<String>,
+    /// A saved run and step: the prototype files the step's patch created.
+    run: Option<String>,
+    step: Option<String>,
+    /// An open approval request that came with a prototype.
+    approval: Option<u64>,
+}
+
+/// Opens a sandboxed preview of a UX prototype; returns its capability URL.
+async fn create_preview(
+    State(s): State<AppState>,
+    Json(body): Json<PreviewBody>,
+) -> Result<Json<Value>, ApiError> {
+    let files = if let Some(id) = body.approval {
+        s.agent
+            .approval_prototype(id)
+            .ok_or_else(|| bad_request("that approval request has no prototype"))?
+    } else if let (Some(run), Some(step)) = (&body.run, &body.step) {
+        validate_name(run)
+            .and(validate_name(step))
+            .map_err(|_| bad_request("invalid run or step"))?;
+        let path = s
+            .info
+            .profile
+            .runs_dir()
+            .join(run)
+            .join(format!("{step}.patch"));
+        let patch = std::fs::read_to_string(path)
+            .map_err(|_| bad_request(format!("run {run} has no patch for step {step}")))?;
+        crate::preview::from_patch(&patch)
+    } else if let Some(name) = &body.share {
+        let path = s
+            .agent
+            .shares()
+            .get(name)
+            .map(|share| share.path.clone())
+            .ok_or_else(|| bad_request(format!("this agent shares no folder '{name}'")))?;
+        tokio::task::spawn_blocking(move || crate::preview::from_dir(&path))
+            .await
+            .map_err(internal)?
+    } else {
+        return Err(bad_request("give a share, a run and step, or an approval"));
+    };
+    let cap = s
+        .previews
+        .add(files)
+        .ok_or_else(|| bad_request("there is no prototype/index.html to preview"))?;
+    Ok(Json(json!({ "url": format!("/preview/{cap}/") })))
 }
 
 /// Rejects requests whose Host isn't this loopback server (DNS-rebinding defense).
@@ -583,6 +713,7 @@ async fn create_task(
         after: Vec::new(),
         approval: false,
         evidence: None,
+        preview: None,
     };
     s.tasks.lock().unwrap().push(view.clone());
     s.send(json!({ "type": "task", "task": view }));
@@ -739,6 +870,7 @@ async fn create_plan(
             after: step.after.clone(),
             approval: step.approve,
             evidence: None,
+            preview: None,
         };
         s.tasks.lock().unwrap().push(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -766,7 +898,7 @@ async fn create_plan(
                     output,
                     evidence,
                     verified,
-                    ..
+                    patch,
                 } => {
                     t.status = "done";
                     t.target = peer.clone();
@@ -775,6 +907,10 @@ async fn create_plan(
                     t.evidence = evidence
                         .as_ref()
                         .map(|_| if *verified { "verified" } else { "unverified" });
+                    t.preview = patch
+                        .as_deref()
+                        .and_then(|p| shared.previews.add(crate::preview::from_patch(p)))
+                        .map(|cap| format!("/preview/{cap}/"));
                 }
                 StepState::Failed {
                     error,
@@ -1241,11 +1377,22 @@ async fn get_run(
             Err(e) => json!({ "step": step, "ok": false, "text": format!("{e:#}") }),
         })
         .collect();
+    // Steps whose patch created a UX prototype (POST /api/previews opens one).
+    let prototypes: Vec<&str> = run
+        .steps
+        .iter()
+        .map(|s| s.step.id.as_str())
+        .filter(|step| {
+            std::fs::read_to_string(dir.join(&run.id).join(format!("{step}.patch")))
+                .is_ok_and(|p| crate::preview::from_patch(&p).contains_key("index.html"))
+        })
+        .collect();
     Ok(Json(json!({
         "summary": run.summary(),
         "verdict": run.verdict_line(),
         "report": run.render_markdown(),
         "signatures": checks,
+        "prototypes": prototypes,
     })))
 }
 

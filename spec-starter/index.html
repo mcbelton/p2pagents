@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}: prototype</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f7f7f9; --fg: #1b1b1f; --muted: #5c5f66; --card: #fff; --line: #d9dbe1; --accent: #2457d6; --accent-fg: #fff; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141518; --fg: #ececf1; --muted: #a7aab3; --card: #1e2024; --line: #33363d; --accent: #8fb0ff; --accent-fg: #0b1a3d; --bad: #ffb4ab; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header, main { max-width: 40rem; margin: 0 auto; padding: 1rem; }
+  header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  nav { display: flex; gap: .25rem; flex-wrap: wrap; }
+  nav button { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  nav button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: .75rem; padding: 1rem; margin-bottom: 1rem; }
+  h2 { font-size: 1.1rem; margin: 0 0 .75rem; }
+  label { display: block; font-weight: 600; margin-bottom: .25rem; }
+  .row { display: flex; gap: .5rem; }
+  input { flex: 1; font: inherit; padding: .5rem .75rem; border: 1px solid var(--line); border-radius: .5rem; background: var(--bg); color: var(--fg); }
+  button { font: inherit; padding: .5rem 1rem; border-radius: .5rem; border: 0; background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .error { color: var(--bad); margin: .5rem 0 0; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; justify-content: space-between; gap: 1rem; padding: .6rem 0; border-top: 1px solid var(--line); }
+  li:first-child { border-top: 0; }
+  time, .muted { color: var(--muted); font-size: .9rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{title}}</h1>
+  <nav aria-label="Prototype states">
+    <button type="button" data-state="items" aria-pressed="true">Items</button>
+    <button type="button" data-state="empty" aria-pressed="false">Empty</button>
+    <button type="button" data-state="signed-out" aria-pressed="false">Signed out (401)</button>
+  </nav>
+</header>
+<main>
+  <section id="add" data-story="US-1" data-ac="AC-1 AC-2" aria-labelledby="add-title">
+    <h2 id="add-title">Add an item</h2>
+    <form id="add-form" novalidate>
+      <label for="name">Name</label>
+      <div class="row">
+        <input id="name" name="name" maxlength="200" autocomplete="off" aria-describedby="name-error">
+        <button type="submit">Add</button>
+      </div>
+      <p id="name-error" class="error" role="alert" hidden>Name is required</p>
+    </form>
+  </section>
+  <section id="list" data-story="US-2" data-ac="AC-3" aria-labelledby="list-title">
+    <h2 id="list-title">My items</h2>
+    <ul id="items"></ul>
+    <p id="empty" class="muted" hidden>No items yet. Add your first one above.</p>
+  </section>
+  <section id="signed-out" data-story="US-2" data-ac="AC-4" hidden>
+    <h2>Sign in first</h2>
+    <p class="muted">Your items are private: only you can see them once you sign in.</p>
+  </section>
+</main>
+<script>
+  // Example data from spec/openapi.json (GET /items, 200).
+  const examples = [
+    { id: "6f1c2a7e", name: "Renew the parking permit", createdAt: "2025-03-02T09:30:00Z" },
+    { id: "0b9e8d7c", name: "Book the team offsite", createdAt: "2025-03-01T16:05:00Z" }
+  ];
+  let items = examples.slice();
+  const $ = (id) => document.getElementById(id);
+
+  function render() {
+    const list = $("items");
+    list.replaceChildren(...items.slice(0, 50).map((item) => {
+      const li = document.createElement("li");
+      const name = document.createElement("span");
+      name.textContent = item.name;
+      const when = document.createElement("time");
+      when.dateTime = item.createdAt;
+      when.textContent = new Date(item.createdAt).toLocaleString();
+      li.append(name, when);
+      return li;
+    }));
+    $("empty").hidden = items.length > 0;
+  }
+
+  $("add-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const name = $("name").value.trim();
+    $("name-error").hidden = name !== "";
+    $("name").setAttribute("aria-invalid", name === "" ? "true" : "false");
+    if (!name) return;
+    items.unshift({ id: String(Date.now()), name, createdAt: new Date().toISOString() });
+    $("name").value = "";
+    render();
+  });
+
+  document.querySelectorAll("nav button").forEach((button) => {
+    button.addEventListener("click", () => {
+      const state = button.dataset.state;
+      document.querySelectorAll("nav button").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+      items = state === "items" ? examples.slice() : [];
+      $("add").hidden = $("list").hidden = state === "signed-out";
+      $("signed-out").hidden = state !== "signed-out";
+      render();
+    });
+  });
+
+  render();
+</script>
+</body>
+</html>

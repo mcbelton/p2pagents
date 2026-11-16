@@ -633,6 +633,7 @@ p2pagents playbook show bootstrap --set peer=alice --set project=Shop > bootstra
 p2pagents playbook show discover  --set peer=alice --set folder=repo > discover.plan   # existing project
 p2pagents playbook show sdlc --set peer=alice --set change="Add CSV export" --set change_id=csv > csv.plan
 p2pagents playbook show learn --set peer=alice > learn.plan                           # learn from operations
+p2pagents playbook show spec --set peer=alice --set change="Wishlist" --set change_id=wish > wish.plan  # spec first
 ```
 
 In the web UI: **Plan** mode, pick a playbook, then **Use**.
@@ -643,6 +644,8 @@ In the web UI: **Plan** mode, pick a playbook, then **Use**.
 | `discover` | Architecture, components and data flows; how to build, test and run (the `test` check passes as documented); security, privacy and reliability hotspots; a glossary. Saved as knowledge and confirmed by someone who knows the system |
 | `sdlc` | Design, then implementation (`test`, `lint`), then independent verification by a reviewer squad applying the patch. Security scan plus accepted review, privacy review accepted by the privacy champion, license and secret scans (`licenses`, `secrets`), then release approval |
 | `learn` | Insights about usage, health and recurring failures, plus TSG drafts for failures without one, accepted by a person |
+| `spec` | Spec-driven: a feature's spec (user stories, testable acceptance criteria, security and privacy), its REST API contract with examples, a clickable UX prototype and a claim per criterion. Each is proven by built-in checks, then the product owner (who clicks through the prototype) and the tech lead accept it. See [Spec-driven development](#spec-driven-development) |
+| `implement-spec` | The accepted spec built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
 your folder's checks (`share add --check ...`); rename them with `--set test=unit` etc.
@@ -660,6 +663,7 @@ put in the step's prompt, so every peer and provider works the same way. Built-i
 | `design-doc`, `implement-change`, `code-review` | Designing, implementing and independently reviewing a change |
 | `security-review`, `privacy-review`, `compliance-check` | SDLC gates: vulnerability classes, personal data handling, licenses and secrets |
 | `ops-insights`, `tsg-writing`, `incident-debugging` | Learning from operations, writing troubleshooting guides, the debugging agent |
+| `write-spec`, `api-contract`, `prototype-ux`, `spec-to-claims` | Spec-driven development: a testable spec, a REST API contract, a self-contained UX prototype, and claims from acceptance criteria |
 
 Add your team's own, or replace a built-in one with the same name:
 
@@ -676,7 +680,8 @@ p2pagents skill add security-review .\our-security-checklist.md --profile boss  
 - your squads;
 - knowledge topics and skills.
 
-`verify=` needs full access, `apply=` a `--worktrees` folder, and approvers must be
+`verify=` with the folder's own checks needs full access (the built-in `spec:*` checks
+need only read access), `apply=` a `--worktrees` folder, and approvers must be
 connected. A plan with errors is not started, and every reason is listed. The web UI
 checks plans as you type and shows the problems under the editor.
 
@@ -751,6 +756,66 @@ TSGs learned from incidents accumulate, and the `learn` playbook analyzes it all
 (`context=all`) into insights and new TSG drafts. In the web UI, the **Health** panel shows
 monitors against their SLOs, open incidents, the incident log and task statistics, and
 **Knowledge** lists the topics and TSGs.
+
+### Spec-driven development
+
+Write down and agree on what to build before anyone builds it: a **spec**, a **REST API
+contract** and a clickable **UX prototype**, each checked by p2pagents and accepted by
+people. Development then starts from evidence, with one claim per acceptance criterion.
+
+A **spec package** lives in the project folder:
+
+| File | What it holds | Checked by |
+| --- | --- | --- |
+| `spec/SPEC.md` | Problem, users, user stories (`- US-1: As a ..., I want ..., so that ...`), acceptance criteria tied to a story (`- AC-1 (US-1): Given ..., when ..., then ...` or `... must ...`), non-functional requirements (security and privacy included), out of scope, open questions | `spec:spec`: every story has a criterion, every criterion names an existing story and is testable, ids are unique, security and privacy are covered |
+| `spec/openapi.json` | The REST API contract (OpenAPI 3, JSON). Each operation lists the criteria it serves: `"x-acceptance": ["AC-1"]` | `spec:api`: `operationId` and summary, a 2xx and a 4xx response, a JSON request body for POST/PUT/PATCH, and every example matches its schema (types, required properties, enums, `$ref`) |
+| `prototype/index.html` | A self-contained, clickable prototype that uses the API's examples as data. Screens are marked with what they show: `data-story="US-1" data-ac="AC-1 AC-2"` | `spec:ux`: no external resources and no server calls; every story is shown |
+| `evidence/claims.json` | A claim per acceptance criterion (`"id": "AC-1"`), which development proves with tests | `spec:trace`: every criterion is covered by the API or the prototype and claimed; nothing refers to an unknown id |
+
+Start from a working example, edit it, and check it as you go:
+
+```powershell
+p2pagents spec init "Wishlist" --dir D:\src\shop    # a starter package that passes every check
+p2pagents spec check --dir D:\src\shop              # or: spec check api|spec|ux|trace
+```
+
+Or let agents write it. The `spec` playbook runs four steps on a peer, each in the
+folder's worktree and building on the previous step's commit:
+
+1. **spec**: `write-spec` skill, `verify=spec:spec`;
+2. **api**: `api-contract` skill, `verify=spec:spec,spec:api`;
+3. **ux**: `prototype-ux` skill, `verify=spec:ux`;
+4. **trace**: `spec-to-claims` skill, all four checks.
+
+Each step gets up to three attempts, each told what failed. The product owner then
+accepts the spec and prototype, and the tech lead accepts the API contract.
+
+- **Built-in checks** (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) run in the
+  worker's runtime after the model, like the folder's own checks, and are signed into
+  the evidence. They only read files, in the runtime itself, without following symbolic
+  links. So a peer may ask for them with any access, and no folder has to define them.
+- **Prototype preview.** A step whose commit creates `prototype/` files gets an **Open
+  prototype** button in the web UI. An approval step after it sends the approver the
+  prototype, so the product owner (you, or a teammate on their own agent) clicks through
+  it from the approval card before answering. The same works from a saved run's report,
+  and for a folder you share (**Preview prototype**).
+  - Previews open in a new tab at an unguessable link that expires after 2 hours.
+  - They run in a CSP sandbox: an opaque origin, no network, no form posts. A prototype a
+    model or a peer wrote can't reach your agent's API or token.
+- **Then build it.** Merge the spec branch (`repo pr`, or `git merge` the `p2p/...`
+  branch), then run `implement-spec`. The model builds the API exactly as the contract
+  says and the UI as the prototype shows, and names a test for every criterion in
+  `evidence/claims.json`. `test`, `lint`, `spec:api` and `spec:trace` must pass. A
+  reviewer squad applies the change on its own copy and checks it independently, then
+  someone signs off.
+
+```powershell
+p2pagents share add shop D:\src\shop --access full --worktrees --check test="npm test" --check lint="npm run lint" --profile alice
+p2pagents playbook explain spec
+p2pagents playbook show spec --set peer=alice --set folder=shop --set change="Shoppers save items to a wishlist" `
+  --set change_id=wish --set product_owner=carol --set tech_lead=me > wish.plan
+p2pagents playbook show implement-spec --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > build.plan
+```
 
 ### Options
 
@@ -1038,7 +1103,9 @@ Workflow for a change:
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
-- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc and learn plan templates
+- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec and implement-spec plan templates
+- [src/spec.rs](src/spec.rs) and [spec-starter/](spec-starter): the built-in spec checks (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) and the `spec init` starter package
+- [src/preview.rs](src/preview.rs): sandboxed previews of UX prototypes (from a step's patch, a shared folder or an approval request)
 - [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
 - [src/skills.rs](src/skills.rs) and [skills/](skills): built-in and profile skills (instructions for plan steps)
 - [src/github.rs](src/github.rs): GitHub sign-in, linked repositories (clone, sync, push task branches, pull requests)

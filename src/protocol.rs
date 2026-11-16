@@ -61,6 +61,10 @@ pub enum Message {
         task_id: u64,
         title: String,
         text: String,
+        /// A UX prototype to look at before answering (path under `prototype/` ->
+        /// content), shown in a sandboxed preview.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        prototype: std::collections::BTreeMap<String, String>,
     },
     /// The requester no longer wants the result of `task_id`; the worker stops it.
     TaskCancel {

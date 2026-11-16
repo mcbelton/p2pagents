@@ -14,7 +14,8 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::audit::{AuditEntry, AuditLog, Outcome};
 use crate::evidence::{
-    CHECK_TIMEOUT, Evidence, EvidenceKind, MAX_ATTEMPTS, retry_prompt, run_check, sha256_hex,
+    CHECK_TIMEOUT, Evidence, EvidenceKind, MAX_ATTEMPTS, retry_prompt, run_built_in, run_check,
+    sha256_hex,
 };
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
 use crate::protocol::{ALPN, Message, write_message};
@@ -154,12 +155,16 @@ pub struct ApprovalInfo {
     pub from: String,
     pub title: String,
     pub text: String,
+    /// It comes with a UX prototype to preview (see [`Agent::approval_prototype`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prototype: bool,
 }
 
 struct IncomingApproval {
     info: ApprovalInfo,
     requester: EndpointId,
     task_id: u64,
+    prototype: crate::preview::Files,
 }
 
 /// Most open approval requests one peer may have with this agent.
@@ -569,6 +574,19 @@ impl Agent {
         title: &str,
         text: &str,
     ) -> Result<Delivered> {
+        self.request_approval_with(peer, title, text, BTreeMap::new())
+            .await
+    }
+
+    /// Like [`Agent::request_approval`], with a UX prototype (path under
+    /// `prototype/` -> content) the approver can preview before answering.
+    pub async fn request_approval_with(
+        &self,
+        peer: Option<EndpointId>,
+        title: &str,
+        text: &str,
+        prototype: BTreeMap<String, String>,
+    ) -> Result<Delivered> {
         let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         let me = self.id();
@@ -577,6 +595,7 @@ impl Agent {
             task_id,
             title: title.to_owned(),
             text: text.to_owned(),
+            prototype: prototype.clone(),
         });
         self.inner.pending.lock().unwrap().insert(
             task_id,
@@ -588,7 +607,7 @@ impl Agent {
         );
         if target == me {
             self.inner
-                .add_approval(me, self.inner.name.clone(), task_id, title, text);
+                .add_approval(me, self.inner.name.clone(), task_id, title, text, prototype);
         } else {
             let sent = self
                 .inner
@@ -614,6 +633,17 @@ impl Agent {
             .values()
             .map(|a| a.info.clone())
             .collect()
+    }
+
+    /// The UX prototype that came with open approval request `id`, if any.
+    pub fn approval_prototype(&self, id: u64) -> Option<crate::preview::Files> {
+        self.inner
+            .approvals
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|a| a.prototype.clone())
+            .filter(|files| files.contains_key("index.html"))
     }
 
     /// Approves or rejects request `id`; the answer is signed with this agent's key.
@@ -853,7 +883,7 @@ impl Inner {
     }
 
     /// Queues an approval request for this agent's user; false if `requester` has
-    /// too many open requests.
+    /// too many open requests. A prototype over the preview limits is left out.
     fn add_approval(
         &self,
         requester: EndpointId,
@@ -861,8 +891,19 @@ impl Inner {
         task_id: u64,
         title: &str,
         text: &str,
+        prototype: BTreeMap<String, String>,
     ) -> bool {
         let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let size: usize = prototype.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let prototype: crate::preview::Files =
+            if size <= crate::preview::MAX_BYTES && prototype.len() <= crate::preview::MAX_FILES {
+                prototype
+                    .into_iter()
+                    .map(|(path, text)| (path, text.into_bytes()))
+                    .collect()
+            } else {
+                crate::preview::Files::new()
+            };
         {
             let mut approvals = self.approvals.lock().unwrap();
             // A re-sent request (after a connection was replaced) is already queued.
@@ -888,9 +929,11 @@ impl Inner {
                         from: from.clone(),
                         title: title.chars().take(200).collect(),
                         text: text.chars().take(20_000).collect(),
+                        prototype: prototype.contains_key("index.html"),
                     },
                     requester,
                     task_id,
+                    prototype,
                 },
             );
         }
@@ -976,21 +1019,28 @@ impl Inner {
                 )
             })?;
         let access = effective_access(grant, share.max_access);
-        for check in &task.checks {
-            if !share.checks.contains_key(check) {
+        // Built-in spec checks only read files, so any access may ask for them.
+        let owner_checks: Vec<&String> = task
+            .checks
+            .iter()
+            .filter(|c| !crate::spec::is_built_in(c))
+            .collect();
+        for check in &owner_checks {
+            if !share.checks.contains_key(*check) {
                 bail!(
-                    "folder '{}' on {} has no check named '{check}' (it has: {})",
+                    "folder '{}' on {} has no check named '{check}' (it has: {}; built in: {})",
                     share.name,
                     self.name,
                     if share.checks.is_empty() {
                         "none".to_owned()
                     } else {
                         share.checks.keys().cloned().collect::<Vec<_>>().join(", ")
-                    }
+                    },
+                    crate::spec::BUILT_IN_CHECKS.join(", ")
                 );
             }
         }
-        if !task.checks.is_empty() && access < Access::Full {
+        if !owner_checks.is_empty() && access < Access::Full {
             bail!(
                 "checks run the folder's code with {}'s rights, so they need full access; {name} has {access} in '{}'",
                 self.name,
@@ -1162,10 +1212,17 @@ impl Inner {
         if let (Some(patch), Some(wt)) = (&task.patch, &worktree) {
             wt.apply(patch).await?;
         }
-        let checks: Vec<(&String, &String)> = task
+        // (name, owner command); built-in checks have no command.
+        let checks: Vec<(&String, Option<&String>)> = task
             .checks
             .iter()
-            .filter_map(|name| share.checks.get_key_value(name))
+            .filter_map(|name| {
+                if crate::spec::is_built_in(name) {
+                    Some((name, None))
+                } else {
+                    share.checks.get(name).map(|command| (name, Some(command)))
+                }
+            })
             .collect();
         let attempts = task.attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS);
         let mut prompt = task.clone();
@@ -1175,7 +1232,10 @@ impl Inner {
             output = executor.execute(&prompt, &ctx).await?;
             results.clear();
             for (name, command) in &checks {
-                results.push(run_check(name, command, &ctx.workspace, CHECK_TIMEOUT).await);
+                results.push(match command {
+                    Some(command) => run_check(name, command, &ctx.workspace, CHECK_TIMEOUT).await,
+                    None => run_built_in(name, &ctx.workspace).await,
+                });
             }
             if results.iter().all(|r| r.passed) {
                 break;
@@ -1401,8 +1461,10 @@ async fn run_connection(
                     task_id,
                     title,
                     text,
+                    prototype,
                 } => {
-                    if !inner.add_approval(peer_id, name.clone(), task_id, &title, &text) {
+                    if !inner.add_approval(peer_id, name.clone(), task_id, &title, &text, prototype)
+                    {
                         let msg = Message::TaskResult {
                             task_id,
                             ok: false,

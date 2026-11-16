@@ -643,7 +643,17 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["bootstrap", "discover", "sdlc", "learn"]);
+    assert_eq!(
+        names,
+        [
+            "bootstrap",
+            "discover",
+            "sdlc",
+            "learn",
+            "spec",
+            "implement-spec"
+        ]
+    );
     let discover = &books["playbooks"][1]["outline"];
     assert!(
         discover["steps"][0]
@@ -752,5 +762,189 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         "{}",
         link.body
     );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn ui_previews_prototypes_in_a_sandbox_by_capability() {
+    let home = tempfile::tempdir().unwrap();
+    let app = tempfile::tempdir().unwrap();
+    p2pagents::spec::init(app.path(), "Wishlist", false).unwrap();
+    let mut shares = ShareStore::with_data(home.path().join("data"));
+    shares
+        .add_with(
+            "app",
+            app.path(),
+            Access::ReadOnly,
+            Default::default(),
+            false,
+        )
+        .unwrap();
+    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = shares;
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "solo").unwrap(),
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+
+    let state = request(port, "GET", "/api/state", &host, Some(token), None)
+        .await
+        .json();
+    let marked: Vec<(String, bool)> = state["me"]["shares"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["name"].as_str().unwrap().to_owned(),
+                s["prototype"] == true,
+            )
+        })
+        .collect();
+    assert_eq!(
+        marked,
+        [("data".to_owned(), false), ("app".to_owned(), true)],
+        "folders holding a prototype are marked for preview"
+    );
+
+    let share = r#"{"share":"app"}"#;
+    let anonymous = request(port, "POST", "/api/previews", &host, None, Some(share)).await;
+    assert_eq!(anonymous.status, 401, "creating a preview needs the token");
+    let missing = request(
+        port,
+        "POST",
+        "/api/previews",
+        &host,
+        Some(token),
+        Some(r#"{"share":"nope"}"#),
+    )
+    .await;
+    assert_eq!(missing.status, 400);
+    let made = request(
+        port,
+        "POST",
+        "/api/previews",
+        &host,
+        Some(token),
+        Some(share),
+    )
+    .await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    let url = made.json()["url"].as_str().unwrap().to_owned();
+    let cap = url
+        .trim_start_matches("/preview/")
+        .trim_end_matches('/')
+        .to_owned();
+    assert_eq!(cap.len(), 32);
+
+    // The capability is the authorization; the content runs sandboxed, offline.
+    let page = request(port, "GET", &url, &host, None, None).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("data-story=\"US-1\""));
+    for header in [
+        "content-security-policy: sandbox allow-scripts",
+        "connect-src 'none'",
+        "form-action 'none'",
+        "x-content-type-options: nosniff",
+        "content-type: text/html",
+    ] {
+        assert!(
+            page.headers.contains(header),
+            "{header} in {}",
+            page.headers
+        );
+    }
+    assert!(!page.headers.contains("allow-same-origin"));
+    let bare = request(port, "GET", &format!("/preview/{cap}"), &host, None, None).await;
+    assert_eq!(bare.status, 308);
+    assert!(bare.headers.contains(&format!("location: /preview/{cap}/")));
+    let foreign = request(port, "GET", &url, "evil.example:80", None, None).await;
+    assert_eq!(foreign.status, 403, "the Host check covers previews");
+    let other = request(
+        port,
+        "GET",
+        &format!("/preview/{}/", "0".repeat(32)),
+        &host,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(other.status, 404);
+    let escape = request(
+        port,
+        "GET",
+        &format!("{url}..%2F..%2Fspec%2FSPEC.md"),
+        &host,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(escape.status, 404, "only prototype files are served");
+
+    // An approval that comes with a prototype can be previewed before answering.
+    let files = [("index.html".to_owned(), "<h1>Proto</h1>".to_owned())].into();
+    let asker = agent.clone();
+    let waiting = tokio::spawn(async move {
+        asker
+            .request_approval_with(None, "Plan step product-ok", "Accept the prototype", files)
+            .await
+    });
+    let approval = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            if let Some(a) = state["approvals"].as_array().and_then(|a| a.first()) {
+                return a.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(approval["prototype"], true);
+    let body = format!(r#"{{"approval":{}}}"#, approval["id"]);
+    let made = request(
+        port,
+        "POST",
+        "/api/previews",
+        &host,
+        Some(token),
+        Some(&body),
+    )
+    .await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    let page = request(
+        port,
+        "GET",
+        made.json()["url"].as_str().unwrap(),
+        &host,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(page.body, "<h1>Proto</h1>");
+    waiting.abort();
     agent.shutdown().await;
 }

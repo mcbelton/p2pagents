@@ -7,7 +7,10 @@
 //!   (architecture, build and run, risks, glossary), confirmed by a person;
 //! - `sdlc`: a change through design, implementation, independent verification,
 //!   security, privacy and compliance gates and release approval;
-//! - `learn`: insights and troubleshooting guide drafts from how the system runs.
+//! - `learn`: insights and troubleshooting guide drafts from how the system runs;
+//! - `spec`: spec-driven development: a feature's spec, REST API contract and UX
+//!   prototype, proven by built-in checks and accepted before any code;
+//! - `implement-spec`: the feature built from its accepted spec, a test per criterion.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +37,16 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
         "Insights and troubleshooting guides from how the system runs",
         include_str!("../playbooks/learn.plan"),
     ),
+    (
+        "spec",
+        "Spec-driven: a feature's spec, REST API contract and UX prototype, checked and accepted before code",
+        include_str!("../playbooks/spec.plan"),
+    ),
+    (
+        "implement-spec",
+        "Implement a feature from its accepted spec package, with a test proving each acceptance criterion",
+        include_str!("../playbooks/implement-spec.plan"),
+    ),
 ];
 
 /// Names and descriptions of the playbooks.
@@ -59,7 +72,7 @@ fn default(playbook: &str, var: &str) -> Option<&'static str> {
         "folder" if playbook == "learn" => "data",
         "folder" => "app",
         "project" => "the project",
-        "approver" | "privacy_approver" => "me",
+        "approver" | "privacy_approver" | "product_owner" | "tech_lead" => "me",
         "reviewers" => "qa",
         "change_id" => "change",
         "build" => "build",
@@ -112,6 +125,7 @@ pub fn outline(name: &str) -> Result<Outline> {
     let mut steps = Vec::new();
     let (mut checks, mut squads, mut topics) = (Vec::new(), Vec::new(), Vec::new());
     let mut approvals = false;
+    let mut builds_on = false;
     for step in &plan.steps {
         let mut line = format!("**{}**", step.id);
         if !step.after.is_empty() {
@@ -138,30 +152,56 @@ pub fn outline(name: &str) -> Result<Outline> {
             }
             line += &format!(": {}", first_sentence(&step.prompt));
             if let Some(apply) = &step.apply {
-                line += &format!(
-                    " It first applies the commit of step {apply}, to check it independently."
-                );
+                line +=
+                    &format!(" It first applies the commit of step {apply} in its own worktree.");
             }
             if !step.checks.is_empty() {
-                line += &format!(
-                    " Then the folder's {} check{} must pass{}.",
-                    step.checks
-                        .iter()
+                let (built_in, own): (Vec<&String>, Vec<&String>) = step
+                    .checks
+                    .iter()
+                    .partition(|c| crate::spec::is_built_in(c));
+                let names = |list: &[&String]| {
+                    list.iter()
                         .map(|c| format!("`{c}`"))
                         .collect::<Vec<_>>()
-                        .join(", "),
-                    if step.checks.len() == 1 { "" } else { "s" },
+                        .join(", ")
+                };
+                let mut what = Vec::new();
+                if !own.is_empty() {
+                    what.push(format!(
+                        "the folder's {} check{}",
+                        names(&own),
+                        if own.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                if !built_in.is_empty() {
+                    what.push(format!(
+                        "the built-in {} check{}",
+                        names(&built_in),
+                        if built_in.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                line += &format!(
+                    " Then {} must pass{}.",
+                    what.join(" and "),
                     step.attempts
                         .map(|n| format!(" (up to {n} attempts, each told what failed)"))
                         .unwrap_or_default()
                 );
-                checks.extend(step.checks.iter().cloned());
+                checks.extend(own.into_iter().cloned());
+            }
+            if step.apply.is_some() {
+                builds_on = true;
             }
             if let Some(topic) = &step.save {
                 line += &format!(" The result is saved as knowledge '{topic}'.");
             }
             if !step.context.is_empty() {
-                line += &format!(" It is given the knowledge {}.", step.context.join(", "));
+                if step.context.iter().any(|t| t == "all") {
+                    line += " It is given the whole knowledge base.";
+                } else {
+                    line += &format!(" It is given the knowledge {}.", step.context.join(", "));
+                }
                 topics.extend(step.context.iter().filter(|t| *t != "all").cloned());
             }
             if let Target::Squad(s) = &step.target {
@@ -188,6 +228,12 @@ pub fn outline(name: &str) -> Result<Outline> {
             "Full access to that folder, and these checks defined on it by its owner (share add --check): {}",
             checks.join(", ")
         ));
+    }
+    if builds_on {
+        needs.push(
+            "The folder shared with --worktrees: steps apply the commit of an earlier step"
+                .to_owned(),
+        );
     }
     if !squads.is_empty() {
         needs.push(format!(
@@ -368,6 +414,30 @@ mod tests {
             "{verify}"
         );
         assert!(sdlc.needs.iter().any(|n| n.contains("#qa")));
+        let spec = outline("spec").unwrap();
+        let api = spec
+            .steps
+            .iter()
+            .find(|s| s.starts_with("**api**"))
+            .unwrap();
+        assert!(
+            api.contains("following the api-contract skill")
+                && api.contains("the built-in `spec:spec`, `spec:api` checks must pass")
+                && api.contains("applies the commit of step spec"),
+            "{api}"
+        );
+        assert!(
+            !spec.needs.iter().any(|n| n.contains("Full access")),
+            "built-in checks need no full access: {:?}",
+            spec.needs
+        );
+        assert!(spec.needs.iter().any(|n| n.contains("--worktrees")));
+        let implement = outline("implement-spec").unwrap();
+        let impl_ = &implement.steps[0];
+        assert!(
+            impl_.contains("the folder's `test`, `lint` checks and the built-in `spec:api`, `spec:trace` checks must pass"),
+            "{impl_}"
+        );
         assert!(
             sdlc.needs
                 .iter()

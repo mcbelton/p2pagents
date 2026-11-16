@@ -61,6 +61,13 @@ const BUILT_IN: &[(&str, &str)] = &[
         "incident-debugging",
         include_str!("../skills/incident-debugging.md"),
     ),
+    ("write-spec", include_str!("../skills/write-spec.md")),
+    ("api-contract", include_str!("../skills/api-contract.md")),
+    ("prototype-ux", include_str!("../skills/prototype-ux.md")),
+    (
+        "spec-to-claims",
+        include_str!("../skills/spec-to-claims.md"),
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

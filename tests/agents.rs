@@ -48,7 +48,11 @@ impl Executor for FakeExecutor {
 
     async fn execute(&self, task: &LlmTask, ctx: &TaskContext) -> anyhow::Result<String> {
         if let Some(file) = task.prompt.strip_prefix("write ") {
-            std::fs::write(ctx.workspace.join(file), "made by the model\n")?;
+            let path = ctx.workspace.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, "made by the model\n")?;
             return Ok(format!("wrote {file}"));
         }
         // Fails its checks the first time; the retry (which gets the failures) fixes it.
@@ -1049,6 +1053,69 @@ async fn checks_run_by_the_worker_prove_results_and_failures_are_retried() {
 }
 
 #[tokio::test]
+async fn built_in_spec_checks_prove_a_spec_package_with_read_only_access() {
+    let dir = tempfile::tempdir().unwrap();
+    p2pagents::spec::init(dir.path(), "Wishlist", false).unwrap();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let checks = parse_checks(&[format!("fixed={}", exists_check("fixed.txt"))]).unwrap();
+    worker
+        .shares
+        .add_with("app", dir.path(), Access::ReadOnly, checks, false)
+        .unwrap();
+    worker.grant("boss", Access::ReadOnly, &["app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let all: Vec<String> = p2pagents::spec::BUILT_IN_CHECKS
+        .iter()
+        .map(|c| (*c).to_owned())
+        .collect();
+    let task = LlmTask::new(Provider::Copilot, "review the spec")
+        .in_share("app")
+        .with_checks(all, None);
+    let proven = boss
+        .delegate_verified(worker.id(), task.clone())
+        .await
+        .unwrap();
+    assert!(proven.ok && proven.verified, "{}", proven.output);
+    let evidence = proven.evidence.as_ref().unwrap();
+    assert_eq!(evidence.checks.len(), 4);
+    assert!(evidence.checks_passed());
+    evidence.verify(&worker.id(), &proven.output).unwrap();
+    assert!(
+        proven.output.contains("✅ `spec:trace`: passed"),
+        "{}",
+        proven.output
+    );
+
+    // A criterion nobody claims: the signed evidence says what is wrong.
+    let claims = dir.path().join("evidence/claims.json");
+    let text = std::fs::read_to_string(&claims).unwrap();
+    std::fs::write(&claims, text.replace("\"AC-4\"", "\"AC-40\"")).unwrap();
+    let failed = boss.delegate_verified(worker.id(), task).await.unwrap();
+    assert!(!failed.ok && failed.verified, "{failed:?}");
+    let trace = &failed.evidence.unwrap().checks[3];
+    assert!(
+        !trace.passed
+            && trace
+                .output
+                .contains("evidence/claims.json has no claim AC-4"),
+        "{trace:?}"
+    );
+
+    // The folder's own checks still need full access.
+    let own = LlmTask::new(Provider::Copilot, "x")
+        .in_share("app")
+        .with_checks(vec!["fixed".into()], None);
+    let err = boss.delegate(worker.id(), own).await.unwrap_err();
+    assert!(format!("{err}").contains("need full access"), "{err}");
+}
+
+#[tokio::test]
 async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch() {
     let dev_repo = git_repo();
     let review_repo = tempfile::tempdir().unwrap();
@@ -1112,6 +1179,72 @@ async fn worktree_tasks_commit_on_a_branch_and_another_peer_verifies_the_patch()
     assert!(evidence.checks_passed());
     assert_eq!(evidence.signer_id, reviewer.id().to_string());
     assert!(!review_repo.path().join("feature.txt").exists());
+}
+
+#[tokio::test]
+async fn approvers_preview_the_prototype_an_earlier_step_created() {
+    let repo = git_repo();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let (mut boss, mut alice) = (Node::new("boss"), Node::new("alice"));
+    mutual(&mut worker, &mut boss);
+    alice.trusts(&boss, None);
+    boss.trusts(&alice, None);
+    worker
+        .shares
+        .add_with(
+            "repo",
+            repo.path(),
+            Access::WorkspaceWrite,
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    worker.grant("boss", Access::WorkspaceWrite, &["repo"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    let (alice, mut alice_events) = alice.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    boss.connect(alice.addr()).await.unwrap();
+    wait_for_peers(&boss, 2).await;
+
+    let plan = Plan::parse(
+        "ux @worker:repo write prototype/index.html\n\
+         product-ok after ux approve @alice Accept the prototype",
+    )
+    .unwrap();
+    let reviewer = {
+        let alice = alice.clone();
+        tokio::spawn(async move {
+            let Event::ApprovalRequested { id, .. } = next_matching(&mut alice_events, |e| {
+                matches!(e, Event::ApprovalRequested { .. })
+            })
+            .await
+            else {
+                unreachable!()
+            };
+            let request = alice.approvals().into_iter().find(|a| a.id == id).unwrap();
+            assert!(request.prototype, "{request:?}");
+            let files = alice.approval_prototype(id).unwrap();
+            assert_eq!(files["index.html"], b"made by the model\n");
+            alice
+                .answer_approval(id, true, "clicked through it")
+                .await
+                .unwrap();
+            assert!(alice.approval_prototype(id).is_none(), "gone once answered");
+        })
+    };
+    let states = timeout(
+        Duration::from_secs(60),
+        run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}),
+    )
+    .await
+    .expect("the plan finished");
+    reviewer.await.unwrap();
+    assert!(
+        matches!(&states["product-ok"], StepState::Done { output, .. } if output.starts_with("Approved by alice")),
+        "{:?}",
+        states["product-ok"]
+    );
 }
 
 #[tokio::test]

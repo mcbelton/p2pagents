@@ -448,6 +448,60 @@
       "live": ["linked a GitHub repository with the profile's GitHub sign-in"]
     },
     {
+      "id": "SPEC-1",
+      "area": "spec-driven",
+      "claim": "Built-in checks validate a feature's spec package before any code: spec:spec (user stories with testable Given/When/Then or 'must' acceptance criteria tied to stories, security and privacy covered), spec:api (an OpenAPI 3 REST contract whose operations name their criteria and whose examples match their schemas, with success and client-error responses), spec:ux (a self-contained prototype showing every story, no external resources or server calls) and spec:trace (every criterion covered by the API or the prototype and claimed in evidence/claims.json). spec init writes a starter package that passes them all.",
+      "tests": [
+        "lib::spec::a_complete_spec_package_passes_every_check",
+        "lib::spec::spec_checks_find_untestable_or_untraced_requirements",
+        "lib::spec::the_starter_package_passes_every_check_and_keeps_existing_claims"
+      ],
+      "live": ["spec init scaffolds a spec package that passes every spec check"]
+    },
+    {
+      "id": "SPEC-2",
+      "area": "spec-driven",
+      "claim": "Peers run the built-in spec checks in the runtime, after the model, with any access level (they only read files, in-process, never following symbolic links), and sign the results as evidence; the folder's own checks still need full access, and plan checks know the difference.",
+      "tests": [
+        "agents::built_in_spec_checks_prove_a_spec_package_with_read_only_access",
+        "lib::spec::built_in_checks_do_not_follow_symbolic_links",
+        "lib::plan::preflight_finds_what_would_fail_before_anything_runs"
+      ],
+      "live": ["worker2 proved the spec package with the built-in checks, without full access"]
+    },
+    {
+      "id": "SPEC-3",
+      "area": "spec-driven",
+      "claim": "The spec playbook takes a feature from spec to REST API contract to UX prototype to claims, each step following a skill (write-spec, api-contract, prototype-ux, spec-to-claims), building on the previous step's commit and proven by built-in checks, then accepted by the product owner and the tech lead; implement-spec builds it with a test per acceptance criterion, verified independently.",
+      "tests": [
+        "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
+        "lib::playbooks::outlines_say_what_a_playbook_does_before_it_is_filled_in",
+        "lib::skills::built_in_skills_are_listed_and_profile_skills_replace_them"
+      ],
+      "live": ["boss's spec-driven run proved its claims"]
+    },
+    {
+      "id": "PREV-1",
+      "area": "spec-driven",
+      "claim": "UX prototypes are previewed from the web UI at an unguessable, expiring capability URL, in a CSP sandbox (opaque origin, no network, no form posts), behind the Host check; only the prototype files a step's patch created (or a shared folder holds, without following links) are served, within size limits.",
+      "tests": [
+        "lib::preview::previews_take_only_new_prototype_files_from_a_patch",
+        "lib::preview::previews_are_served_by_capability_only_and_expire",
+        "lib::preview::folder_previews_are_capped_and_do_not_follow_links",
+        "ui::ui_previews_prototypes_in_a_sandbox_by_capability"
+      ]
+    },
+    {
+      "id": "PREV-2",
+      "area": "spec-driven",
+      "claim": "An approval step sends the approver (this agent's user or a teammate) the UX prototype its earlier steps created, so they click through it before they answer.",
+      "tests": [
+        "agents::approvers_preview_the_prototype_an_earlier_step_created",
+        "ui::ui_previews_prototypes_in_a_sandbox_by_capability"
+      ],
+      "live": ["the approver got the prototype a worker2 step created"]
+    },
+    {
       "id": "BRG-1",
       "area": "providers",
       "claim": "The Claude/Codex bridge passes task fields, runs requests concurrently, and surfaces provider errors and bridge exits.",

@@ -213,6 +213,28 @@ impl Evidence {
     }
 }
 
+/// Runs built-in check `name` (see [`crate::spec`]): it only reads files in `dir`,
+/// in this process, so it needs no shell and no more than read access.
+pub async fn run_built_in(name: &str, dir: &Path) -> CheckResult {
+    let started = Instant::now();
+    let (check, folder) = (name.to_owned(), dir.to_path_buf());
+    let report = tokio::task::spawn_blocking(move || crate::spec::run(&check, &folder))
+        .await
+        .unwrap_or_else(|e| crate::spec::Report {
+            problems: vec![format!("the check failed: {e}")],
+            notes: Vec::new(),
+        });
+    let passed = report.passed();
+    CheckResult {
+        name: name.to_owned(),
+        command: format!("built-in {name}"),
+        exit_code: Some(if passed { 0 } else { 1 }),
+        passed,
+        millis: started.elapsed().as_millis() as u64,
+        output: tail(&report.text(), OUTPUT_TAIL),
+    }
+}
+
 /// Runs `command` (an owner-defined check) in `dir` with the shell, without the
 /// inherited credential variables, for at most `timeout`. If it times out or the
 /// task is cancelled, the whole process tree is killed.

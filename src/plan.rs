@@ -591,7 +591,7 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
     let missing: Vec<&str> = step
         .checks
         .iter()
-        .filter(|c| !share.checks.contains(c))
+        .filter(|c| !crate::spec::is_built_in(c) && !share.checks.contains(c))
         .map(String::as_str)
         .collect();
     if !missing.is_empty() {
@@ -606,9 +606,9 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
             }
         ));
     }
-    if !step.checks.is_empty() && share.access < Access::Full {
+    if step.checks.iter().any(|c| !crate::spec::is_built_in(c)) && share.access < Access::Full {
         return Some(format!(
-            "verify= needs full access, you have {} in '{folder}' on {}",
+            "verify= with the folder's own checks needs full access, you have {} in '{folder}' on {} (built-in spec:* checks need only read access)",
             share.access, peer.name
         ));
     }
@@ -849,6 +849,22 @@ pub async fn run_plan(
                     })
                     .collect();
                 let prompt = step_prompt(step, &deps);
+                // An approver sees the UX prototype its earlier steps created.
+                let prototype: BTreeMap<String, String> = if step.approve {
+                    crate::preview::from_patches(step.after.iter().filter_map(|d| {
+                        match &states[d] {
+                            StepState::Done {
+                                patch: Some(patch), ..
+                            } => Some(patch.as_str()),
+                            _ => None,
+                        }
+                    }))
+                    .into_iter()
+                    .map(|(path, bytes)| (path, String::from_utf8_lossy(&bytes).into_owned()))
+                    .collect()
+                } else {
+                    BTreeMap::new()
+                };
                 let chosen = if step.approve {
                     choose_approver(step, &agent.peers()).map(|(id, name)| (id, name, None))
                 } else {
@@ -905,7 +921,11 @@ pub async fn run_plan(
                 running.spawn(async move {
                     let result = match (peer_id, task) {
                         (Some(peer), Some(task)) => agent.delegate_verified(peer, task).await,
-                        (approver, _) => agent.request_approval(approver, &title, &prompt).await,
+                        (approver, _) => {
+                            agent
+                                .request_approval_with(approver, &title, &prompt, prototype)
+                                .await
+                        }
                     };
                     (id, peer_name, result)
                 });
@@ -1203,6 +1223,12 @@ mod tests {
         };
         let good = "claim: C-1 tests pass\nfix @alice:app verify=test skill=implement-change claims=C-1 Fix it\nok after fix approve @me claims=C-1 Approve";
         assert!(check(good).is_empty(), "{:?}", check(good));
+        let spec_on_bob = "s @bob:app verify=spec:spec,spec:trace skill=write-spec Write the spec";
+        assert!(
+            check(spec_on_bob).iter().all(|p| !p.starts_with("E ")),
+            "built-in checks need no owner check or full access: {:?}",
+            check(spec_on_bob)
+        );
 
         let bad = check(
             "a @zed do\nb @alice:web do\nc @alice:app verify=lint do\nd @bob:app verify=test do\n\
@@ -1212,7 +1238,7 @@ mod tests {
             "E a: zed is not connected",
             "E b: alice shares no folder 'web' with you (it shares: app)",
             "E c: folder 'app' on alice has no check lint (it has: test)",
-            "E d: verify= needs full access, you have workspace-write in 'app' on bob",
+            "E d: verify= with the folder's own checks needs full access, you have workspace-write in 'app' on bob",
             "E e: apply= needs edit access in a folder shared with --worktrees; 'app' on bob isn't",
             "E f: there is no squad #ops",
             "E g: @me can only approve",

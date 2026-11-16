@@ -1,0 +1,19 @@
+// Spec-driven development: before any code, a feature's spec (user stories and
+// testable acceptance criteria), its REST API contract with examples and a clickable
+// UX prototype, each proven by built-in checks, traced to evidence claims and
+// accepted by the product owner and the tech lead. Each step builds on the commit of
+// the one before (share the folder with --worktrees); the last step's branch holds
+// the whole spec package, ready to merge and implement with the implement-spec playbook.
+// Vars: peer, folder, change (the feature), change_id, product_owner, tech_lead
+claim: SPEC-1 The spec has user stories with testable acceptance criteria and covers security and privacy
+claim: SPEC-2 The REST API contract serves the acceptance criteria and its examples match its schemas
+claim: SPEC-3 The self-contained UX prototype shows every user story
+claim: SPEC-4 Every acceptance criterion is covered by the API or the prototype and is an evidence claim
+claim: SPEC-5 The product owner accepted the spec and the prototype
+claim: SPEC-6 The tech lead accepted the API contract
+spec @{{peer}}:{{folder}} skill=write-spec context=all verify=spec:spec attempts=3 save=spec-{{change_id}} claims=SPEC-1 Write the spec for this feature in spec/SPEC.md: {{change}}. List the user stories and testable acceptance criteria, including the unhappy paths, and the security and privacy requirements.
+api after spec @{{peer}}:{{folder}} apply=spec skill=api-contract verify=spec:spec,spec:api attempts=3 claims=SPEC-2 Design the REST API contract in spec/openapi.json for the spec in spec/SPEC.md. Every operation names the acceptance criteria it serves and has examples that match its schemas.
+ux after api @{{peer}}:{{folder}} apply=api skill=prototype-ux verify=spec:ux attempts=3 claims=SPEC-3 Build the clickable UX prototype in prototype/index.html for the spec in spec/SPEC.md, using the examples of spec/openapi.json as its data. Mark each screen with its story and criteria.
+trace after ux @{{peer}}:{{folder}} apply=ux skill=spec-to-claims verify=spec:spec,spec:api,spec:ux,spec:trace attempts=3 claims=SPEC-4 Add a claim for every acceptance criterion to evidence/claims.json, close any coverage gap, and give the test plan.
+product-ok after trace approve @{{product_owner}} claims=SPEC-5 Accept the spec and the prototype of: {{change}}. Open the prototype from step trace.
+tech-ok after trace approve @{{tech_lead}} claims=SPEC-6 Accept the REST API contract of: {{change}}.

@@ -1,0 +1,130 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "{{title}} API",
+    "version": "0.1.0",
+    "description": "Starter contract: replace it with yours. Every operation names the acceptance criteria it serves (x-acceptance)."
+  },
+  "security": [{ "bearer": [] }],
+  "paths": {
+    "/items": {
+      "get": {
+        "operationId": "listItems",
+        "summary": "List my items, newest first",
+        "x-acceptance": ["AC-3", "AC-4"],
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 50 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "My items",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ItemPage" },
+                "example": {
+                  "items": [
+                    { "id": "6f1c2a7e-5b8d-4c3a-9e2f-1a2b3c4d5e6f", "name": "Renew the parking permit", "createdAt": "2025-03-02T09:30:00Z" },
+                    { "id": "0b9e8d7c-6a5f-4e3d-8c2b-1a0f9e8d7c6b", "name": "Book the team offsite", "createdAt": "2025-03-01T16:05:00Z" }
+                  ],
+                  "next": null
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "operationId": "addItem",
+        "summary": "Add an item",
+        "x-acceptance": ["AC-1", "AC-2"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/NewItem" },
+              "example": { "name": "Renew the parking permit" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Added",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Item" },
+                "example": { "id": "6f1c2a7e-5b8d-4c3a-9e2f-1a2b3c4d5e6f", "name": "Renew the parking permit", "createdAt": "2025-03-02T09:30:00Z" }
+              }
+            }
+          },
+          "400": {
+            "description": "The item is invalid",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": { "code": "name_required", "message": "Name is required" } }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": { "type": "http", "scheme": "bearer" }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Not signed in",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": { "code": "unauthorized", "message": "Sign in first" } }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "NewItem": {
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 200 } }
+      },
+      "Item": {
+        "type": "object",
+        "required": ["id", "name", "createdAt"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string", "maxLength": 200 },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ItemPage": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Item" } },
+          "next": { "type": "string", "nullable": true }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "details": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

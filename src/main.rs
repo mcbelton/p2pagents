@@ -71,13 +71,17 @@ enum Command {
     /// The knowledge base: what agents learned about your systems (topics, TSGs).
     #[command(subcommand)]
     Kb(KbCommand),
-    /// Ready-made plans: bootstrap, discover, sdlc, learn.
+    /// Ready-made plans: bootstrap, discover, sdlc, learn, spec, implement-spec.
     #[command(subcommand)]
     Playbook(PlaybookCommand),
     /// Skills: instructions agents follow in plan steps (skill=name). Built-in ones
     /// ship with p2pagents; a profile's own replace or add to them.
     #[command(subcommand)]
     Skill(SkillCommand),
+    /// Spec-driven development: check a feature's spec, REST API contract and UX
+    /// prototype (the checks plan steps run as verify=spec:spec,spec:api,...).
+    #[command(subcommand)]
+    Spec(SpecCommand),
     /// Sign a profile in to GitHub (an account of the GitHub CLI) for repositories.
     #[command(subcommand)]
     Github(GithubCommand),
@@ -343,6 +347,38 @@ Use it in a plan step with skill=security-review.")]
         name: String,
         #[command(flatten)]
         profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpecCommand {
+    /// Check the spec package in a folder: spec, api, ux, trace or all.
+    #[command(after_help = "\
+A spec package is:
+  spec/SPEC.md          user stories (US-1: ...) and acceptance criteria (AC-1 (US-1): Given/When/Then)
+  spec/openapi.json     the REST API contract; operations list their criteria in x-acceptance
+  prototype/index.html  a self-contained clickable prototype; screens marked data-story/data-ac
+  evidence/claims.json  a claim per acceptance criterion, proven later by tests
+examples:
+  p2pagents spec check
+  p2pagents spec check api --dir D:\\src\\shop")]
+    Check {
+        /// Which check: spec, api, ux, trace or all.
+        #[arg(default_value = "all")]
+        part: String,
+        /// The folder holding the package.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Create a starter spec package (an example that passes every check) to edit.
+    Init {
+        /// The feature's title.
+        title: String,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Replace an existing spec package.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -698,6 +734,7 @@ async fn main() -> Result<()> {
         Some(Command::Kb(command)) => run_kb(command),
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
+        Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Github(command)) => run_github(command),
         Some(Command::Repo(command)) => run_repo(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
@@ -1192,6 +1229,55 @@ fn read_input(file: &std::path::Path) -> Result<String> {
     }
 }
 
+fn run_spec(command: SpecCommand) -> Result<()> {
+    use p2pagents::spec;
+    match command {
+        SpecCommand::Check { part, dir } => {
+            let names: Vec<&str> = match part.trim_start_matches("spec:") {
+                "all" => spec::BUILT_IN_CHECKS.to_vec(),
+                one => match spec::BUILT_IN_CHECKS
+                    .iter()
+                    .find(|n| n.strip_prefix("spec:") == Some(one))
+                {
+                    Some(name) => vec![*name],
+                    None => bail!("there is no spec check '{one}' (spec, api, ux, trace or all)"),
+                },
+            };
+            let mut failed = Vec::new();
+            for name in names {
+                let report = spec::run(name, &dir);
+                println!(
+                    "{name}: {}",
+                    if report.passed() { "passed" } else { "FAILED" }
+                );
+                for note in &report.notes {
+                    println!("  ok: {note}");
+                }
+                for problem in &report.problems {
+                    println!("  - {problem}");
+                }
+                if !report.passed() {
+                    failed.push(name);
+                }
+            }
+            if !failed.is_empty() {
+                bail!("{} failed", failed.join(", "));
+            }
+        }
+        SpecCommand::Init { title, dir, force } => {
+            for path in spec::init(&dir, &title, force)? {
+                println!("created {path}");
+            }
+            println!(
+                "Edit them, then: p2pagents spec check --dir {}\n\
+                 Or let peers write them: pick the 'spec' playbook in Plan mode.",
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_skill(command: SkillCommand) -> Result<()> {
     match command {
         SkillCommand::List { profile } => {
@@ -1233,7 +1319,7 @@ fn run_playbook(command: PlaybookCommand) -> Result<()> {
                     })
                     .collect();
                 println!(
-                    "  {name:<10} {description}\n             --set {}",
+                    "  {name:<15} {description}\n                  --set {}",
                     vars.join(", ")
                 );
             }
@@ -2072,8 +2158,18 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 }
                 for a in open {
                     println!(
-                        "=== #{} from {}: {} ===\n{}\n=== /approve {} [note] or /reject {} <why> ===",
-                        a.id, a.from, a.title, a.text, a.id, a.id
+                        "=== #{} from {}: {} ===\n{}\n{}=== /approve {} [note] or /reject {} <why> ===",
+                        a.id,
+                        a.from,
+                        a.title,
+                        a.text,
+                        if a.prototype {
+                            "(it comes with a UX prototype: open it from this request in the web UI, --ui)\n"
+                        } else {
+                            ""
+                        },
+                        a.id,
+                        a.id
                     );
                 }
             }

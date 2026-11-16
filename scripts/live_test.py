@@ -115,6 +115,11 @@ try:
     _, out1 = cli("share", "add", "repo", REPO, "--profile", "worker1")
     _, out2 = cli("share", "add", "code", ws, "--access", "workspace-write", "--profile", "worker2")
     print(f"  {out1.strip()}\n  {out2.strip()}")
+    code, out = cli("spec", "init", "Todo done", "--dir", ws)
+    check_code, check_out = cli("spec", "check", "--dir", ws)
+    print(f"  {check_out.strip()}")
+    check("spec init scaffolds a spec package that passes every spec check",
+          code == 0 and check_code == 0 and "spec:trace: passed" in check_out, out + check_out)
     print("== EDD: worker2 shares a git repo as 'app' (a worktree per task) with a check it defines")
     app = tempfile.mkdtemp(prefix="p2p-live-app-")
     for args in (["init", "-q"], ["config", "core.autocrlf", "false"]):
@@ -353,6 +358,30 @@ try:
     check("boss saved the verified result as knowledge",
           boss.wait_for(r"knowledge saved: evidence-notes", 5)
           and "evidence.txt" in cli("kb", "show", "evidence-notes", "--profile", "boss")[1])
+
+    print("== spec-driven: built-in spec checks on worker2 (edit access is enough) and a prototype for the approver")
+    with open(plan_file, "w") as f:
+        f.write("claim: LIVE-3 worker2's runtime proved the spec package with the built-in spec checks\n"
+                "claim: LIVE-4 a teammate accepted the prototype a worker2 step created\n"
+                "read @worker2:code skill=spec-to-claims verify=spec:spec,spec:api,spec:ux,spec:trace claims=LIVE-3 "
+                "Read spec/SPEC.md and reply with only the ids of its acceptance criteria.\n"
+                "proto @worker2:app skill=prototype-ux Create the file prototype/index.html: a small self-contained page "
+                "with the heading Live prototype and one button. Reply DONE.\n"
+                "look after proto approve @worker1 claims=LIVE-4 Open the prototype, then approve it.\n")
+    boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
+    boss.send(f"/plan {plan_file}")
+    asked = w1.wait_for(r"/approve (\d+)", 400)
+    if asked:
+        w1.send("/approvals")
+        w1.wait_for(r"comes with a UX prototype", 10)
+        w1.send(f"/approve {re.search(r'/approve (\d+)', asked).group(1)} clicked through the prototype")
+    finished = boss.wait_for(r"=== plan finished", 120)
+    text = "\n".join(boss.lines[boss.cursor:])
+    check("worker2 proved the spec package with the built-in checks, without full access",
+          all(f"✅ `spec:{part}`: passed" in text for part in ("spec", "api", "ux", "trace")), text[-1500:])
+    check("the approver got the prototype a worker2 step created",
+          any("comes with a UX prototype" in l for l in w1.lines[w1.cursor:]), w1.lines[w1.cursor:][-12:])
+    check("boss's spec-driven run proved its claims", finished and "PASS: 2/2 claims proven" in finished, finished)
     shutil.rmtree(app, ignore_errors=True)
 
     print("== ops: incidents on worker2's monitors")

@@ -251,6 +251,28 @@ async function copy(text, what) {
   }
 }
 
+// A UX prototype opens in a new tab. The server sandboxes it (opaque origin, no
+// network), and the tab is cut off from this page before it loads.
+async function openPreview(body, button) {
+  const tab = window.open("", "_blank");
+  if (tab) tab.opener = null;
+  if (button) button.disabled = true;
+  try {
+    const { url } = await api("/api/previews", { method: "POST", body: JSON.stringify(body) });
+    if (tab) tab.location.replace(url);
+    else window.open(url, "_blank", "noopener");
+  } catch (err) {
+    tab?.close();
+    toast(err.message, "error");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function previewLink(href, label = "Open prototype") {
+  return el("a", { class: "btn small", href, target: "_blank", rel: "noopener noreferrer" }, label);
+}
+
 // ---------- rendering ----------
 function renderMe() {
   const me = state.me;
@@ -284,7 +306,12 @@ function renderMe() {
       fact("Shared folders", el("ul", { class: "share-list" },
         ...me.shares.map((s) => el("li", {},
           el("strong", { text: s.name }), ` · at most ${ACCESS_SHORT[s.max_access] ?? s.max_access}`,
-          el("div", { class: "mono small", text: s.path })))));
+          el("div", { class: "mono small", text: s.path }),
+          s.prototype ? el("button", {
+            type: "button", class: "btn small link",
+            title: "Preview prototype/index.html of this folder in a sandboxed tab",
+            onclick: (e) => openPreview({ share: s.name }, e.currentTarget),
+          }, "Preview prototype") : null))));
     }
   } else {
     fact("Providers", "None (delegates only)");
@@ -408,6 +435,11 @@ function taskNode(t) {
         t.status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, statusText)),
     el("p", { class: "task-prompt", text: t.prompt }),
     meta);
+  if (t.preview) {
+    node.append(el("div", { class: "task-actions" },
+      previewLink(t.preview, "Open prototype"),
+      el("span", { class: "task-meta", text: "Sandboxed preview of the UX prototype this step created" })));
+  }
   if (t.status === "running" || (t.plan && t.status === "waiting")) {
     node.append(el("button", {
       type: "button", class: "btn small",
@@ -563,6 +595,9 @@ function renderApprovals() {
         el("span", { class: "status waiting", text: "Needs you" })),
       el("details", {}, el("summary", { text: "What you're approving" }),
         el("div", { class: "result", tabindex: "0" }, renderMarkdown(a.text))),
+      a.prototype ? el("div", { class: "task-actions" },
+        el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ approval: a.id }, e.currentTarget) }, "Open prototype"),
+        el("span", { class: "task-meta", text: "Click through the UX prototype before you answer" })) : null,
       note,
       error,
       el("div", { class: "approval-actions" },
@@ -599,6 +634,9 @@ async function openRun(id) {
     $("#run-verdict").dataset.pass = String(run.summary.passed);
     $("#run-signatures").replaceChildren(...run.signatures.map((s) => el("li", { class: s.ok ? "ok" : "bad" },
       el("strong", { text: `${s.ok ? "✓" : "✗"} ${s.step}: ` }), s.text)));
+    $("#run-prototypes").replaceChildren(...(run.prototypes ?? []).map((step) =>
+      el("button", { type: "button", class: "btn small", onclick: (e) => openPreview({ run: id, step }, e.currentTarget) },
+        `Open prototype of step ${step}`)));
     $("#run-report").replaceChildren(renderMarkdown(run.report));
     $("#run-dialog").showModal();
     $("#run-close").focus();
@@ -661,12 +699,15 @@ function renderPlanExplain() {
 }
 
 const CHECK_VARS = new Set(["build", "test", "lint", "secscan", "licenses", "secrets"]);
+const APPROVER_VARS = new Set(["approver", "privacy_approver", "product_owner", "tech_lead"]);
 const VAR_HELP = {
   peer: "The peer that does the work (connected peers that run tasks)",
   folder: "A folder that peer shares with you",
   reviewers: "A squad whose members review independently",
   approver: "Who signs off",
   privacy_approver: "Who accepts the privacy review",
+  product_owner: "Who accepts the spec and clicks through the prototype",
+  tech_lead: "Who accepts the REST API contract",
   change: "What to change, in a sentence",
   change_id: "A short id for this change (letters, digits, -)",
   project: "The project's name",
@@ -723,7 +764,7 @@ function openPlaybook() {
       field.addEventListener("change", refreshChecks);
     } else if (CHECK_VARS.has(v.name)) {
       field = el("select", { name: v.name }, el("option", { value: v.default, text: v.default }));
-    } else if (v.name === "approver" || v.name === "privacy_approver") {
+    } else if (APPROVER_VARS.has(v.name)) {
       field = select(v.name, [["me", "me (you, in this UI)"], ...state.trusted.map((t) => [t.name, t.name])], v.default);
     } else if (v.name === "reviewers" && (state.squads ?? []).length) {
       field = select("reviewers", state.squads.map((s) => [s.name, `#${s.name} (${s.members.map((m) => m.name).join(", ")})`]), v.default);
