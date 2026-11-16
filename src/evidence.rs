@@ -277,23 +277,28 @@ impl Drop for TreeGuard {
     fn drop(&mut self) {
         let Some(pid) = self.0 else { return };
         #[cfg(windows)]
-        let mut kill = {
-            let mut cmd = std::process::Command::new("taskkill");
-            cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
-            cmd
-        };
-        #[cfg(not(windows))]
-        let mut kill = {
-            // The shell leads its own process group (see `shell`).
-            let mut cmd = std::process::Command::new("kill");
-            cmd.args(["-KILL", &format!("-{pid}")]);
-            cmd
-        };
-        let _ = kill
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(unix)]
+        {
+            // The shell leads its own process group (see `shell`): signal exactly that
+            // group. Never through an external `kill`, whose handling of a negative
+            // id differs between distributions (some signal unrelated processes).
+            if let Ok(pgid) = libc::pid_t::try_from(pid)
+                && pgid > 1
+            {
+                // SAFETY: kill(2) with a negative id only signals that process group.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
     }
 }
 
@@ -437,5 +442,42 @@ mod tests {
         assert!(!r.passed);
         assert_eq!(r.exit_code, None);
         assert!(r.output.contains("timed out"));
+    }
+
+    /// A timed-out check's whole process group dies (checked on Linux), and nothing
+    /// else does (everywhere).
+    #[tokio::test]
+    async fn timed_out_checks_kill_only_their_own_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bystander = if cfg!(windows) {
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .unwrap();
+        let slow = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30 & echo $! > bg.pid; wait"
+        };
+        let r = run_check("slow", slow, dir.path(), Duration::from_millis(500)).await;
+        assert!(!r.passed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        #[cfg(target_os = "linux")]
+        {
+            let bg = std::fs::read_to_string(dir.path().join("bg.pid")).unwrap();
+            let alive = std::fs::read_to_string(format!("/proc/{}/stat", bg.trim()))
+                .is_ok_and(|stat| stat.split_whitespace().nth(2) != Some("Z"));
+            assert!(!alive, "the check's background process was killed");
+        }
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "an unrelated process lives on"
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
     }
 }

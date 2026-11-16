@@ -294,6 +294,7 @@
       "tests": [
         "lib::evidence::checks_report_exit_codes_and_output",
         "lib::evidence::checks_time_out",
+        "lib::evidence::timed_out_checks_kill_only_their_own_processes",
         "agents::checks_run_by_the_worker_prove_results_and_failures_are_retried"
       ],
       "live": ["worker's runtime ran the owner's check after the model"]
