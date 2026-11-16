@@ -1163,7 +1163,12 @@ async fn list_playbooks() -> Result<Json<Value>, ApiError> {
             .into_iter()
             .map(|(v, d)| json!({ "name": v, "default": d }))
             .collect();
-        list.push(json!({ "name": name, "description": description, "vars": vars }));
+        list.push(json!({
+            "name": name,
+            "description": description,
+            "vars": vars,
+            "outline": crate::playbooks::outline(name).map_err(internal)?,
+        }));
     }
     Ok(Json(json!({ "playbooks": list })))
 }

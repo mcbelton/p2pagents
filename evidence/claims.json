@@ -364,10 +364,12 @@
     {
       "id": "PB-1",
       "area": "knowledge",
-      "claim": "Ready-made playbooks cover the lifecycle: bootstrap a fresh project, reverse-engineer an existing one into knowledge, take a change through design, independent verification, security, privacy and compliance gates, and learn from operations. Each renders into a valid plan where every claim is proven only by runtime checks or a sign-off.",
+      "claim": "Ready-made playbooks cover the lifecycle: bootstrap a fresh project, reverse-engineer an existing one into knowledge, take a change through design, independent verification, security, privacy and compliance gates, and learn from operations. Each renders into a valid plan where every claim is proven only by runtime checks or a sign-off, and explains itself before use (each step in plain words, what it proves, what you need).",
       "tests": [
         "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
-        "lib::playbooks::rendering_needs_required_values_and_rejects_bad_ones"
+        "lib::playbooks::outlines_say_what_a_playbook_does_before_it_is_filled_in",
+        "lib::playbooks::rendering_needs_required_values_and_rejects_bad_ones",
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
       ]
     },
     {

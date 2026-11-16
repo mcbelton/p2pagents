@@ -330,6 +330,9 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .plan-problems .bad { color: var(--danger); }
 .plan-problems .warn { color: var(--warn); }
 .plan-problems li { overflow-wrap: anywhere; }
+.plan-explain { margin: 8px 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); max-height: 280px; overflow: auto; }
+.plan-explain summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 12.5px; }
+.plan-explain .md { font-size: 12.5px; }
 .skills-box { margin-top: 8px; }
 .skills-box summary { cursor: pointer; font-weight: 600; font-size: 13px; }
 .skills-box li .muted { margin-top: 2px; }

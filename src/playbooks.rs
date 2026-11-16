@@ -72,6 +72,153 @@ fn default(playbook: &str, var: &str) -> Option<&'static str> {
     })
 }
 
+/// A plain-language outline of a playbook: what each step does, what it proves and
+/// what you need to run it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Outline {
+    pub claims: Vec<(String, String)>,
+    pub steps: Vec<String>,
+    pub needs: Vec<String>,
+}
+
+const PICKED_PEER: &str = "PICKED-PEER";
+const PICKED_FOLDER: &str = "PICKED-FOLDER";
+
+/// Describes playbook `name` step by step, before any value is filled in.
+pub fn outline(name: &str) -> Result<Outline> {
+    use crate::plan::{Plan, Target};
+    let mut vars = BTreeMap::new();
+    for (var, _) in variables(name)? {
+        let value = match var.as_str() {
+            "peer" => PICKED_PEER.to_owned(),
+            "folder" => PICKED_FOLDER.to_owned(),
+            "change" => "the change you describe".to_owned(),
+            "project" => "your project".to_owned(),
+            _ => continue,
+        };
+        vars.insert(var, value);
+    }
+    let plan = Plan::parse(&render(name, &vars)?)?;
+    let who = |target: &Target| match target {
+        Target::Peer(p) if p == PICKED_PEER => "the peer you pick".to_owned(),
+        Target::Peer(p) if p == "me" => "you".to_owned(),
+        Target::Peer(p) => format!("@{p}"),
+        Target::Squad(s) => format!("a member of squad #{s}"),
+    };
+    let first_sentence = |text: &str| {
+        let end = text.find(". ").map(|i| i + 1).unwrap_or(text.len());
+        text[..end].trim().to_owned()
+    };
+    let mut steps = Vec::new();
+    let (mut checks, mut squads, mut topics) = (Vec::new(), Vec::new(), Vec::new());
+    let mut approvals = false;
+    for step in &plan.steps {
+        let mut line = format!("**{}**", step.id);
+        if !step.after.is_empty() {
+            line += &format!(" (after {})", step.after.join(", "));
+        }
+        if step.approve {
+            approvals = true;
+            let who = who(&step.target);
+            let verb = if who == "you" {
+                "sign off"
+            } else {
+                "signs off"
+            };
+            line += &format!(": {who} {verb}: {}", first_sentence(&step.prompt));
+        } else {
+            let folder = match step.share.as_deref() {
+                Some(PICKED_FOLDER) => " in the folder you pick".to_owned(),
+                Some(f) => format!(" in its '{f}' folder"),
+                None => String::new(),
+            };
+            line += &format!(": {}{folder}", who(&step.target));
+            if !step.skills.is_empty() {
+                line += &format!(", following the {} skill", step.skills.join(" and "));
+            }
+            line += &format!(": {}", first_sentence(&step.prompt));
+            if let Some(apply) = &step.apply {
+                line += &format!(
+                    " It first applies the commit of step {apply}, to check it independently."
+                );
+            }
+            if !step.checks.is_empty() {
+                line += &format!(
+                    " Then the folder's {} check{} must pass{}.",
+                    step.checks
+                        .iter()
+                        .map(|c| format!("`{c}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if step.checks.len() == 1 { "" } else { "s" },
+                    step.attempts
+                        .map(|n| format!(" (up to {n} attempts, each told what failed)"))
+                        .unwrap_or_default()
+                );
+                checks.extend(step.checks.iter().cloned());
+            }
+            if let Some(topic) = &step.save {
+                line += &format!(" The result is saved as knowledge '{topic}'.");
+            }
+            if !step.context.is_empty() {
+                line += &format!(" It is given the knowledge {}.", step.context.join(", "));
+                topics.extend(step.context.iter().filter(|t| *t != "all").cloned());
+            }
+            if let Target::Squad(s) = &step.target {
+                squads.push(s.clone());
+            }
+        }
+        if !step.claims.is_empty() {
+            line += &format!(" Proves {}.", step.claims.join(", "));
+        }
+        steps.push(line);
+    }
+    checks.sort();
+    checks.dedup();
+    squads.sort();
+    squads.dedup();
+    topics.sort();
+    topics.dedup();
+    let mut needs = vec![
+        "A connected peer that runs tasks (Copilot, Claude or Codex) and shares a folder with you"
+            .to_owned(),
+    ];
+    if !checks.is_empty() {
+        needs.push(format!(
+            "Full access to that folder, and these checks defined on it by its owner (share add --check): {}",
+            checks.join(", ")
+        ));
+    }
+    if !squads.is_empty() {
+        needs.push(format!(
+            "A squad of reviewers: {}",
+            squads
+                .iter()
+                .map(|s| format!("#{s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !topics.is_empty() {
+        needs.push(format!(
+            "Knowledge topics {} (the discover playbook saves them)",
+            topics.join(", ")
+        ));
+    }
+    if approvals {
+        needs.push("Someone to sign off: you, or a connected teammate".to_owned());
+    }
+    Ok(Outline {
+        claims: plan
+            .claims
+            .iter()
+            .map(|c| (c.id.clone(), c.text.clone()))
+            .collect(),
+        steps,
+        needs,
+    })
+}
+
 /// The `{{name}}` placeholders of a playbook, with their defaults (None: required).
 pub fn variables(name: &str) -> Result<Vec<(String, Option<&'static str>)>> {
     let text = template(name)?;
@@ -180,6 +327,64 @@ mod tests {
                 .iter()
                 .any(|s| s.save.as_deref() == Some("architecture"))
         );
+    }
+
+    #[test]
+    fn outlines_say_what_a_playbook_does_before_it_is_filled_in() {
+        let discover = outline("discover").unwrap();
+        assert_eq!(discover.claims.len(), 4);
+        let arch = &discover.steps[0];
+        assert!(
+            arch.starts_with("**architecture**: the peer you pick in the folder you pick, following the reverse-engineer skill: Reverse-engineer this codebase."),
+            "{arch}"
+        );
+        assert!(arch.contains("saved as knowledge 'architecture'"), "{arch}");
+        let build = discover
+            .steps
+            .iter()
+            .find(|s| s.starts_with("**build**"))
+            .unwrap();
+        assert!(
+            build.contains("the folder's `test` check must pass") && build.contains("Proves KB-2"),
+            "{build}"
+        );
+        assert!(discover.steps.last().unwrap().contains("you sign off"));
+        assert!(
+            discover
+                .needs
+                .iter()
+                .any(|n| n.contains("checks defined on it by its owner") && n.contains("test"))
+        );
+
+        let sdlc = outline("sdlc").unwrap();
+        let verify = sdlc
+            .steps
+            .iter()
+            .find(|s| s.starts_with("**verify**"))
+            .unwrap();
+        assert!(
+            verify.contains("a member of squad #qa")
+                && verify.contains("applies the commit of step impl"),
+            "{verify}"
+        );
+        assert!(sdlc.needs.iter().any(|n| n.contains("#qa")));
+        assert!(
+            sdlc.needs
+                .iter()
+                .any(|n| n.contains("Knowledge topics architecture, risks"))
+        );
+        for (name, _) in list() {
+            let o = outline(name).unwrap();
+            assert!(
+                !o.steps.is_empty() && !o.claims.is_empty() && !o.needs.is_empty(),
+                "{name}"
+            );
+            assert!(
+                o.steps.iter().all(|s| !s.contains("PICKED")),
+                "{name}: {:?}",
+                o.steps
+            );
+        }
     }
 
     #[test]

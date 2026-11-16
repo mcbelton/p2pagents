@@ -613,6 +613,51 @@ async function loadPlaybooks() {
   playbooks = (await api("/api/playbooks")).playbooks;
   const select = $("#playbook");
   for (const p of playbooks) select.append(el("option", { value: p.name, text: `${p.name}: ${p.description}` }));
+  renderPlanExplain();
+}
+
+const PLAN_INTRO = [
+  "**A plan runs several agent tasks on your peers, in order, and keeps evidence of what was proven.**",
+  "",
+  "Pick a playbook above to see what it does, or write your own, one step per line:",
+  "",
+  "- `claim: C-1 The parser handles empty input`: what must be true at the end",
+  "- `fix @alice:app skill=implement-change verify=test claims=C-1 Make the parser accept empty input`: step `fix` runs on peer alice in her `app` folder; afterwards alice's runtime runs her `test` check, and the step only passes if it does",
+  "- `review after fix approve @me claims=C-1 Approve the fix`: after `fix`, you sign off",
+  "",
+  "Other options: `attempts=3` (retry with the failures), `apply=fix` (another peer checks the commit independently), `context=` / `save=` (knowledge), `#squad` (any member of a squad). A claim is proven only by passing checks or a sign-off; the run is saved under **Evidence runs**.",
+].join("\n");
+
+/// Explains the selected playbook (or what a plan is) above the plan editor.
+function renderPlanExplain() {
+  const box = $("#plan-explain");
+  if (state.mode !== "plan") {
+    box.hidden = true;
+    return;
+  }
+  const p = playbooks.find((x) => x.name === $("#playbook").value);
+  let text;
+  if (p) {
+    const o = p.outline;
+    text = [
+      `**${p.name}: ${p.description}**`,
+      "",
+      "What it does, step by step:",
+      ...o.steps.map((s, i) => `${i + 1}. ${s}`),
+      "",
+      "What it proves (only with passing checks or a sign-off):",
+      ...o.claims.map(([id, claim]) => `- ${id}: ${claim}`),
+      "",
+      "What you need:",
+      ...o.needs.map((n) => `- ${n}`),
+      "",
+      "Press **Use** to pick the peer, folder, checks and approver; the plan is checked before it runs.",
+    ].join("\n");
+  } else if (!$("#composer-input").value.trim()) {
+    text = PLAN_INTRO;
+  }
+  box.hidden = !text;
+  if (text) box.replaceChildren(el("details", { open: "" }, el("summary", { text: p ? `What "${p.name}" does` : "What is a plan?" }), renderMarkdown(text)));
 }
 
 const CHECK_VARS = new Set(["build", "test", "lint", "secscan", "licenses", "secrets"]);
@@ -1045,6 +1090,7 @@ function updateComposer() {
   const noProviders = task && !availableProviders().length;
   $("#task-opts").hidden = !task;
   $("#playbook-opts").hidden = !plan;
+  renderPlanExplain();
   input.rows = plan ? 6 : 2;
   input.placeholder = plan
     ? `Pick a playbook above and press Use, or write a plan: claim lines, then one step per line, e.g.\nclaim: C-1 The parser handles empty input\n${PLAN_EXAMPLE}`
@@ -1254,7 +1300,11 @@ function init() {
   $("#playbook-use").addEventListener("click", openPlaybook);
   $("#playbook-cancel").addEventListener("click", () => $("#playbook-dialog").close());
   $("#playbook-form").addEventListener("submit", submitPlaybook);
-  $("#composer-input").addEventListener("input", schedulePlanCheck);
+  $("#playbook").addEventListener("change", renderPlanExplain);
+  $("#composer-input").addEventListener("input", () => {
+    schedulePlanCheck();
+    if (!$("#playbook").value) renderPlanExplain();
+  });
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
   loadGithub().catch((err) => toast(err.message, "error"));

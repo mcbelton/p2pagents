@@ -350,6 +350,8 @@ Use it in a plan step with skill=security-review.")]
 enum PlaybookCommand {
     /// List the playbooks and what they need.
     List,
+    /// Explain what a playbook does, step by step, and what you need to run it.
+    Explain { name: String },
     /// Print a playbook as a plan, filled in with --set values.
     #[command(after_help = "\
 examples:
@@ -1235,6 +1237,29 @@ fn run_playbook(command: PlaybookCommand) -> Result<()> {
                     vars.join(", ")
                 );
             }
+        }
+        PlaybookCommand::Explain { name } => {
+            let description = playbooks::list()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, d)| d)
+                .unwrap_or_default();
+            let o = playbooks::outline(&name)?;
+            println!("{name}: {description}\n\nWhat it does, step by step:");
+            for (i, step) in o.steps.iter().enumerate() {
+                println!("  {}. {}", i + 1, step.replace("**", ""));
+            }
+            println!("\nWhat it proves (only with passing checks or a sign-off):");
+            for (id, claim) in &o.claims {
+                println!("  - {id}: {claim}");
+            }
+            println!("\nWhat you need:");
+            for need in &o.needs {
+                println!("  - {need}");
+            }
+            println!(
+                "\nFill it in: p2pagents playbook show {name} --set peer=<peer> ... > {name}.plan, then /plan {name}.plan"
+            );
         }
         PlaybookCommand::Show { name, set } => {
             let mut vars = std::collections::BTreeMap::new();

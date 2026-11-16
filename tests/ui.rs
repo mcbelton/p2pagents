@@ -644,6 +644,14 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         .map(|p| p["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["bootstrap", "discover", "sdlc", "learn"]);
+    let discover = &books["playbooks"][1]["outline"];
+    assert!(
+        discover["steps"][0]
+            .as_str()
+            .unwrap()
+            .contains("the peer you pick")
+    );
+    assert_eq!(discover["claims"].as_array().unwrap().len(), 4);
     let post = |path: &str, body: &str| {
         let (host, token, path, body) = (
             host.clone(),
