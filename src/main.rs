@@ -1313,7 +1313,8 @@ fn start_monitors(
                 | IncidentKind::Resolved
                 | IncidentKind::Learned
         ) {
-            alerts.broadcast(format!(
+            // Peers on the allowlist that aren't connected get it when they connect.
+            alerts.alert(format!(
                 "[{name} alert] {} {}: {line}",
                 e.monitor,
                 format!("{:?}", e.kind).to_lowercase()

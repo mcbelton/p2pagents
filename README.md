@@ -635,7 +635,7 @@ option that takes a list adds to it: `skill=adr skill=api-contract` is
 | --- | --- |
 | ✅ proven | Every step that claims it finished, each with verified evidence: all its checks passed, or the approver approved |
 | ❌ failed | A step that claims it failed or was skipped (failed checks, rejected, unreachable) |
-| ⚠️ unverified | It rests on a model's word only (no checks or sign-off), or no step claims it |
+| ⚠️ unverified | It rests on a model's word: a step that claims it has neither checks nor a sign-off (even if another step proves it), or no step claims it. The plan check warns about both before the run, and the web UI offers the fix (e.g. **Let review prove C-1**) |
 | ⏳ pending | The run was cancelled before its steps finished |
 
 A run **passes** only if every claim is proven. Runs are saved in the boss's profile under
@@ -786,9 +786,10 @@ p2pagents monitor add api --share svc --check health --every 60 --fail-after 3 -
 
 - Every run is a **metric** (ok, latency, exit code) in the profile's `ops/metrics.jsonl`.
 - `fail-after` failures in a row open an **incident** (`ops/incidents.jsonl`). The agent
-  **alerts** its terminal and its connected peers by chat. An incident stays open until
-  the monitor passes again, also across agent restarts, so the same failure never alerts
-  or runs the debugging agent twice.
+  **alerts** its terminal and the peers on its allowlist by chat; a peer that isn't
+  connected gets the alerts it missed when it connects (the last 20, up to a day old, while
+  the agent runs). An incident stays open until the monitor passes again, also across
+  agent restarts, so the same failure never alerts or runs the debugging agent twice.
 - A monitor whose folder or check no longer exists **can't run**: it is skipped (no
   samples, no incidents) and the report and **Health** panel say what to fix, or to
   `p2pagents monitor remove` it. Monitors use the folder's checks as they are now.
@@ -1033,7 +1034,8 @@ p2pagents --name me --providers copilot --serve --ui
   their folders, squads, the folders' checks and MCP servers, skills, knowledge topics,
   `after` and other options. A click adds to the step your cursor is on, in the place the
   plan syntax expects (skills you click add up, who runs it is replaced), or starts a new
-  step on an empty line, then selects what to type next. The plan is checked as you type.
+  step on an empty line, then selects what to type next. The plan is checked as you type,
+  and problems with a clear fix come with a button that makes it.
   Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
   the plan on its own at set times ([scheduled plans](#scheduled-plans)). "What is a
   plan?" stays folded until you open it.

@@ -72,6 +72,17 @@ const planText = (() => {
     }
   }
 
+  /// Removes `word`'s values from the step's option (claims=C-1 from claims=C-1,C-2);
+  /// an option left without values goes.
+  function removeOption(step, word) {
+    const at = step.options.findIndex((o) => optionOf(o) === optionOf(word));
+    if (at < 0) return;
+    const drop = valueOf(word).split(",");
+    const values = valueOf(step.options[at]).split(",").filter((v) => v && !drop.includes(v));
+    if (values.length) step.options[at] = `${keyOf(step.options[at])}=${values.join(",")}`;
+    else step.options.splice(at, 1);
+  }
+
   /// A step line's parts. Lenient, so a click can repair a line: parts out of order
   /// are found, repeated options are merged, and a line of plain words is what to do.
   function parseStep(line) {
@@ -198,7 +209,8 @@ const planText = (() => {
     }
     if (what === "step") {
       const id = freeId(ids, (n) => `step${n}`, ids.length + 1);
-      const [line, select] = make([id, target, check ? `verify=${check}` : "", proves], TODO);
+      // Only a step with a check can prove a claim: without one it would spoil it.
+      const [line, select] = make([id, target, check ? `verify=${check}` : "", check ? proves : ""], TODO);
       return placeLine(text, at, kind, line, select);
     }
     const of = (kind === "step" && parseStep(at.line).id) || ids.at(-1);
@@ -208,5 +220,31 @@ const planText = (() => {
     return placeLine(text, at, kind, line, select);
   }
 
-  return { addPart, addLine, stepIds, claimIds, parseStep, formatStep, ERRORS };
+  /// Makes a plan check fix's edits (Fix in src/plan.rs) on `text`: add or remove a
+  /// step's option, add a line after a step's, remove a claim. Returns the new text.
+  function applyFix(text, edits) {
+    for (const edit of edits) {
+      const lines = linesOf(text);
+      if (edit.do === "remove_claim") {
+        const at = lines.find((l) => kindOf(l.line) === "claim" && claimIds(l.line)[0] === edit.claim);
+        if (at) {
+          text = at.end < text.length ? text.slice(0, at.start) + text.slice(at.end + 1)
+            : text.slice(0, Math.max(at.start - 1, 0));
+        }
+        continue;
+      }
+      const at = lines.find((l) => kindOf(l.line) === "step" && parseStep(l.line).id === (edit.step ?? edit.after));
+      if (!at) continue;
+      let line = `${at.line}\n${edit.line}`;
+      if (edit.do !== "add_line") {
+        const step = parseStep(at.line);
+        (edit.do === "add" ? setOption : removeOption)(step, edit.option);
+        line = at.line.match(/^\s*/)[0] + formatStep(step);
+      }
+      text = text.slice(0, at.start) + line + text.slice(at.end);
+    }
+    return text;
+  }
+
+  return { addPart, addLine, applyFix, stepIds, claimIds, parseStep, formatStep, ERRORS };
 })();

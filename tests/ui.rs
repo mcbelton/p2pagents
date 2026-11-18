@@ -847,8 +847,28 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     assert!(
         messages
             .iter()
-            .any(|m| m.contains("no step proves claim C-1")),
+            .any(|m| m.starts_with("Nothing proves C-1, so it will end unverified.")),
         "{messages:?}"
+    );
+    // With what fixes it, for the page to offer as buttons.
+    let unproven = checked["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| {
+            p["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Nothing proves C-1")
+        })
+        .unwrap();
+    assert_eq!(
+        unproven["fixes"],
+        serde_json::json!([
+            { "label": "Prove C-1 with your sign-off", "edits": [{ "do": "add_line", "after": "a",
+                "line": "review after a approve @me claims=C-1 Approve if C-1 holds: x" }] },
+            { "label": "Remove claim C-1", "edits": [{ "do": "remove_claim", "claim": "C-1" }] },
+        ])
     );
     let ok = post(
         "/api/plans/check",

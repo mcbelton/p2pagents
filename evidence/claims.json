@@ -385,10 +385,11 @@
     {
       "id": "OPS-2",
       "area": "operations",
-      "claim": "Repeated monitor failures open an incident and alert the team; a matching troubleshooting guide's fix runs first, otherwise the debugging agent diagnoses read-only. A fix it names with high confidence runs and, if the monitor then passes, becomes a new active TSG; unsure or failed fixes leave a draft TSG and escalate to a person.",
+      "claim": "Repeated monitor failures open an incident and alert the team (a teammate who isn't connected gets the alerts it missed when it connects); a matching troubleshooting guide's fix runs first, otherwise the debugging agent diagnoses read-only. A fix it names with high confidence runs and, if the monitor then passes, becomes a new active TSG; unsure or failed fixes leave a draft TSG and escalate to a person.",
       "tests": [
         "lib::knowledge::troubleshooting_guides_parse_and_match",
         "lib::ops::a_matching_tsg_fixes_the_incident_without_the_model",
+        "agents::alerts_reach_teammates_who_connect_later",
         "lib::ops::a_confident_verified_diagnosis_becomes_a_new_tsg",
         "lib::ops::unsure_or_failed_fixes_escalate_with_a_draft_tsg",
         "lib::ops::assessments_are_parsed_leniently"
@@ -435,7 +436,7 @@
     {
       "id": "PRE-1",
       "area": "squads",
-      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type. A malformed line is explained with what a step line looks like, repeating a list option adds to it (one-value options can't be repeated), and options typed into the task text are flagged.",
+      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type. A malformed line is explained with what a step line looks like, repeating a list option adds to it (one-value options can't be repeated), and options typed into the task text are flagged. A claim that would end unverified (nothing proves it, or a step without checks claims it) is flagged on the step, saying why, with the changes that fix it: let a sign-off prove it, add your sign-off, use the folder's own check, or remove the claim.",
       "tests": [
         "lib::plan::preflight_finds_what_would_fail_before_anything_runs",
         "lib::plan::step_lines_say_what_is_wrong_and_repeated_options_add_up",
@@ -702,7 +703,7 @@
     {
       "id": "UX-1",
       "area": "ui",
-      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
       "tests": [
         "ui::the_page_follows_the_ux_guidelines",
         "ui::the_plan_editor_puts_each_part_where_it_belongs",

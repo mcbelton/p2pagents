@@ -620,6 +620,148 @@ pub struct Problem {
     pub step: Option<String>,
     pub error: bool,
     pub message: String,
+    /// Changes to the plan that resolve it, which the web UI offers as buttons.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<Fix>,
+}
+
+/// A change to the plan that resolves a problem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Fix {
+    /// What it does, as its button says.
+    pub label: String,
+    /// The changes to the plan text, in order (ui/plan-text.js makes them).
+    pub edits: Vec<Edit>,
+}
+
+/// One change to plan text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum Edit {
+    /// Adds an option (`claims=C-1`) to a step; a list option adds its values.
+    Add { step: String, option: String },
+    /// Removes an option's values (`claims=C-1`) from a step.
+    Remove { step: String, option: String },
+    /// Puts a new line after a step's line.
+    AddLine { after: String, line: String },
+    /// Removes a claim's line.
+    RemoveClaim { claim: String },
+}
+
+/// A step name like `base` that `plan` doesn't use yet (base, base-2, ...).
+fn free_id(plan: &Plan, base: &str) -> String {
+    let taken = |id: &str| plan.steps.iter().any(|s| s.id == id);
+    if !taken(base) {
+        return base.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|id| !taken(id))
+        .expect("a free name")
+}
+
+/// How `step`, which claims `claim` but has no checks, can stop leaving it unverified:
+/// let a sign-off prove it instead, or check the step's work with its folder's check.
+fn unchecked_fixes(plan: &Plan, peers: &[PeerInfo], step: &Step, claim: &str) -> Vec<Fix> {
+    use crate::llm::Access;
+    let option = format!("claims={claim}");
+    let drop = Edit::Remove {
+        step: step.id.clone(),
+        option: option.clone(),
+    };
+    let mut fixes = Vec::new();
+    if let Some(s) = plan
+        .steps
+        .iter()
+        .find(|s| s.approve && s.claims.iter().any(|c| c == claim))
+    {
+        fixes.push(Fix {
+            label: format!("Let {} prove {claim}", s.id),
+            edits: vec![drop],
+        });
+    } else if let Some(s) = plan
+        .steps
+        .iter()
+        .find(|s| s.approve && s.after.contains(&step.id))
+    {
+        fixes.push(Fix {
+            label: format!("Let {} prove {claim}", s.id),
+            edits: vec![
+                drop,
+                Edit::Add {
+                    step: s.id.clone(),
+                    option,
+                },
+            ],
+        });
+    } else {
+        let id = free_id(plan, "review");
+        fixes.push(Fix {
+            label: format!("Prove {claim} with your sign-off on {}", step.id),
+            edits: vec![
+                drop,
+                Edit::AddLine {
+                    after: step.id.clone(),
+                    line: format!(
+                        "{id} after {0} approve @me {option} Check the result of {0} and approve it",
+                        step.id
+                    ),
+                },
+            ],
+        });
+    }
+    let folder = step.share.as_deref().unwrap_or(crate::shares::DATA_SHARE);
+    if let Target::Peer(name) = &step.target
+        && let Some(share) = peers
+            .iter()
+            .find(|p| &p.name == name)
+            .and_then(|p| p.shares.iter().find(|s| s.name == folder))
+        && share.access >= Access::Full
+        && let Some(check) = share.checks.first()
+    {
+        fixes.push(Fix {
+            label: format!("Check {}'s work with the folder's {check} check", step.id),
+            edits: vec![Edit::Add {
+                step: step.id.clone(),
+                option: format!("verify={check}"),
+            }],
+        });
+    }
+    fixes
+}
+
+/// How `claim`, which no step proves, can be proven by a sign-off, or removed.
+fn unproven_fixes(plan: &Plan, claim: &ClaimDef) -> Vec<Fix> {
+    let option = format!("claims={}", claim.id);
+    let mut fixes = Vec::new();
+    if let Some(s) = plan.steps.iter().rev().find(|s| s.approve) {
+        fixes.push(Fix {
+            label: format!("Let {} prove {}", s.id, claim.id),
+            edits: vec![Edit::Add {
+                step: s.id.clone(),
+                option,
+            }],
+        });
+    } else if let Some(last) = plan.steps.last() {
+        let id = free_id(plan, "review");
+        fixes.push(Fix {
+            label: format!("Prove {} with your sign-off", claim.id),
+            edits: vec![Edit::AddLine {
+                after: last.id.clone(),
+                line: format!(
+                    "{id} after {} approve @me {option} Approve if {} holds: {}",
+                    last.id, claim.id, claim.text
+                ),
+            }],
+        });
+    }
+    fixes.push(Fix {
+        label: format!("Remove claim {}", claim.id),
+        edits: vec![Edit::RemoveClaim {
+            claim: claim.id.clone(),
+        }],
+    });
+    fixes
 }
 
 /// Why `peer` can't run `step`, if it can't: provider, folder, checks, access.
@@ -710,6 +852,7 @@ pub fn preflight(
             step: step.map(|s| s.id.clone()),
             error,
             message,
+            fixes: Vec::new(),
         })
     };
     for step in &plan.steps {
@@ -780,15 +923,24 @@ pub fn preflight(
             report(Some(step), true, reasons.join("; "));
         }
     }
+    // Each claim needs a step that can prove it: one with checks, or a sign-off.
     for claim in &plan.claims {
+        let mut warn = |step: Option<&Step>, message: String, fixes: Vec<Fix>| {
+            problems.push(Problem {
+                step: step.map(|s| s.id.clone()),
+                error: false,
+                message,
+                fixes,
+            })
+        };
         if claim.text == TODO_CLAIM {
-            report(
+            warn(
                 None,
-                false,
                 format!(
                     "claim {} still says \"{TODO_CLAIM}\": say what must be true",
                     claim.id
                 ),
+                Vec::new(),
             );
         }
         let proving: Vec<&Step> = plan
@@ -797,19 +949,31 @@ pub fn preflight(
             .filter(|s| s.claims.contains(&claim.id))
             .collect();
         if proving.is_empty() {
-            report(
+            warn(
                 None,
-                false,
-                format!("no step proves claim {}: it will be unverified", claim.id),
-            );
-        } else if proving.iter().any(|s| !s.approve && s.checks.is_empty()) {
-            report(
-                None,
-                false,
                 format!(
-                    "claim {} is claimed by a step without checks (verify=): that step can only leave it unverified",
+                    "Nothing proves {0}, so it will end unverified. Give it to a sign-off or to a step with a check (claims={0} verify=...), or remove it.",
                     claim.id
                 ),
+                unproven_fixes(plan, claim),
+            );
+        }
+        let signoff = proving.iter().find(|s| s.approve);
+        for step in proving.iter().filter(|s| !s.approve && s.checks.is_empty()) {
+            let outcome = match signoff {
+                Some(s) => format!(
+                    "so {} will end unverified even if the sign-off {} is approved",
+                    claim.id, s.id
+                ),
+                None => format!("so {} can only end unverified", claim.id),
+            };
+            warn(
+                Some(step),
+                format!(
+                    "{} claims {} but nothing checks its work, {outcome}. Only a check the peer runs (verify=) or a sign-off can prove a claim.",
+                    step.id, claim.id
+                ),
+                unchecked_fixes(plan, peers, step, &claim.id),
             );
         }
     }
@@ -1519,14 +1683,102 @@ mod tests {
         assert!(
             claims
                 .iter()
-                .any(|c| c.starts_with("W : no step proves claim C-2")),
+                .any(|c| c.starts_with("W : Nothing proves C-2, so it will end unverified.")),
             "{claims:?}"
         );
         assert!(
-            claims
-                .iter()
-                .any(|c| c.contains("claim C-1 is claimed by a step without checks")),
+            claims.iter().any(|c| c.starts_with(
+                "W a: a claims C-1 but nothing checks its work, so C-1 can only end unverified."
+            )),
             "{claims:?}"
+        );
+
+        // Claim problems come with the changes that fix them.
+        let fixes = |text: &str| {
+            preflight(&Plan::parse(text).unwrap(), &peers, &squads, &kb, &skills)
+                .into_iter()
+                .map(|p| (p.step, p.message, p.fixes))
+                .collect::<Vec<_>>()
+        };
+        let remove = |step: &str, option: &str| Edit::Remove {
+            step: step.into(),
+            option: option.into(),
+        };
+        let add = |step: &str, option: &str| Edit::Add {
+            step: step.into(),
+            option: option.into(),
+        };
+        // A sign-off proves the claim too: the step without checks only spoils it.
+        let both = fixes(
+            "claim: C-1 x\nstep1 @alice:app claims=C-1 Write it\nreview after step1 approve @me claims=C-1 Check it",
+        );
+        assert_eq!(both.len(), 1, "{both:?}");
+        let (step, message, offered) = &both[0];
+        assert_eq!(step.as_deref(), Some("step1"));
+        assert!(
+            message.contains("so C-1 will end unverified even if the sign-off review is approved"),
+            "{message}"
+        );
+        assert_eq!(
+            offered,
+            &[
+                Fix {
+                    label: "Let review prove C-1".into(),
+                    edits: vec![remove("step1", "claims=C-1")],
+                },
+                Fix {
+                    label: "Check step1's work with the folder's test check".into(),
+                    edits: vec![add("step1", "verify=test")],
+                },
+            ]
+        );
+        // No check to offer on bob's folder (not full access); a sign-off after it
+        // takes the claim over, or a new one is added.
+        let after = fixes("claim: C-1 x\na @bob:app claims=C-1 do\nok after a approve @me Approve");
+        assert_eq!(
+            after[0].2,
+            [Fix {
+                label: "Let ok prove C-1".into(),
+                edits: vec![remove("a", "claims=C-1"), add("ok", "claims=C-1")],
+            }]
+        );
+        let alone = fixes("claim: C-1 x\nreview @bob:app do\na @bob:app claims=C-1 do");
+        assert_eq!(
+            alone[0].2,
+            [Fix {
+                label: "Prove C-1 with your sign-off on a".into(),
+                edits: vec![
+                    remove("a", "claims=C-1"),
+                    Edit::AddLine {
+                        after: "a".into(),
+                        line: "review-2 after a approve @me claims=C-1 Check the result of a and approve it".into(),
+                    },
+                ],
+            }]
+        );
+        let unproven = fixes("claim: C-1 x\nclaim: C-2 y\na @alice:app verify=test claims=C-1 do");
+        assert_eq!(
+            unproven[0].2,
+            [
+                Fix {
+                    label: "Prove C-2 with your sign-off".into(),
+                    edits: vec![Edit::AddLine {
+                        after: "a".into(),
+                        line: "review after a approve @me claims=C-2 Approve if C-2 holds: y"
+                            .into(),
+                    }],
+                },
+                Fix {
+                    label: "Remove claim C-2".into(),
+                    edits: vec![Edit::RemoveClaim {
+                        claim: "C-2".into()
+                    }],
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&unproven[0].2[0].edits[0]).unwrap(),
+            serde_json::json!({ "do": "add_line", "after": "a", "line": "review after a approve @me claims=C-2 Approve if C-2 holds: y" })
         );
         let late = check("a @alice:app Fix it skill=implement-change");
         assert_eq!(

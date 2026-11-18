@@ -287,6 +287,43 @@ async fn peers_discover_each_other_via_gossip_and_chat() {
 }
 
 #[tokio::test]
+async fn alerts_reach_teammates_who_connect_later() {
+    let (mut a, mut b) = (Node::new("a"), Node::new("b"));
+    mutual(&mut a, &mut b);
+    let (a, _ae) = a.start().await;
+    // b isn't connected: a holds its alerts (the last 20) until it is.
+    for n in 1..=22 {
+        assert_eq!(a.alert(format!("[a alert] api opened: failure {n}")), 0);
+    }
+    assert_eq!(a.broadcast("just chat"), 0);
+    let (b, mut b_events) = b.start().await;
+    b.connect(a.addr()).await.unwrap();
+    let chat = |e: &Event| matches!(e, Event::Chat { .. });
+    let mut held = Vec::new();
+    for _ in 0..20 {
+        let Event::Chat { from, text } = next_matching(&mut b_events, chat).await else {
+            unreachable!()
+        };
+        assert_eq!(from, "a");
+        held.push(text);
+    }
+    assert_eq!(
+        held[0],
+        "[a alert] api opened: failure 3 (raised less than a minute ago, while you weren't connected)"
+    );
+    assert!(held[19].starts_with("[a alert] api opened: failure 22 (raised"));
+    // Connected now: alerts arrive at once, and none of the held ones again.
+    assert_eq!(a.alert("[a alert] api resolved"), 1);
+    assert_eq!(
+        next_matching(&mut b_events, chat).await,
+        Event::Chat {
+            from: "a".into(),
+            text: "[a alert] api resolved".into()
+        }
+    );
+}
+
+#[tokio::test]
 async fn rejects_peers_that_are_not_allowlisted() {
     let mut a = Node::new("a");
     let mut stranger = Node::new("stranger");

@@ -100,6 +100,8 @@ Every list and panel defines three states:
   the cursor: each part goes where the syntax expects it, into the line the cursor is on
   (or a new line), and a placeholder to type over is selected. Errors about that syntax
   show what a correct line looks like.
+- A warning says what will happen and what to do, in plain words, on the thing it is
+  about (a step, not just a claim id); when the fix is clear, a button makes it.
 - Live previews for anything with consequences in time or scope (next runs, what a
   plugin contains, the plan check).
 

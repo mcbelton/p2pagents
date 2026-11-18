@@ -21,10 +21,11 @@ const part = (text, value) => {
   const [plan, pos] = cursor(text);
   return show(plan, planText.addPart(plan, pos, value, defaults));
 };
-const line = (text, what) => {
+const line = (text, what, given = defaults) => {
   const [plan, pos] = cursor(text);
-  return show(plan, planText.addLine(plan, pos, what, defaults));
+  return show(plan, planText.addLine(plan, pos, what, given));
 };
+const fixed = (text, edits) => planText.applyFix(text, edits);
 
 const cases = [
   // Skills clicked in an empty plan start a step, then add up.
@@ -72,9 +73,29 @@ const cases = [
     "fix @x do\nstep3 @worker:repo verify=test [What to do]\nlast @x do"],
   ["step proves a claim if there is one", line("claim: C-1 x\nfix @x d|o", "step"),
     "claim: C-1 x\nfix @x do\nstep2 @worker:repo verify=test claims=C-1 [What to do]"],
+  ["no claim for a step without a check", line("claim: C-1 x\nfix @x d|o", "step", { target: "@worker:repo" }),
+    "claim: C-1 x\nfix @x do\nstep2 @worker:repo [What to do]"],
   ["sign-off on the step at the cursor", line("fix @x d|o\nship @x do", "signoff"),
     "fix @x do\nreview after fix approve @me [Check the result of fix and approve it]\nship @x do"],
   ["sign-off in an empty plan", line("|", "signoff"), "review approve @me [Approve it]"],
+  // The plan check's fixes (Fix in src/plan.rs), made on the text.
+  ["the sign-off proves it alone", fixed(
+    "claim: C-1 x\nstep1 @worker:repo claims=C-1 skill=adr,api-contract Write\nreview after step1 approve @me claims=C-1 Check",
+    [{ do: "remove", step: "step1", option: "claims=C-1" }]),
+  "claim: C-1 x\nstep1 @worker:repo skill=adr,api-contract Write\nreview after step1 approve @me claims=C-1 Check"],
+  ["one claim of two removed", fixed("a @x claims=C-1,C-2 do", [{ do: "remove", step: "a", option: "claims=C-1" }]),
+    "a @x claims=C-2 do"],
+  ["a sign-off takes a claim over", fixed("a @x claims=C-1 do\nok after a approve @me claims=C-2 Approve",
+    [{ do: "remove", step: "a", option: "claims=C-1" }, { do: "add", step: "ok", option: "claims=C-1" }]),
+  "a @x do\nok after a approve @me claims=C-2,C-1 Approve"],
+  ["a new sign-off", fixed("a @x claims=C-1 do\nb @x do", [{ do: "remove", step: "a", option: "claims=C-1" },
+    { do: "add_line", after: "a", line: "review after a approve @me claims=C-1 Check the result of a and approve it" }]),
+  "a @x do\nreview after a approve @me claims=C-1 Check the result of a and approve it\nb @x do"],
+  ["a check added", fixed("  a @x claims=C-1 do", [{ do: "add", step: "a", option: "verify=test" }]),
+    "  a @x claims=C-1 verify=test do"],
+  ["a claim removed", fixed("claim: C-1 x\nclaim: C-2 y\na @x do", [{ do: "remove_claim", claim: "C-2" }]),
+    "claim: C-1 x\na @x do"],
+  ["the last line removed", fixed("a @x do\nclaim: C-2 y", [{ do: "remove_claim", claim: "C-2" }]), "a @x do"],
 ];
 
 const failed = cases.filter(([, got, want]) => got !== want);

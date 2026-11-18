@@ -210,6 +210,11 @@ struct PendingTask {
 /// How long a served task's result is kept to answer a re-sent request.
 const RECENT_RESULTS: Duration = Duration::from_secs(600);
 
+/// The most alerts held for an allowlisted peer that isn't connected, and for how
+/// long: they are sent when it connects.
+const HELD_ALERTS: usize = 20;
+const HOLD_ALERTS_FOR: Duration = Duration::from_secs(24 * 3600);
+
 /// A served task, the result sent for it, and when.
 type RecentResult = (LlmTask, Message, Instant);
 
@@ -270,6 +275,9 @@ struct Inner {
     recent: Mutex<HashMap<(EndpointId, u64), RecentResult>>,
     /// Peers reported via `PeerConnected` and not yet via `PeerDisconnected`.
     announced: Mutex<HashSet<EndpointId>>,
+    /// Alerts for allowlisted peers that weren't connected, with when they were
+    /// raised; sent when the peer connects (see [`Agent::alert`]).
+    held: Mutex<HashMap<EndpointId, VecDeque<(Instant, String)>>>,
     next_task_id: AtomicU64,
     worktrees_dir: PathBuf,
     /// Approval requests waiting for this agent's user, by local id.
@@ -321,6 +329,7 @@ impl Agent {
             serving: Mutex::new(HashMap::new()),
             recent: Mutex::new(HashMap::new()),
             announced: Mutex::new(HashSet::new()),
+            held: Mutex::new(HashMap::new()),
             next_task_id: AtomicU64::new(1),
             worktrees_dir: config.worktrees_dir,
             approvals: Mutex::new(BTreeMap::new()),
@@ -536,6 +545,44 @@ impl Agent {
             .values()
             .filter(|p| p.tx.send(msg.clone()).is_ok())
             .count()
+    }
+
+    /// Sends an alert, a chat message the team must see, to every connected peer and
+    /// holds it for the allowlisted peers that aren't connected: each gets it when it
+    /// connects (the last [`HELD_ALERTS`], up to [`HOLD_ALERTS_FOR`] old, while this
+    /// agent runs). Returns how many peers it was sent to now.
+    pub fn alert(&self, text: impl Into<String>) -> usize {
+        let text = text.into();
+        let allowlisted: Vec<EndpointId> = self
+            .inner
+            .trust
+            .lock()
+            .unwrap()
+            .peers
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        let msg = Message::Chat {
+            from: self.inner.name.clone(),
+            text: text.clone(),
+        };
+        // Held under the peers lock: a peer registering now gets it either way.
+        let peers = self.inner.peers.lock().unwrap();
+        let sent = peers
+            .values()
+            .filter(|p| p.tx.send(msg.clone()).is_ok())
+            .count();
+        let now = Instant::now();
+        let mut held = self.inner.held.lock().unwrap();
+        for id in allowlisted.into_iter().filter(|id| !peers.contains_key(id)) {
+            let queue = held.entry(id).or_default();
+            queue.retain(|(at, _)| now.duration_since(*at) < HOLD_ALERTS_FOR);
+            queue.push_back((now, text.clone()));
+            while queue.len() > HELD_ALERTS {
+                queue.pop_front();
+            }
+        }
+        sent
     }
 
     /// Delegates an LLM task to a connected peer and waits for its result.
@@ -889,6 +936,29 @@ impl Inner {
             return true;
         }
         false
+    }
+
+    /// Sends `id` the alerts raised while it wasn't connected, saying how long ago.
+    fn send_held(&self, id: EndpointId, tx: &mpsc::UnboundedSender<Message>) {
+        let Some(queue) = self.held.lock().unwrap().remove(&id) else {
+            return;
+        };
+        let now = Instant::now();
+        for (at, text) in queue {
+            let ago = now.duration_since(at);
+            if ago >= HOLD_ALERTS_FOR {
+                continue;
+            }
+            let ago = match ago.as_secs() {
+                s if s < 60 => "less than a minute".to_owned(),
+                s if s < 3600 => format!("{} min", s / 60),
+                s => format!("{} h", s / 3600),
+            };
+            let _ = tx.send(Message::Chat {
+                from: self.name.clone(),
+                text: format!("{text} (raised {ago} ago, while you weren't connected)"),
+            });
+        }
     }
 
     /// Fails tasks delegated to `peer` once it is really gone.
@@ -1426,6 +1496,7 @@ async fn run_connection(
             }
         }
     }
+    inner.send_held(peer_id, &tx);
     // A shutdown that raced with this handshake missed our close handle.
     if *inner.shutdown.borrow() {
         close.notify_one();

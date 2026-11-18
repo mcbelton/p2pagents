@@ -1278,8 +1278,9 @@ async function submitPlaybook(e) {
 }
 
 /// Checks the plan against connected peers, folders, checks, squads, knowledge and
-/// skills; shows the problems in `box` (under the editor); true if it can run.
-async function checkPlan(text, box = $("#plan-problems")) {
+/// skills; shows the problems in `box` (under the plan's `input`), with buttons for
+/// the fixes the check offers; true if it can run.
+async function checkPlan(text, box = $("#plan-problems"), input = $("#composer-input")) {
   if (!text.trim()) {
     box.hidden = true;
     return false;
@@ -1290,10 +1291,20 @@ async function checkPlan(text, box = $("#plan-problems")) {
     box.replaceChildren(el("p", { class: "ok", text: `✓ Ready to run: ${nOf(res.steps, "step")}, ${nOf(res.claims, "claim")}` }));
     return true;
   }
+  const fix = (f) => el("button", {
+    type: "button", class: "btn small", title: "Change the plan this way",
+    onclick: () => {
+      input.value = planText.applyFix(input.value, f.edits);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+      checkPlan(input.value, box, input).catch(() => {});
+    },
+  }, f.label);
   box.replaceChildren(
     el("p", { class: res.ok ? "warn" : "bad", text: res.ok ? "Ready to run, with warnings:" : "Can't run yet:" }),
     el("ul", {}, ...res.problems.map((p) => el("li", { class: p.error ? "bad" : "warn" },
-      el("strong", { text: `${p.error ? "Error" : "Warning"}${p.step ? ` (step ${p.step})` : ""}: ` }), p.message))));
+      el("strong", { text: `${p.error ? "Error" : "Warning"}${p.step ? ` (step ${p.step})` : ""}: ` }), p.message,
+      p.fixes?.length ? el("span", { class: "fixes" }, ...p.fixes.map(fix)) : null))));
   return res.ok;
 }
 
@@ -1312,7 +1323,7 @@ function openPlanEditor() {
   renderPalette();
   $("#plan-editor").showModal();
   editor.focus();
-  checkPlan(editor.value, $("#plan-editor-check")).catch(() => {});
+  checkPlan(editor.value, $("#plan-editor-check"), editor).catch(() => {});
 }
 
 /// Makes a palette change in the plan editor (see ui/plan-text.js) and selects what
@@ -1392,7 +1403,7 @@ function onPlanEditorInput() {
   clearTimeout(editorTimer);
   editorTimer = setTimeout(() => {
     renderPalette();
-    checkPlan($("#plan-editor-text").value, $("#plan-editor-check")).catch(() => {});
+    checkPlan($("#plan-editor-text").value, $("#plan-editor-check"), $("#plan-editor-text")).catch(() => {});
   }, 600);
 }
 

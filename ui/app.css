@@ -382,6 +382,8 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .plan-problems .bad { color: var(--danger); }
 .plan-problems .warn { color: var(--warn); }
 .plan-problems li { overflow-wrap: anywhere; }
+.plan-problems .fixes { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 4px; }
+.plan-problems .fixes .btn { color: var(--text); }
 .plan-explain { margin: 8px 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); max-height: 280px; overflow: auto; }
 .plan-explain summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 12.5px; }
 .plan-explain .md { font-size: 12.5px; }

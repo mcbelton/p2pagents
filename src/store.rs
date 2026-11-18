@@ -111,20 +111,22 @@ mod tests {
         assert!(leftovers.is_empty());
 
         let lock = FileLock::acquire(&file).unwrap();
+        let (trying, tried) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn({
             let file = file.clone();
             move || {
-                let started = std::time::Instant::now();
+                trying.send(()).unwrap();
                 let _second = FileLock::acquire(&file).unwrap();
-                started.elapsed()
+                std::time::Instant::now()
             }
         });
+        tried.recv().unwrap();
         std::thread::sleep(Duration::from_millis(200));
+        let released = std::time::Instant::now();
         drop(lock);
-        assert!(
-            waiter.join().unwrap() >= Duration::from_millis(150),
-            "waited for the first"
-        );
+        // The second lock is taken only once the first is released, however late
+        // its thread started.
+        assert!(waiter.join().unwrap() >= released, "waited for the first");
         assert!(!dir.path().join("x.json.lock").exists(), "released");
     }
 }
