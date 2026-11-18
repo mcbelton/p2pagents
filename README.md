@@ -676,7 +676,9 @@ p2pagents playbook show spec --set peer=alice --set change="Wishlist" --set chan
 p2pagents playbook show design --set peer=alice --set change="Wishlist" --set change_id=wish > design.plan  # then design and reviews
 ```
 
-In the web UI: **Plan** mode, pick a playbook, then **Use**.
+In the web UI: **Plan** mode, **Start from a playbook…**: each playbook with what it is
+for, the steps it runs, what it proves and what it needs; then pick who does the work and
+where, and the plan is filled in and checked.
 
 | Playbook | What it proves |
 | --- | --- |
@@ -779,7 +781,12 @@ p2pagents monitor add api --share svc --check health --every 60 --fail-after 3 -
 
 - Every run is a **metric** (ok, latency, exit code) in the profile's `ops/metrics.jsonl`.
 - `fail-after` failures in a row open an **incident** (`ops/incidents.jsonl`). The agent
-  **alerts** its terminal and its connected peers by chat.
+  **alerts** its terminal and its connected peers by chat. An incident stays open until
+  the monitor passes again, also across agent restarts, so the same failure never alerts
+  or runs the debugging agent twice.
+- A monitor whose folder or check no longer exists **can't run**: it is skipped (no
+  samples, no incidents) and the report and **Health** panel say what to fix, or to
+  `p2pagents monitor remove` it. Monitors use the folder's checks as they are now.
 - **Auto-fix with TSGs.** A troubleshooting guide is a knowledge topic with front matter
   (`tsg`, `monitor`, `match`, `fix`, `verify`, `status`). The fix check of every active
   guide whose monitor matches, and whose `match` text appears in the failure, is run, then

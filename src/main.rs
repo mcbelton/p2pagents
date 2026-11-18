@@ -1282,7 +1282,6 @@ fn start_monitors(
     profile: &Profile,
     agent: &Agent,
     executor: Option<Arc<dyn Executor>>,
-    shares: &p2pagents::shares::ShareStore,
 ) -> Result<()> {
     use p2pagents::ops::{IncidentEvent, IncidentKind, MonitorStore, Ops};
     let monitors = MonitorStore::load(&profile.monitors_path())?.monitors;
@@ -1321,10 +1320,12 @@ fn start_monitors(
             ));
         }
     };
+    let current = agent.clone();
     let ops = Arc::new(Ops {
         agent_name: agent.name().to_owned(),
         monitors,
-        shares: shares.clone(),
+        // As they are now: shares changed while the agent runs apply to its monitors.
+        shares: Arc::new(move || current.shares()),
         store: profile.ops_store(),
         kb: profile.knowledge(),
         skills: profile.skills(),
@@ -1364,6 +1365,7 @@ fn ops_report(profile: &Profile, hours: u64) -> Result<String> {
         &profile.name,
         hours,
         &monitors,
+        &profile.shares()?,
         &profile.ops_store(),
         &audit,
         &runs,
@@ -2924,7 +2926,6 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         &profile,
         &agent,
         executor.clone().map(|e| e as Arc<dyn Executor>),
-        &shares,
     )?;
 
     for peer in &args.peers {

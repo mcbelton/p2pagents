@@ -1369,7 +1369,7 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// The health dashboard: monitors against their SLOs (last 24 hours), incident
 /// events, peer task statistics, evidence runs and the knowledge base topics.
 async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
-    use crate::ops::{MonitorStore, monitor_stats, open_incidents, task_stats};
+    use crate::ops::{MonitorStore, monitor_stats, task_stats};
     let profile = &s.info.profile;
     let since = crate::runs::unix_now().saturating_sub(24 * 3600);
     let monitors = MonitorStore::load(&profile.monitors_path())
@@ -1377,7 +1377,13 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         .monitors;
     let store = profile.ops_store();
     let incidents = store.incidents(since);
-    let stats = monitor_stats(&monitors, &store.samples(since), &incidents);
+    // The whole log: an incident opened days ago may still be open.
+    let stats = monitor_stats(
+        &monitors,
+        &store.samples(since),
+        &store.incidents(0),
+        &s.agent.shares(),
+    );
     let audit: Vec<_> = AuditLog::read(&profile.audit_path(), 10_000)
         .unwrap_or_default()
         .into_iter()
@@ -1386,8 +1392,9 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     let runs = RunRecord::list(&profile.runs_dir()).unwrap_or_default();
     let recent: Vec<_> = incidents.iter().rev().take(30).cloned().collect();
     Ok(Json(json!({
+        // Monitors with an open incident (one ongoing problem each).
+        "open_incidents": stats.iter().filter(|m| m.open_incident).count(),
         "monitors": stats,
-        "open_incidents": open_incidents(&incidents).len(),
         "incidents": recent,
         "tasks": task_stats(&audit),
         "runs": { "total": runs.len(), "passed": runs.iter().filter(|r| r.passed).count() },

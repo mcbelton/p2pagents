@@ -639,7 +639,11 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     let profile = Profile::open_in(home.path(), "solo").unwrap();
     let app = tempfile::tempdir().unwrap();
     let mut shares = ShareStore::with_data(home.path().join("data"));
-    let checks = [("health".to_owned(), "exit 0".to_owned())].into();
+    let checks = [
+        ("health".to_owned(), "exit 0".to_owned()),
+        ("ping".to_owned(), "exit 0".to_owned()),
+    ]
+    .into();
     shares
         .add_with("app", app.path(), Access::Full, checks, false)
         .unwrap();
@@ -652,8 +656,24 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         fail_after: 3,
         slo: 99.0,
     };
-    monitors.set(monitor, &shares).unwrap();
+    monitors.set(monitor.clone(), &shares).unwrap();
+    let web = Monitor {
+        name: "web".into(),
+        check: "ping".into(),
+        ..monitor
+    };
+    monitors.set(web, &shares).unwrap();
     monitors.save(&profile.monitors_path()).unwrap();
+    // The 'ping' check is removed later: the 'web' monitor can't run any more.
+    shares
+        .add_with(
+            "app",
+            app.path(),
+            Access::Full,
+            [("health".to_owned(), "exit 0".to_owned())].into(),
+            false,
+        )
+        .unwrap();
     let now = p2pagents::runs::unix_now();
     let store = profile.ops_store();
     for ok in [true, false] {
@@ -667,16 +687,19 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             })
             .unwrap();
     }
-    store
-        .record_incident(&IncidentEvent {
-            ts: now,
-            incident: now,
-            monitor: "api".into(),
-            kind: IncidentKind::Opened,
-            text: "api failed".into(),
-            checks: vec![],
-        })
-        .unwrap();
+    // The same failure opened twice (as agents before 0.8.1 did after a restart).
+    for incident in [now - 60, now] {
+        store
+            .record_incident(&IncidentEvent {
+                ts: incident,
+                incident,
+                monitor: "api".into(),
+                kind: IncidentKind::Opened,
+                text: "api failed".into(),
+                checks: vec![],
+            })
+            .unwrap();
+    }
     profile
         .knowledge()
         .write("architecture", "Two services.", "test")
@@ -685,6 +708,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     let mut config = AgentConfig::new("solo", SecretKey::generate());
     config.network = Network::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = shares;
     let (agent, events) = Agent::bind(config).await.unwrap();
     let info = UiInfo {
         profile,
@@ -723,7 +747,15 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     assert_eq!(ops["monitors"][0]["name"], "api");
     assert_eq!(ops["monitors"][0]["availability"], 50.0);
     assert_eq!(ops["monitors"][0]["meets_slo"], false);
-    assert_eq!(ops["open_incidents"], 1);
+    assert!(ops["monitors"][0]["problem"].is_null());
+    assert_eq!(
+        ops["open_incidents"], 1,
+        "one ongoing problem, however often it was opened"
+    );
+    assert_eq!(
+        ops["monitors"][1]["problem"],
+        "folder 'app' has no check 'ping' any more"
+    );
     assert_eq!(ops["incidents"][0]["kind"], "opened");
     assert_eq!(ops["knowledge"][0]["name"], "architecture");
     let topic = get("/api/kb/architecture").await.json();
@@ -1522,12 +1554,34 @@ async fn the_page_follows_the_ux_guidelines() {
         "tools-dialog",
         "when-repeat",
         "when-preview",
+        "playbook-pick",
+        "playbook-choices",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
+    // Playbooks need explaining, so they're picked from cards, not a native dropdown.
+    assert!(!page.contains(r#"<select id="playbook""#));
     let confirm = regex::Regex::new(r"\bconfirm\(").unwrap();
     let html =
         regex::Regex::new(r"\.(inner|outer)HTML\b|insertAdjacentHTML|document\.write").unwrap();
+    // Every dialog closes with Escape (and a stray backdrop click never loses input).
+    let app = request(port, "GET", "/app.js", &host, None, None)
+        .await
+        .body;
+    let guarded = regex::Regex::new(r"for \(const id of \[([^\]]+)\]\) guardDialog")
+        .unwrap()
+        .captures(&app)
+        .expect("app.js guards its dialogs")[1]
+        .to_owned();
+    let dialogs = regex::Regex::new(r#"<dialog[^>]*\bid="([^"]+)""#).unwrap();
+    assert!(dialogs.captures_iter(&page).count() >= 10);
+    for d in dialogs.captures_iter(&page) {
+        assert!(
+            guarded.contains(&format!("\"#{}\"", &d[1])),
+            "{} isn't guarded",
+            &d[1]
+        );
+    }
     for script in ["/app.js", "/tools.js"] {
         let js = request(port, "GET", script, &host, None, None).await;
         assert_eq!(js.status, 200, "{script}");

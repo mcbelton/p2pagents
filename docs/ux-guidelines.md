@@ -90,6 +90,10 @@ Every list and panel defines three states:
 - Use the right control: `type="time"` for times, toggles for days, `select` for
   closed sets, `type="password"` with `autocomplete="off"` for secrets,
   `spellcheck="false"` for identifiers and commands.
+- A `select` holds short labels only: its open list is as wide as its longest option,
+  can't be styled, and spills over the page. When each choice needs explaining (e.g.
+  playbooks), use a picker: radio cards with a one-line description, and the details of
+  the picked one beside them.
 - Structured input first, free text as the advanced option (the schedule picker
   offers Repeat, time and days; "Custom" accepts the text form).
 - Live previews for anything with consequences in time or scope (next runs, what a
@@ -141,6 +145,7 @@ Every list and panel defines three states:
 
 - [ ] Works at 1440×900, 880×760 and 390×844 without clipped or overlapping
       controls; the composer's text box and main button are always visible.
+- [ ] Every dropdown opened at 880 px wide stays within its panel (short option labels).
 - [ ] Light and dark themes checked.
 - [ ] Keyboard only: reach, use and leave every new control and dialog.
 - [ ] Empty, loading and error states present and worded per this guide.

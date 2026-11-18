@@ -133,11 +133,8 @@
             </div>
           </div>
           <div class="task-opts" id="playbook-opts" hidden>
-            <label class="field-inline">
-              <span>Playbook</span>
-              <select id="playbook"><option value="">Write your own…</option></select>
-            </label>
-            <button type="button" class="btn small" id="playbook-use">Use</button>
+            <button type="button" class="btn small" id="playbook-pick" aria-haspopup="dialog"
+                    title="Ready-made plans for the lifecycle: see what each does, then fill in who and where">Start from a playbook…</button>
             <button type="button" class="btn small" id="plan-expand"
                     title="Edit the plan in a large editor, with peers, folders, skills and checks to insert">Open editor</button>
             <button type="button" class="btn small" id="schedule-open"
@@ -148,11 +145,11 @@
         <div class="input-row">
           <label for="composer-input" class="visually-hidden" id="composer-label">Message</label>
           <textarea id="composer-input" rows="2" placeholder="Message all connected peers…"></textarea>
+          <div id="plan-problems" class="plan-problems" role="status" aria-live="polite" hidden></div>
           <button type="submit" class="btn primary" id="send-btn">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-8-6 16-2-7-8-1z"></path></svg><span>Send</span>
           </button>
         </div>
-        <div id="plan-problems" class="plan-problems" role="status" aria-live="polite" hidden></div>
         <p class="hint" id="composer-hint">Enter to send · Shift+Enter for a new line</p>
       </form>
     </main>
@@ -404,15 +401,28 @@
     </div>
   </dialog>
 
-  <dialog id="playbook-dialog" aria-labelledby="playbook-h">
+  <dialog id="playbook-dialog" class="wide" aria-labelledby="playbook-h">
     <form method="dialog" id="playbook-form" novalidate>
-      <h2 id="playbook-h">Playbook</h2>
-      <p class="muted small" id="playbook-desc"></p>
-      <div id="playbook-vars" class="playbook-vars"></div>
-      <p class="form-error" id="playbook-error" role="alert"></p>
-      <div class="dialog-actions">
-        <button type="button" class="btn" id="playbook-cancel">Cancel</button>
-        <button type="submit" class="btn primary">Fill in the plan</button>
+      <h2 id="playbook-h">Start from a playbook</h2>
+      <p class="muted small" id="playbook-desc">A playbook is a ready-made plan for one stage of the lifecycle. Pick one to see what it does, then say who does the work and where.</p>
+      <div id="playbook-step-pick" class="playbook-picker">
+        <fieldset class="playbook-list">
+          <legend class="visually-hidden">Playbooks</legend>
+          <div id="playbook-choices" class="playbook-choices"></div>
+        </fieldset>
+        <section id="playbook-detail" class="playbook-detail" aria-live="polite" aria-label="What the playbook does"></section>
+      </div>
+      <div id="playbook-step-fill" hidden>
+        <p class="small warn-text" id="playbook-replaces" hidden>Filling it in replaces the plan in the editor.</p>
+        <div id="playbook-vars" class="playbook-vars"></div>
+      </div>
+      <div class="dialog-footer">
+        <p class="form-error" id="playbook-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn" id="playbook-cancel">Cancel</button>
+          <button type="button" class="btn" id="playbook-back" hidden>Back</button>
+          <button type="submit" class="btn primary" id="playbook-submit">Next: who and where</button>
+        </div>
       </div>
     </form>
   </dialog>

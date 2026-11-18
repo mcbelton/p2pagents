@@ -217,6 +217,22 @@ pub struct MonitorStats {
     pub last_ok: Option<bool>,
     pub last_ts: Option<u64>,
     pub open_incident: bool,
+    /// Why it can't run (its folder or check is gone), if so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+/// Why monitor `m` can't run with `shares`: its folder isn't shared or has no such
+/// check any more. Such a monitor records no samples and opens no incidents.
+pub fn problem(m: &Monitor, shares: &ShareStore) -> Option<String> {
+    match shares.get(&m.share) {
+        None => Some(format!("folder '{}' isn't shared any more", m.share)),
+        Some(share) if !share.checks.contains_key(&m.check) => Some(format!(
+            "folder '{}' has no check '{}' any more",
+            m.share, m.check
+        )),
+        Some(_) => None,
+    }
 }
 
 fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
@@ -244,10 +260,14 @@ pub fn open_incidents(events: &[IncidentEvent]) -> BTreeMap<u64, String> {
     open
 }
 
+/// Each monitor's health from `samples`. `incidents` should reach back far enough to
+/// hold the incidents still open (e.g. the whole log); `shares` tells which monitors
+/// can't run.
 pub fn monitor_stats(
     monitors: &[Monitor],
     samples: &[Sample],
     incidents: &[IncidentEvent],
+    shares: &ShareStore,
 ) -> Vec<MonitorStats> {
     let open = open_incidents(incidents);
     monitors
@@ -269,6 +289,7 @@ pub fn monitor_stats(
                 last_ok: mine.last().map(|s| s.ok),
                 last_ts: mine.last().map(|s| s.ts),
                 open_incident: open.values().any(|n| n == &m.name),
+                problem: problem(m, shares),
             }
         })
         .collect()
@@ -315,6 +336,7 @@ pub fn report(
     title: &str,
     hours: u64,
     monitors: &[Monitor],
+    shares: &ShareStore,
     store: &OpsStore,
     audit: &[AuditEntry],
     runs: &[RunSummary],
@@ -330,9 +352,17 @@ pub fn report(
         md += "No monitors. Add one with `p2pagents monitor add`.\n";
     } else {
         md += "| Monitor | Availability | SLO | p50 | p95 | Now |\n| --- | --- | --- | --- | --- | --- |\n";
-        for s in monitor_stats(monitors, &samples, &incidents) {
+        // Incidents opened before the window may still be open.
+        for s in monitor_stats(monitors, &samples, &store.incidents(0), shares) {
+            let now = match (&s.problem, s.open_incident, s.last_ok) {
+                (Some(why), _, _) => format!("⚠️ can't run: {why}"),
+                (None, true, _) => "🔥 incident open".into(),
+                (None, false, Some(true)) => "up".into(),
+                (None, false, Some(false)) => "failing".into(),
+                (None, false, None) => "unknown".into(),
+            };
             md += &format!(
-                "| {} | {} | {}{} | {} | {} | {} |\n",
+                "| {} | {} | {}{} | {} | {} | {now} |\n",
                 s.name,
                 s.availability
                     .map(|a| format!("{a:.2}% ({} samples)", s.samples))
@@ -345,12 +375,6 @@ pub fn report(
                 },
                 s.p50_ms.map(|m| format!("{m} ms")).unwrap_or_default(),
                 s.p95_ms.map(|m| format!("{m} ms")).unwrap_or_default(),
-                match (s.open_incident, s.last_ok) {
-                    (true, _) => "🔥 incident open",
-                    (false, Some(true)) => "up",
-                    (false, Some(false)) => "failing",
-                    (false, None) => "unknown",
-                }
             );
         }
     }
@@ -472,7 +496,8 @@ fn signature(output: &str) -> Option<String> {
 pub struct Ops {
     pub agent_name: String,
     pub monitors: Vec<Monitor>,
-    pub shares: ShareStore,
+    /// The agent's shared folders as they are now (they can change while it runs).
+    pub shares: Arc<dyn Fn() -> ShareStore + Send + Sync>,
     pub store: OpsStore,
     pub kb: KnowledgeBase,
     /// Skills; the debugging agent follows `incident-debugging`.
@@ -515,7 +540,8 @@ impl Ops {
     }
 
     async fn run_named(&self, m: &Monitor, check: &str) -> Option<CheckResult> {
-        let share = self.shares.get(&m.share)?;
+        let shares = (self.shares)();
+        let share = shares.get(&m.share)?;
         let command = share.checks.get(check)?;
         Some(run_check(check, command, &share.path, CHECK_TIMEOUT).await)
     }
@@ -644,7 +670,8 @@ impl Ops {
             self.event(incident, &m.name, IncidentKind::Escalated, "no troubleshooting guide fixed it and this agent has no model to debug it: needs a person".into(), vec![]);
             return false;
         };
-        let Some(share) = self.shares.get(&m.share) else {
+        let shares = (self.shares)();
+        let Some(share) = shares.get(&m.share) else {
             return false;
         };
         let Some(provider) = executor.providers().first().copied() else {
@@ -782,34 +809,77 @@ impl Ops {
     }
 
     async fn watch(&self, m: Monitor) {
-        let mut failures = 0u32;
-        let mut open: Option<u64> = None;
+        let mut state = self.resume(&m);
         loop {
-            let result = self.probe(&m).await;
-            if result.passed {
-                failures = 0;
-                if let Some(incident) = open.take() {
-                    self.event(
-                        incident,
-                        &m.name,
-                        IncidentKind::Resolved,
-                        "recovered".into(),
-                        vec![],
-                    );
-                }
-            } else {
-                failures += 1;
-                if failures >= m.fail_after && open.is_none() {
-                    let incident = unix_now();
-                    if !self.handle(incident, &m, &result).await {
-                        open = Some(incident);
-                    }
-                    failures = 0;
-                }
-            }
+            self.tick(&m, &mut state).await;
             tokio::time::sleep(Duration::from_secs(m.every_secs)).await;
         }
     }
+
+    /// Where watching `m` resumes after the agent (re)starts: its incidents still
+    /// open in the log stay open, so no second one opens for the same failure.
+    pub fn resume(&self, m: &Monitor) -> Watch {
+        Watch {
+            open: open_incidents(&self.store.incidents(0))
+                .into_iter()
+                .filter(|(_, monitor)| monitor == &m.name)
+                .map(|(incident, _)| incident)
+                .collect(),
+            ..Watch::default()
+        }
+    }
+
+    /// One check of `m`: records the sample, opens an incident after `fail_after`
+    /// failures in a row (unless one is open) and resolves open ones when it passes.
+    /// A monitor whose folder or check is gone is skipped: it records nothing and
+    /// opens nothing (it isn't the service failing), and its owner is told once.
+    pub async fn tick(&self, m: &Monitor, state: &mut Watch) {
+        if let Some(why) = problem(m, &(self.shares)()) {
+            if !state.cant_run {
+                eprintln!(
+                    "monitor {} can't run: {why}; fix it, or remove the monitor (p2pagents monitor remove {})",
+                    m.name, m.name
+                );
+            }
+            state.cant_run = true;
+            state.failures = 0;
+            return;
+        }
+        state.cant_run = false;
+        let result = self.probe(m).await;
+        if result.passed {
+            state.failures = 0;
+            for incident in state.open.drain(..) {
+                self.event(
+                    incident,
+                    &m.name,
+                    IncidentKind::Resolved,
+                    "recovered".into(),
+                    vec![],
+                );
+            }
+            return;
+        }
+        state.failures += 1;
+        if state.failures >= m.fail_after && state.open.is_empty() {
+            let incident = unix_now();
+            if !self.handle(incident, m, &result).await {
+                state.open.push(incident);
+            }
+            state.failures = 0;
+        }
+    }
+}
+
+/// What watching a monitor remembers between checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Watch {
+    /// Failures in a row.
+    pub failures: u32,
+    /// Its incidents still open.
+    pub open: Vec<u64>,
+    /// Its folder or check is gone (its owner was told).
+    pub cant_run: bool,
 }
 
 #[cfg(test)]
@@ -845,6 +915,7 @@ mod tests {
     #[test]
     fn stats_and_reports_cover_slos_incidents_and_tasks() {
         let dir = tempfile::tempdir().unwrap();
+        let (_service, shares) = service(true);
         let store = OpsStore::new(dir.path());
         let now = unix_now();
         for (i, ok) in [true, true, true, false].iter().enumerate() {
@@ -876,17 +947,21 @@ mod tests {
             fail_after: 3,
             slo: 99.0,
         }];
-        let stats = monitor_stats(&monitors, &store.samples(0), &store.incidents(0));
+        let stats = monitor_stats(&monitors, &store.samples(0), &store.incidents(0), &shares);
         assert_eq!(stats[0].availability, Some(75.0));
         assert_eq!(stats[0].meets_slo, Some(false));
         assert_eq!(stats[0].p50_ms, Some(200));
         assert!(stats[0].open_incident && stats[0].last_ok == Some(false));
-        let md = report("worker", 24, &monitors, &store, &[], &[]);
+        assert_eq!(stats[0].problem, None);
+        let md = report("worker", 24, &monitors, &shares, &store, &[], &[]);
         assert!(
             md.contains("| api | 75.00% (4 samples) | 99% ❌ missed"),
             "{md}"
         );
-        assert!(md.contains("**open**"), "{md}");
+        assert!(
+            md.contains("**open**") && md.contains("| 🔥 incident open |"),
+            "{md}"
+        );
         store
             .record_incident(&IncidentEvent {
                 ts: now + 5,
@@ -897,8 +972,21 @@ mod tests {
                 checks: vec![],
             })
             .unwrap();
-        let md = report("worker", 24, &monitors, &store, &[], &[]);
+        let md = report("worker", 24, &monitors, &shares, &store, &[], &[]);
         assert!(md.contains("resolved after 5s (recovered)"), "{md}");
+
+        // A monitor whose check is gone says so instead of looking like an outage.
+        let gone = ShareStore::default();
+        let stats = monitor_stats(&monitors, &store.samples(0), &store.incidents(0), &gone);
+        assert_eq!(
+            stats[0].problem.as_deref(),
+            Some("folder 'app' isn't shared any more")
+        );
+        let md = report("worker", 24, &monitors, &gone, &store, &[], &[]);
+        assert!(
+            md.contains("⚠️ can't run: folder 'app' isn't shared any more"),
+            "{md}"
+        );
     }
 
     /// A model that diagnoses with a fixed answer.
@@ -964,7 +1052,7 @@ mod tests {
         let ops = Ops {
             agent_name: "worker".into(),
             monitors: vec![],
-            shares,
+            shares: Arc::new(move || shares.clone()),
             store,
             kb,
             skills: crate::skills::Skills::new(std::env::temp_dir().join("p2p-no-skills")),
@@ -1147,5 +1235,68 @@ mod tests {
         };
         assert!(store.set(fast, &shares).is_err());
         assert!(store.remove("api") && store.monitors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incidents_stay_open_across_restarts_and_monitors_without_their_check_wait() {
+        let (dir, shares) = service(false);
+        let home = tempfile::tempdir().unwrap();
+        let current = Arc::new(Mutex::new(shares.clone()));
+        let (mut ops, seen) = ops(
+            shares.clone(),
+            KnowledgeBase::new(home.path().join("kb")),
+            OpsStore::new(home.path().join("ops")),
+            None,
+        );
+        let now_shares = current.clone();
+        ops.shares = Arc::new(move || now_shares.lock().unwrap().clone());
+        let m = monitor();
+        // Before this fix, every restart opened the same incident again: two are open.
+        for incident in [1, 2] {
+            ops.store
+                .record_incident(&IncidentEvent {
+                    ts: incident,
+                    incident,
+                    monitor: "api".into(),
+                    kind: IncidentKind::Opened,
+                    text: "api failed".into(),
+                    checks: vec![],
+                })
+                .unwrap();
+        }
+
+        // A restart resumes the open incidents: failing again opens no new one.
+        let mut state = ops.resume(&m);
+        assert_eq!(state.open, [1, 2]);
+        ops.tick(&m, &mut state).await;
+        ops.tick(&m, &mut state).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no new incident, no model call, no alert"
+        );
+        assert_eq!(ops.store.samples(0).len(), 2, "failures are still measured");
+
+        // Its check is removed while the agent runs: it records nothing and opens nothing.
+        let mut without = shares.clone();
+        without.shares[0].checks.remove("health");
+        *current.lock().unwrap() = without;
+        ops.tick(&m, &mut state).await;
+        assert!(state.cant_run);
+        assert_eq!(
+            ops.store.samples(0).len(),
+            2,
+            "a monitor that can't run records no samples"
+        );
+
+        // The check is back and the service recovers: every open incident resolves.
+        *current.lock().unwrap() = shares;
+        std::fs::write(dir.path().join("ok.txt"), "ok").unwrap();
+        ops.tick(&m, &mut state).await;
+        assert!(!state.cant_run && state.open.is_empty());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [IncidentKind::Resolved, IncidentKind::Resolved]
+        );
+        assert!(open_incidents(&ops.store.incidents(0)).is_empty());
     }
 }

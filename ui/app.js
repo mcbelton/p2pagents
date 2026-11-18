@@ -82,13 +82,20 @@ function confirmDialog({ title, body, confirm = "Confirm", danger = false }) {
 }
 
 /// A dialog closes on a backdrop click only while nothing was typed in it, so a
-/// stray click never discards input (Escape and Cancel still close it).
+/// stray click never discards input. Escape and Cancel always close it (not every
+/// browser closes a modal dialog on Escape by itself).
 function guardDialog(dialog) {
   let dirty = false;
   dialog.addEventListener("input", () => { dirty = true; });
   dialog.addEventListener("close", () => { dirty = false; });
   dialog.addEventListener("click", (e) => {
     if (e.target === dialog && !dirty) dialog.close();
+  });
+  dialog.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !e.defaultPrevented) {
+      e.preventDefault();
+      dialog.close();
+    }
   });
 }
 
@@ -246,7 +253,7 @@ async function api(path, options = {}) {
 }
 
 // ---------- state ----------
-const state = { me: null, peers: [], trusted: [], feed: [], tasks: [], mode: "chat" };
+const state = { me: null, peers: [], trusted: [], feed: [], tasks: [], mode: "chat", playbook: null };
 
 function hue(text) {
   let h = 0;
@@ -937,7 +944,7 @@ function openScheduleDialog(edit = null) {
     delete name.dataset.edit;
   }
   name.disabled = Boolean(edit);
-  if (!edit && !name.value && $("#playbook").value) name.value = $("#playbook").value;
+  if (!edit && !name.value && state.playbook) name.value = state.playbook;
   $("#schedule-replan-field").hidden = !(edit && text && text !== edit.plan.trim());
   $("#schedule-replan").checked = false;
   if (edit) setWhenPicker(edit.when, edit.when_parts);
@@ -974,7 +981,7 @@ async function submitSchedule(e) {
       if ($("#schedule-replan").checked) body.plan = $("#composer-input").value;
       res = await api(`/api/schedules/${encodeURIComponent(editing.name)}`, { method: "PUT", body: JSON.stringify(body) });
     } else {
-      const book = $("#playbook").value;
+      const book = state.playbook;
       res = await api("/api/schedules", {
         method: "POST",
         body: JSON.stringify({ name, when: at, plan: $("#composer-input").value, source: book ? `playbook ${book}` : "" }),
@@ -1012,17 +1019,20 @@ async function openRun(id) {
 
 // ---------- playbooks ----------
 let playbooks = [];
+/** The playbook picker: the playbook picked, and its step (pick, then fill in). */
+const playbookPicker = { name: null, step: "pick" };
+
 async function loadPlaybooks() {
   playbooks = (await api("/api/playbooks")).playbooks;
-  const select = $("#playbook");
-  for (const p of playbooks) select.append(el("option", { value: p.name, text: `${p.name}: ${p.description}` }));
   renderPlanExplain();
 }
+
+const nOf = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 const PLAN_INTRO = [
   "**A plan runs several agent tasks on your peers, in order, and keeps evidence of what was proven.**",
   "",
-  "Pick a playbook above to see what it does, or write your own, one step per line:",
+  "Press **Start from a playbook…** for a ready-made one, or write your own, one step per line:",
   "",
   "- `claim: C-1 The parser handles empty input`: what must be true at the end",
   "- `fix @alice:app skill=implement-change verify=test claims=C-1 Make the parser accept empty input`: step `fix` runs on peer alice in her `app` folder; afterwards alice's runtime runs her `test` check, and the step only passes if it does",
@@ -1031,39 +1041,37 @@ const PLAN_INTRO = [
   "Other options: `attempts=3` (retry with the failures), `apply=fix` (another peer checks the commit independently), `context=` / `save=` (knowledge), `#squad` (any member of a squad). A claim is proven only by passing checks or a sign-off; the run is saved under **Evidence runs**.",
 ].join("\n");
 
-/// Explains the selected playbook (or what a plan is) above the plan editor.
+/// What a playbook does, proves and needs, as Markdown.
+function playbookText(p) {
+  const o = p.outline;
+  return [
+    `**${p.name}: ${p.description}**`,
+    "",
+    "What it does, step by step:",
+    ...o.steps.map((s, i) => `${i + 1}. ${s}`),
+    "",
+    "What it proves (only with passing checks or a sign-off):",
+    ...o.claims.map(([id, claim]) => `- ${id}: ${claim}`),
+    "",
+    "What you need:",
+    ...o.needs.map((n) => `- ${n}`),
+  ].join("\n");
+}
+
+/// Explains the playbook the plan came from (or what a plan is) above the plan box.
 function renderPlanExplain() {
   const box = $("#plan-explain");
   if (state.mode !== "plan") {
     box.hidden = true;
     return;
   }
-  const p = playbooks.find((x) => x.name === $("#playbook").value);
-  let text;
-  if (p) {
-    const o = p.outline;
-    text = [
-      `**${p.name}: ${p.description}**`,
-      "",
-      "What it does, step by step:",
-      ...o.steps.map((s, i) => `${i + 1}. ${s}`),
-      "",
-      "What it proves (only with passing checks or a sign-off):",
-      ...o.claims.map(([id, claim]) => `- ${id}: ${claim}`),
-      "",
-      "What you need:",
-      ...o.needs.map((n) => `- ${n}`),
-      "",
-      "Press **Use** to pick the peer, folder, checks and approver; the plan is checked before it runs.",
-    ].join("\n");
-  } else if (!$("#composer-input").value.trim()) {
-    text = PLAN_INTRO;
-  }
+  const p = playbooks.find((x) => x.name === state.playbook);
+  const text = p ? playbookText(p) : !$("#composer-input").value.trim() ? PLAN_INTRO : null;
   box.hidden = !text;
   if (text) {
     // Collapsed unless its owner opened it (remembered): the plan box stays in view.
     const details = el("details", { open: localStorage.getItem(EXPLAIN_KEY) === "open" },
-      el("summary", { text: p ? `What "${p.name}" does` : "What is a plan?" }), renderMarkdown(text));
+      el("summary", { text: p ? `From the ${p.name} playbook: what it does` : "What is a plan?" }), renderMarkdown(text));
     details.addEventListener("toggle", () => localStorage.setItem(EXPLAIN_KEY, details.open ? "open" : "closed"));
     box.replaceChildren(details);
   }
@@ -1087,15 +1095,68 @@ const VAR_HELP = {
   project: "The project's name",
 };
 
-function openPlaybook() {
-  const p = playbooks.find((x) => x.name === $("#playbook").value);
-  if (!p) {
-    $("#composer-input").focus();
+/// The playbook picker's step: "pick" (the list and what each does) or "fill" (who and where).
+function setPlaybookStep(step) {
+  playbookPicker.step = step;
+  const p = playbooks.find((x) => x.name === playbookPicker.name);
+  $("#playbook-step-pick").hidden = step !== "pick";
+  $("#playbook-step-fill").hidden = step !== "fill";
+  $("#playbook-back").hidden = step !== "fill";
+  $("#playbook-submit").textContent = step === "pick" ? "Next: who and where" : "Fill in the plan";
+  $("#playbook-h").textContent = step === "pick" ? "Start from a playbook" : `${p?.name ?? "Playbook"}: who and where`;
+  $("#playbook-desc").textContent = step === "pick"
+    ? "A playbook is a ready-made plan for one stage of the lifecycle. Pick one to see what it does, then say who does the work and where."
+    : `${p?.description ?? ""}. The plan is checked before it runs.`;
+  $("#playbook-error").textContent = "";
+}
+
+/// Shows what playbook `name` does, proves and needs, beside the list.
+function showPlaybookDetail(name) {
+  const p = playbooks.find((x) => x.name === name);
+  if (!p) return;
+  playbookPicker.name = name;
+  const o = p.outline;
+  $("#playbook-detail").replaceChildren(
+    el("h3", { text: p.name }),
+    el("p", { class: "muted", text: p.description }),
+    el("h4", { text: "What it does" }),
+    el("ol", {}, ...o.steps.map((s) => el("li", {}, inlineMd(s)))),
+    el("h4", { text: "What it proves" }),
+    el("ul", {}, ...o.claims.map(([id, claim]) => el("li", {}, el("strong", { text: `${id} ` }), inlineMd(claim)))),
+    el("h4", { text: "What you need" }),
+    el("ul", {}, ...o.needs.map((n) => el("li", {}, inlineMd(n)))));
+}
+
+/// Opens the playbook picker: every playbook with what it is for, and the details of
+/// the one picked; next, who does the work and where.
+function openPlaybookPicker() {
+  if (!playbooks.length) {
+    toast("The playbooks are still loading; try again in a moment", "error");
     return;
   }
-  $("#playbook-h").textContent = `Playbook: ${p.name}`;
-  $("#playbook-desc").textContent = p.description;
-  $("#playbook-error").textContent = "";
+  const want = playbooks.some((x) => x.name === state.playbook) ? state.playbook
+    : playbooks.some((x) => x.name === playbookPicker.name) ? playbookPicker.name : playbooks[0].name;
+  $("#playbook-choices").replaceChildren(...playbooks.map((p) => {
+    const radio = el("input", { type: "radio", name: "playbook", value: p.name, checked: p.name === want });
+    radio.addEventListener("change", () => showPlaybookDetail(p.name));
+    return el("label", { class: "pick-card" }, radio,
+      el("span", { class: "pick-body" },
+        el("span", { class: "pick-name", text: p.name }),
+        el("span", { class: "pick-desc", text: p.description }),
+        el("span", { class: "pick-meta", text: `${nOf(p.outline.steps.length, "step")} · proves ${nOf(p.outline.claims.length, "claim")}` })));
+  }));
+  showPlaybookDetail(want);
+  setPlaybookStep("pick");
+  $("#playbook-dialog").returnValue = "";
+  $("#playbook-dialog").showModal();
+  $("#playbook-choices input:checked")?.focus();
+}
+
+/// The values playbook `name` needs: peers, their folders and checks, approvers, squads.
+function renderPlaybookVars(name) {
+  const p = playbooks.find((x) => x.name === name);
+  playbookPicker.name = name;
+  $("#playbook-replaces").hidden = !$("#composer-input").value.trim();
   const workers = state.peers.filter((x) => x.capabilities.length);
   const select = (name, options, value) => {
     const s = el("select", { name }, ...options.map(([v, label]) => el("option", { value: v, text: label })));
@@ -1143,32 +1204,76 @@ function openPlaybook() {
     } else if (v.name === "reviewers" && (state.squads ?? []).length) {
       field = select("reviewers", state.squads.map((s) => [s.name, `#${s.name} (${s.members.map((m) => m.name).join(", ")})`]), v.default);
     } else {
-      field = el("input", { type: "text", name: v.name, value: v.default ?? "", spellcheck: "false" });
+      field = el("input", { type: "text", name: v.name, value: v.default ?? "", spellcheck: "false", autocomplete: "off" });
     }
     fields[v.name] = field;
-    const help = CHECK_VARS.has(v.name) ? `The folder's check that runs as "${v.name}"` : VAR_HELP[v.name];
-    box.append(el("label", { class: "field" },
-      el("span", { text: v.default == null ? `${v.name} (required)` : v.name }),
+    field.id = `pb-var-${v.name}`;
+    field.required = v.default == null;
+    const noWorker = v.name === "peer" && !workers.length;
+    const help = noWorker ? NO_WORKER
+      : CHECK_VARS.has(v.name) ? `The folder's check that runs as "${v.name}"` : VAR_HELP[v.name];
+    if (help) field.setAttribute("aria-describedby", `${field.id}-hint`);
+    box.append(el("div", { class: "field" },
+      el("label", { for: field.id, text: field.required ? `${v.name} (required)` : v.name }),
       field,
-      help ? el("span", { class: "muted small", text: help }) : null));
+      help ? el("span", { class: `small hint-text ${noWorker ? "warn-text" : "muted"}`, id: `${field.id}-hint`, text: help }) : null));
   }
   refreshFolder();
-  $("#playbook-dialog").showModal();
-  box.querySelector("select, input")?.focus();
+}
+
+const NO_WORKER = "None of your connected peers runs tasks yet. Add one under Allowlist (Add peer); its agent needs Copilot, Claude or Codex signed in.";
+
+/// Flags the fill step's empty required values; shows what to do and focuses the
+/// first. True if every required value is there.
+function checkPlaybookVars() {
+  const fields = [...document.querySelectorAll("#playbook-vars [name]")];
+  const missing = fields.filter((f) => f.required && !f.value.trim());
+  for (const f of fields) {
+    if (missing.includes(f)) f.setAttribute("aria-invalid", "true");
+    else f.removeAttribute("aria-invalid");
+  }
+  if (!missing.length) return true;
+  $("#playbook-error").textContent = missing[0].name === "peer" && !missing[0].value
+    && !state.peers.some((x) => x.capabilities.length)
+    ? "No peer can do this work yet: see the note under peer."
+    : `Fill in ${missing.map((f) => f.name).join(", ")}.`;
+  missing[0].focus();
+  return false;
 }
 
 async function submitPlaybook(e) {
   e.preventDefault();
+  const error = $("#playbook-error");
+  if (playbookPicker.step === "pick") {
+    const picked = $("#playbook-choices input:checked")?.value;
+    if (!picked) {
+      error.textContent = "Pick a playbook.";
+      return;
+    }
+    renderPlaybookVars(picked);
+    setPlaybookStep("fill");
+    $("#playbook-vars").querySelector("select, input")?.focus();
+    return;
+  }
+  const name = playbookPicker.name;
+  if (!checkPlaybookVars()) return;
   const vars = Object.fromEntries([...document.querySelectorAll("#playbook-vars [name]")].map((i) => [i.name, i.value]));
+  const button = $("#playbook-submit");
+  button.disabled = true;
+  button.textContent = "Filling in…";
   try {
-    const res = await api(`/api/playbooks/${encodeURIComponent($("#playbook").value)}`, { method: "POST", body: JSON.stringify({ vars }) });
+    const res = await api(`/api/playbooks/${encodeURIComponent(name)}`, { method: "POST", body: JSON.stringify({ vars }) });
     $("#composer-input").value = res.text;
-    $("#playbook-dialog").close();
-    $("#composer-input").focus();
+    state.playbook = name;
+    $("#playbook-dialog").close("filled");
+    renderPlanExplain();
     const ok = await checkPlan(res.text);
-    toast(ok ? "Playbook filled in and checked: review it, then Ctrl+Enter to run" : "Playbook filled in, but it has problems (see under the editor)", ok ? "" : "error");
+    toast(ok ? "Playbook filled in and checked: review it, then Ctrl+Enter to run" : "Playbook filled in, but it has problems (see under the plan)", ok ? "" : "error");
   } catch (err) {
-    $("#playbook-error").textContent = err.message;
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = playbookPicker.step === "pick" ? "Next: who and where" : "Fill in the plan";
   }
 }
 
@@ -1320,12 +1425,18 @@ async function loadOps() {
   }
   const list = el("ul", { class: "monitor-list" });
   for (const m of ops.monitors) {
-    const state = m.open_incident ? "incident" : m.last_ok === false ? "failing" : m.last_ok ? "up" : "unknown";
+    const state = m.problem ? "misconfigured" : m.open_incident ? "incident" : m.last_ok === false ? "failing" : m.last_ok ? "up" : "unknown";
+    const [cls, label] = {
+      up: ["done", "Up"], failing: ["failed", "Failing"], incident: ["failed", "Incident"],
+      unknown: ["skipped", "Unknown"], misconfigured: ["cancelled", "Can't run"],
+    }[state];
     list.append(el("li", { class: `monitor ${state}` },
       el("span", { class: "dot", "aria-hidden": "true" }),
       el("span", { class: "name", text: m.name }),
-      el("span", { class: "muted small", text: `${m.availability == null ? "no data" : `${m.availability.toFixed(2)}%`} · SLO ${m.slo}%${m.meets_slo === false ? " missed" : ""}${m.p95_ms != null ? ` · p95 ${m.p95_ms} ms` : ""}` }),
-      el("span", { class: `status ${state === "up" ? "done" : state === "unknown" ? "skipped" : "failed"}`, text: { up: "Up", failing: "Failing", incident: "Incident", unknown: "Unknown" }[state] })));
+      el("span", { class: "muted small", text: m.problem ? "not checked" : `${m.availability == null ? "no data" : `${m.availability.toFixed(2)}%`} · SLO ${m.slo}%${m.meets_slo === false ? " missed" : ""}${m.p95_ms != null ? ` · p95 ${m.p95_ms} ms` : ""}` }),
+      el("span", { class: `status ${cls}`, text: label }),
+      m.problem ? el("span", { class: "problem" }, `${m.problem[0].toUpperCase()}${m.problem.slice(1)}. Fix the folder or its check, or remove the monitor: `,
+        el("span", { class: "mono", text: `p2pagents monitor remove ${m.name}` })) : null));
   }
   health.append(list);
   const t = ops.tasks;
@@ -1642,11 +1753,13 @@ function updateComposer() {
   const noProviders = task && !availableProviders().length;
   $("#task-opts").hidden = !task;
   $("#playbook-opts").hidden = !plan;
+  // The layout follows the mode: in a plan the text box takes the full width.
+  $("#composer").dataset.mode = state.mode;
   if (!plan) $("#plan-problems").hidden = true;
   renderPlanExplain();
   input.rows = plan ? 6 : 2;
   input.placeholder = plan
-    ? `Pick a playbook above and press Use, or write a plan: claim lines, then one step per line, e.g.\nclaim: C-1 The parser handles empty input\n${PLAN_EXAMPLE}`
+    ? `Start from a playbook, or write a plan: claim lines, then one step per line, e.g.\nclaim: C-1 The parser handles empty input\n${PLAN_EXAMPLE}`
     : task
       ? noProviders
         ? "No provider available: enable one with --providers, or connect a peer that serves one"
@@ -1672,12 +1785,13 @@ async function submitComposer(e) {
       if (res.sent === 0) toast("No peers connected; nobody received the message");
     } else if (state.mode === "plan") {
       if (!(await checkPlan(text))) {
-        toast("Fix the plan's errors first (listed under the editor)", "error");
+        toast("Fix the plan's errors first (listed under the plan)", "error");
         return;
       }
       const res = await api("/api/plans", { method: "POST", body: JSON.stringify({ text }) });
       toast(`Plan started: ${Object.keys(res.steps).length} steps`);
       $("#plan-problems").hidden = true;
+      state.playbook = null;
     } else {
       const task = await api("/api/tasks", {
         method: "POST",
@@ -1862,13 +1976,22 @@ function init() {
     if (state.mode === "plan" ? e.ctrlKey || e.metaKey : !e.shiftKey) submitComposer(e);
   });
   $("#add-squad-btn").addEventListener("click", openSquadDialog);
-  $("#playbook-use").addEventListener("click", openPlaybook);
+  $("#playbook-pick").addEventListener("click", openPlaybookPicker);
   $("#playbook-cancel").addEventListener("click", () => $("#playbook-dialog").close());
+  $("#playbook-back").addEventListener("click", () => {
+    setPlaybookStep("pick");
+    $("#playbook-choices input:checked")?.focus();
+  });
   $("#playbook-form").addEventListener("submit", submitPlaybook);
-  $("#playbook").addEventListener("change", renderPlanExplain);
+  $("#playbook-vars").addEventListener("input", (e) => e.target.removeAttribute("aria-invalid"));
+  // Filled in: on to the plan, to review and run it; otherwise back to the opener.
+  $("#playbook-dialog").addEventListener("close", (e) =>
+    $(e.target.returnValue === "filled" ? "#composer-input" : "#playbook-pick").focus());
   $("#composer-input").addEventListener("input", () => {
     schedulePlanCheck();
-    if (!$("#playbook").value) renderPlanExplain();
+    // An emptied plan no longer comes from a playbook.
+    if (!$("#composer-input").value.trim()) state.playbook = null;
+    if (!state.playbook) renderPlanExplain();
   });
   loadPlaybooks().catch((err) => toast(err.message, "error"));
   loadSkills().catch((err) => toast(err.message, "error"));
@@ -1884,12 +2007,6 @@ function init() {
   setInterval(() => { if (!document.hidden) loadOps().catch(() => {}); }, 20000);
   $("#run-close").addEventListener("click", () => $("#run-dialog").close());
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
-  $("#squad-dialog").addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      $("#squad-dialog").close();
-    }
-  });
   $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
   $("#squad-form").addEventListener("submit", submitSquad);
   $("#schedule-open").addEventListener("click", () => openScheduleDialog());
@@ -1913,6 +2030,7 @@ function init() {
   // However the editor closes, the plan goes back to the composer.
   $("#plan-editor").addEventListener("close", () => {
     editorToComposer();
+    if (!$("#composer-input").value.trim()) state.playbook = null;
     renderPlanExplain();
     schedulePlanCheck();
   });
@@ -1927,7 +2045,7 @@ function init() {
     openScheduleDialog();
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
-    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog"]) guardDialog($(id));
+    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", renderMcpOptions);
@@ -1935,13 +2053,6 @@ function init() {
   $("#copy-ticket").addEventListener("click", () => state.me && copy(state.me.ticket, "Ticket"));
   $("#add-peer-btn").addEventListener("click", openAddDialog);
   $("#add-cancel").addEventListener("click", () => $("#add-dialog").close());
-  // Not every browser closes a modal <dialog> on Escape.
-  $("#add-dialog").addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      $("#add-dialog").close();
-    }
-  });
   $("#add-dialog").addEventListener("close", () => $("#add-peer-btn").focus());
   $("#add-form").addEventListener("submit", submitAdd);
   $("#add-delegate").addEventListener("change", syncDelegateFields);

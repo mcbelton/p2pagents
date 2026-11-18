@@ -402,8 +402,14 @@
     {
       "id": "OPS-3",
       "area": "web ui",
-      "claim": "The web UI shows health (monitors against SLOs, open incidents, the incident log, task statistics), the knowledge base with its TSGs, and fills in playbooks into the plan editor.",
+      "claim": "The web UI shows health (monitors against SLOs, open incidents counted once per monitor however often they were opened, monitors that can't run with how to fix them, the incident log, task statistics), the knowledge base with its TSGs, and fills in playbooks into the plan editor.",
       "tests": ["ui::ui_shows_health_knowledge_and_fills_in_playbooks"]
+    },
+    {
+      "id": "OPS-4",
+      "area": "operations",
+      "claim": "An open incident stays open across agent restarts: the same failure never opens a second incident, alert or debugging run, and all of a monitor's open incidents resolve when it passes again. A monitor whose folder or check is gone shows it can't run, with the fix, and records no samples, incidents or model calls; monitors follow the agent's current shares without a restart.",
+      "tests": ["lib::ops::incidents_stay_open_across_restarts_and_monitors_without_their_check_wait"]
     },
     {
       "id": "LRN-1",
@@ -695,7 +701,7 @@
     {
       "id": "UX-1",
       "area": "ui",
-      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor that inserts peers, folders, squads, checks, MCP servers, skills and knowledge; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor that inserts peers, folders, squads, checks, MCP servers, skills and knowledge; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
       "tests": [
         "ui::the_page_follows_the_ux_guidelines",
         "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
