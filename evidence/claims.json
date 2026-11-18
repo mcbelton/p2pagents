@@ -435,9 +435,10 @@
     {
       "id": "PRE-1",
       "area": "squads",
-      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type.",
+      "claim": "Before a plan runs it is checked against what exists now: connected peers, the folders they share with you with their checks, access and worktrees, squads, knowledge topics and skills. A plan with errors is refused with every reason, in the terminal and the web UI, and the web UI checks plans as you type. A malformed line is explained with what a step line looks like, repeating a list option adds to it (one-value options can't be repeated), and options typed into the task text are flagged.",
       "tests": [
         "lib::plan::preflight_finds_what_would_fail_before_anything_runs",
+        "lib::plan::step_lines_say_what_is_wrong_and_repeated_options_add_up",
         "ui::ui_shows_health_knowledge_and_fills_in_playbooks"
       ],
       "live": ["a plan with errors was refused before anything ran"]
@@ -701,9 +702,10 @@
     {
       "id": "UX-1",
       "area": "ui",
-      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor that inserts peers, folders, squads, checks, MCP servers, skills and knowledge; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
       "tests": [
         "ui::the_page_follows_the_ux_guidelines",
+        "ui::the_plan_editor_puts_each_part_where_it_belongs",
         "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
       ]
     },

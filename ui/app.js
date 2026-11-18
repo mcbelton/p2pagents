@@ -1287,7 +1287,7 @@ async function checkPlan(text, box = $("#plan-problems")) {
   const res = await api("/api/plans/check", { method: "POST", body: JSON.stringify({ text }) });
   box.hidden = false;
   if (!res.problems.length) {
-    box.replaceChildren(el("p", { class: "ok", text: `✓ Ready to run: ${res.steps} steps, ${res.claims} claims` }));
+    box.replaceChildren(el("p", { class: "ok", text: `✓ Ready to run: ${nOf(res.steps, "step")}, ${nOf(res.claims, "claim")}` }));
     return true;
   }
   box.replaceChildren(
@@ -1305,19 +1305,6 @@ function schedulePlanCheck() {
 }
 
 // ---------- plan editor ----------
-/// The first word of each step line ("fix @alice:app ..." is step fix).
-function stepIds(text) {
-  return text.split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !/^(claim:|#|\/\/)/i.test(l))
-    .map((l) => l.split(/\s+/)[0])
-    .filter((id) => /^[A-Za-z0-9_-]+$/.test(id));
-}
-
-function claimIds(text) {
-  return text.split("\n").map((l) => l.trim().match(/^claim:\s*(\S+)/i)?.[1]).filter(Boolean);
-}
-
 /// Opens the plan in a large editor, with what can go into it beside it.
 function openPlanEditor() {
   const editor = $("#plan-editor-text");
@@ -1328,75 +1315,73 @@ function openPlanEditor() {
   checkPlan(editor.value, $("#plan-editor-check")).catch(() => {});
 }
 
-/// Inserts `text` at the cursor: a token joins the line with a space, a line
-/// template goes on a line of its own.
-function insertIntoPlan(text, line = false) {
+/// Makes a palette change in the plan editor (see ui/plan-text.js) and selects what
+/// to type next.
+function applyPlanEdit(change) {
   const editor = $("#plan-editor-text");
-  const { selectionStart: start, selectionEnd: end, value } = editor;
-  const before = value.slice(0, start);
-  let insert = text;
-  if (line) {
-    if (before && !before.endsWith("\n")) insert = `\n${insert}`;
-    if (!value.slice(end).startsWith("\n")) insert += "\n";
-  } else if (before && !/\s$/.test(before)) {
-    insert = ` ${insert}`;
-  }
-  editor.setRangeText(insert, start, end, "end");
   editor.focus();
+  if (change.error) {
+    toast(change.error, "error");
+    return;
+  }
+  editor.setRangeText(change.insert, change.from, change.to);
+  editor.setSelectionRange(...change.select);
   editor.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function renderPalette() {
-  const text = $("#plan-editor-text").value;
-  const chip = (label, insert, title, line = false) => el("button", {
-    type: "button", class: "insert", title: title ?? `Insert ${insert}`, onclick: () => insertIntoPlan(insert, line),
+  const editor = $("#plan-editor-text");
+  const text = editor.value;
+  const workers = state.peers.filter((p) => p.capabilities.length);
+  const shares = workers.flatMap((p) => (p.shares ?? []).map((s) => ({ peer: p.name, ...s })));
+  const firstShare = shares.find((s) => s.name !== "data");
+  const defaults = {
+    target: firstShare ? `@${firstShare.peer}:${firstShare.name}` : workers[0] ? `@${workers[0].name}` : "@peer:folder",
+    check: firstShare?.checks?.[0],
+  };
+  // Changes are worked out on click, from the plan as it is then.
+  const chip = (label, title, edit) => el("button", {
+    type: "button", class: "insert", title, onclick: () => applyPlanEdit(edit(editor.value, editor.selectionStart)),
   }, label);
+  const line = (label, what, title) => chip(label, title, (t, pos) => planText.addLine(t, pos, what, defaults));
+  const part = (value, title) => chip(value, title, (t, pos) => planText.addPart(t, pos, value, defaults));
   const section = (title, hint, items) => items.length
     ? el("section", { class: "palette-section" }, el("h4", { text: title }),
       hint ? el("p", { class: "muted small", text: hint }) : null,
       el("div", { class: "chips" }, ...items))
     : null;
-  const workers = state.peers.filter((p) => p.capabilities.length);
-  const shares = workers.flatMap((p) => (p.shares ?? []).map((s) => ({ peer: p.name, ...s })));
-  const steps = stepIds(text);
-  const claims = claimIds(text);
-  let n = steps.length + 1;
-  while (steps.includes(`step${n}`)) n++;
-  const firstShare = shares.find((s) => s.name !== "data");
-  const target = firstShare ? `@${firstShare.peer}:${firstShare.name}` : workers[0] ? `@${workers[0].name}` : "@peer:folder";
-  const check = firstShare?.checks?.[0];
-  const claim = claims[0] ?? "C-1";
+  const steps = planText.stepIds(text);
+  const claims = planText.claimIds(text);
   const about = (name) => shares.find((s) => s.mcp_about?.[name])?.mcp_about?.[name];
   const sections = [
     section("Add a line", null, [
-      chip("Claim", `claim: C-${claims.length + 1} What must be true at the end`, "Something the run must prove", true),
-      chip("Step", `step${n} ${target}${check ? ` verify=${check}` : ""} claims=${claim} What to do`, "Who does what, and how it is checked", true),
-      chip("Sign-off", `review after ${steps.at(-1) ?? "step1"} approve @me claims=${claim} Approve it`, "A person signs off; their answer is signed evidence", true),
+      line("Claim", "claim", "Something the run must prove (goes with the other claims)"),
+      line("Step", "step", "A new step after the cursor's line: who does what, and how it is checked"),
+      line("Sign-off", "signoff", "You sign off on the step at the cursor (or the last step); your answer is signed evidence"),
     ]),
     section("Who runs it", "Peers, the folders they share with you, and squads", [
       ...workers.flatMap((p) => [
-        chip(`@${p.name}`, `@${p.name}`, `${p.name}, in its data folder`),
+        part(`@${p.name}`, `${p.name}, in its data folder`),
         ...(p.shares ?? []).filter((s) => s.name !== "data").map((s) =>
-          chip(`@${p.name}:${s.name}`, `@${p.name}:${s.name}`, `${p.name}'s ${s.name} folder (${ACCESS_SHORT[s.access] ?? s.access})`)),
+          part(`@${p.name}:${s.name}`, `${p.name}'s ${s.name} folder (${ACCESS_SHORT[s.access] ?? s.access})`)),
       ]),
-      ...(state.squads ?? []).map((s) => chip(`#${s.name}`, `#${s.name}`, `Any online member of squad ${s.name}`)),
+      ...(state.squads ?? []).map((s) => part(`#${s.name}`, `Any online member of squad ${s.name}`)),
     ]),
     section("Checks and MCP servers", "What those folders' owners offer", [
       ...[...new Set(shares.flatMap((s) => s.checks ?? []))].map((c) =>
-        chip(`verify=${c}`, `verify=${c}`, `After the step, the peer's runtime runs its ${c} check`)),
+        part(`verify=${c}`, `After the step, the peer's runtime runs its ${c} check`)),
       ...[...new Set(shares.flatMap((s) => s.mcp ?? []))].map((m) =>
-        chip(`mcp=${m}`, `mcp=${m}`, about(m) ? `${m}: ${about(m)}` : `Let the step use MCP server ${m}`)),
+        part(`mcp=${m}`, about(m) ? `${m}: ${about(m)}` : `Let the step use MCP server ${m}`)),
     ]),
-    section("Skills", "Instructions the step follows", (state.skills ?? []).map((s) =>
-      chip(`skill=${s.name}`, `skill=${s.name}`, s.description || s.name))),
+    section("Skills", "Instructions the step follows; pick several to combine them", (state.skills ?? []).map((s) =>
+      part(`skill=${s.name}`, s.description || s.name))),
     section("Knowledge", "What agents learned, given to the step", (state.knowledge ?? []).map((k) =>
-      chip(`context=${k.name}`, `context=${k.name}`, `Give the step the topic ${k.name}`))),
+      part(`context=${k.name}`, `Give the step the topic ${k.name}`))),
     section("Order and options", null, [
-      ...steps.map((id) => chip(`after ${id}`, `after ${id}`, `Run once step ${id} is done`)),
-      ...claims.map((id) => chip(`claims=${id}`, `claims=${id}`, `This step proves ${id}`)),
-      chip("attempts=3", "attempts=3", "Retry a failing step with its failures, up to 3 times"),
-      chip("approve @me", "approve @me", "You sign off on this step"),
-      chip("save=topic", "save=topic", "Save what the step learned under a knowledge topic"),
+      ...steps.map((id) => part(`after ${id}`, `Run once step ${id} is done`)),
+      ...claims.map((id) => part(`claims=${id}`, `This step proves ${id}`)),
+      part("attempts=3", "Retry a failing step with its failures, up to 3 times"),
+      part("save=topic", "Save what the step learned under a knowledge topic (type its name)"),
     ]),
   ].filter(Boolean);
   $("#plan-palette").replaceChildren(...sections);

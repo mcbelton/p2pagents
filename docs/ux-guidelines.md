@@ -96,6 +96,10 @@ Every list and panel defines three states:
   the picked one beside them.
 - Structured input first, free text as the advanced option (the schedule picker
   offers Repeat, time and days; "Custom" accepts the text form).
+- Insert buttons for a text syntax (the plan editor's palette) never paste raw text at
+  the cursor: each part goes where the syntax expects it, into the line the cursor is on
+  (or a new line), and a placeholder to type over is selected. Errors about that syntax
+  show what a correct line looks like.
 - Live previews for anything with consequences in time or scope (next runs, what a
   plugin contains, the plan check).
 

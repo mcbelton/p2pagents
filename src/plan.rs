@@ -20,8 +20,10 @@
 //! after the model (as signed evidence), `attempts=N` retries with the failures,
 //! `claims=C-1` says which claims the step proves, `apply=step` applies that
 //! prerequisite's commit first and `mcp=a,b` lets the model use those MCP servers
-//! of the folder. `approve @person` (or `@me`) asks a team member to
-//! sign off instead of running a model. See [`crate::runs`] for the verdicts.
+//! of the folder. Repeating an option that takes a list adds to it (`skill=a skill=b`
+//! is `skill=a,b`); the others are given once. `approve @person` (or `@me`) asks a
+//! team member to sign off instead of running a model. See [`crate::runs`] for the
+//! verdicts.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -381,19 +383,46 @@ fn parse_claim(rest: &str) -> Result<ClaimDef> {
     })
 }
 
-fn list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// What a step line looks like, for error messages.
+const STEP_FORM: &str = "a step line is: name [after steps] @peer[:folder] or #squad [options] what to do, e.g. fix @alice:app skill=implement-change Fix the parser";
+
+/// What the plan editor's palette (ui/plan-text.js) writes for a new step's task and a
+/// new claim's statement, for you to type over.
+const TODO_TASK: &str = "What to do";
+const TODO_CLAIM: &str = "What must be true at the end";
+
+/// Step options (`name=value`, before what to do).
+const STEP_OPTIONS: &[&str] = &[
+    "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
+];
+
+/// Whether `word` sets a step option.
+fn is_option(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(key, value)| !value.is_empty() && STEP_OPTIONS.contains(&key))
+}
+
+/// Adds an option's comma-separated values to `list`: repeating an option adds to it.
+fn add(list: &mut Vec<String>, value: &str) {
+    for v in value.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+        if !list.iter().any(|have| have == v) {
+            list.push(v.to_owned());
+        }
+    }
 }
 
 fn parse_step(line: &str) -> Result<Step> {
     let mut words = line.split_whitespace().peekable();
     let id = words.next().context("missing step id")?.to_owned();
-    validate_name(&id).map_err(|_| anyhow!("invalid step id {id:?}"))?;
+    if validate_name(&id).is_err() {
+        if id.contains('=') {
+            bail!("starts with the option {id}, but {STEP_FORM}");
+        }
+        if id.starts_with(['@', '#']) {
+            bail!("starts with who runs it ({id}), but {STEP_FORM}");
+        }
+        bail!("invalid step name {id:?}: use letters, digits, '-', '_' or '.'");
+    }
     let mut after = Vec::new();
     if words.peek() == Some(&"after") {
         words.next();
@@ -410,21 +439,31 @@ fn parse_step(line: &str) -> Result<Step> {
     if approve {
         words.next();
     }
-    let target = words.next().context("missing target: @peer or #squad")?;
-    let (kind, rest) = target.split_at(1);
+    let target = words
+        .next()
+        .with_context(|| format!("who runs it is missing; {STEP_FORM}"))?;
+    let Some(rest) = target
+        .strip_prefix('@')
+        .or_else(|| target.strip_prefix('#'))
+    else {
+        bail!(
+            "who runs it (@peer, @peer:folder or #squad) comes after the step's name, got {target:?}"
+        );
+    };
     let (name, share) = match rest.split_once(':') {
         Some((name, share)) => (name, Some(share.to_owned()).filter(|s| !s.is_empty())),
         None => (rest, None),
     };
     validate_name(name).map_err(|_| anyhow!("invalid target {target:?}"))?;
-    let target = match kind {
-        "@" => Target::Peer(name.to_owned()),
-        "#" => Target::Squad(name.to_owned()),
-        _ => bail!("target must be @peer or #squad, got {target:?}"),
+    let target = if target.starts_with('@') {
+        Target::Peer(name.to_owned())
+    } else {
+        Target::Squad(name.to_owned())
     };
     let mut provider = Provider::Copilot;
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
+    let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
             Some("using") => {
@@ -435,8 +474,11 @@ fn parse_step(line: &str) -> Result<Step> {
             }
             Some(word) if word.contains('=') => {
                 let (key, value) = word.split_once('=').expect("contains '='");
+                if matches!(key, "attempts" | "apply" | "save") && !once.insert(key) {
+                    bail!("{key}= is given twice; a step has one");
+                }
                 match key {
-                    "verify" => checks = list(value),
+                    "verify" => add(&mut checks, value),
                     "attempts" => {
                         let n: u32 = value
                             .parse()
@@ -449,12 +491,12 @@ fn parse_step(line: &str) -> Result<Step> {
                         }
                         attempts = Some(n);
                     }
-                    "claims" | "claim" => claims = list(value),
+                    "claims" | "claim" => add(&mut claims, value),
                     "apply" => apply = Some(value.to_owned()).filter(|v| !v.is_empty()),
-                    "context" => context = list(value),
-                    "skill" | "skills" => skills = list(value),
+                    "context" => add(&mut context, value),
+                    "skill" | "skills" => add(&mut skills, value),
                     "mcp" => {
-                        mcp = list(value);
+                        add(&mut mcp, value);
                         if let Some(bad) = mcp.iter().find(|m| validate_name(m).is_err()) {
                             bail!("mcp= needs MCP server names, got {bad:?}");
                         }
@@ -473,7 +515,7 @@ fn parse_step(line: &str) -> Result<Step> {
     }
     let prompt = words.collect::<Vec<_>>().join(" ");
     if prompt.is_empty() {
-        bail!("missing the task prompt");
+        bail!("missing the task prompt: what to do comes last, after who runs it and the options");
     }
     Ok(Step {
         id,
@@ -671,6 +713,22 @@ pub fn preflight(
         })
     };
     for step in &plan.steps {
+        if step.prompt == TODO_TASK {
+            report(
+                Some(step),
+                true,
+                format!("the task is still \"{TODO_TASK}\": say what the step should do"),
+            );
+        }
+        if let Some(word) = step.prompt.split_whitespace().find(|w| is_option(w)) {
+            report(
+                Some(step),
+                false,
+                format!(
+                    "{word} is in the task text, so it isn't used as an option: options go before what to do"
+                ),
+            );
+        }
         if let Err(e) = skills.instructions(&step.skills) {
             report(Some(step), true, format!("{e:#}"));
         }
@@ -723,6 +781,16 @@ pub fn preflight(
         }
     }
     for claim in &plan.claims {
+        if claim.text == TODO_CLAIM {
+            report(
+                None,
+                false,
+                format!(
+                    "claim {} still says \"{TODO_CLAIM}\": say what must be true",
+                    claim.id
+                ),
+            );
+        }
         let proving: Vec<&Step> = plan
             .steps
             .iter()
@@ -1132,11 +1200,57 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains("line 1: missing the task prompt"), "{err}");
         assert!(
-            err.contains("line 2: target must be @peer or #squad"),
+            err.contains("line 2: who runs it (@peer, @peer:folder or #squad) comes after the step's name, got \"nobody\""),
             "{err}"
         );
         assert!(err.contains("line 3: unknown provider"), "{err}");
         assert!(Plan::parse("// only a comment").is_err());
+    }
+
+    #[test]
+    fn step_lines_say_what_is_wrong_and_repeated_options_add_up() {
+        // What the plan editor makes of clicking two skills, and the same typed out.
+        for text in [
+            "step1 @worker:repo skill=adr,api-contract What to do",
+            "step1 @worker:repo skill=adr skills=api-contract,adr What to do",
+        ] {
+            assert_eq!(
+                Plan::parse(text).unwrap().steps[0].skills,
+                ["adr", "api-contract"]
+            );
+        }
+        let step = &Plan::parse("a @x verify=build verify=test,build mcp=web mcp=db do it")
+            .unwrap()
+            .steps[0];
+        assert_eq!(step.checks, ["build", "test"]);
+        assert_eq!(step.mcp, ["web", "db"]);
+
+        let fails = |text: &str, expected: &str| {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text:?}: {err}");
+        };
+        let form = "a step line is: name [after steps] @peer[:folder] or #squad [options] what to do, e.g. fix @alice:app";
+        fails(
+            "skill=adr skill=api-contract",
+            "line 1: starts with the option skill=adr, but a step line is",
+        );
+        fails("skill=adr skill=api-contract", form);
+        fails(
+            "@worker:repo Do it",
+            "line 1: starts with who runs it (@worker:repo), but",
+        );
+        fails("a! @x do", "invalid step name \"a!\"");
+        fails("a", "who runs it is missing; a step line is");
+        fails(
+            "a skill=adr do",
+            "comes after the step's name, got \"skill=adr\"",
+        );
+        fails("a ü@x do", "comes after the step's name, got \"ü@x\"");
+        fails("a @x save=one save=two do", "save= is given twice");
+        fails(
+            "a @x verify=t attempts=2 attempts=3 do",
+            "attempts= is given twice",
+        );
     }
 
     #[test]
@@ -1413,6 +1527,25 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("claim C-1 is claimed by a step without checks")),
             "{claims:?}"
+        );
+        let late = check("a @alice:app Fix it skill=implement-change");
+        assert_eq!(
+            late,
+            [
+                "W a: skill=implement-change is in the task text, so it isn't used as an option: options go before what to do"
+            ]
+        );
+        assert!(check("a @alice:app Set the=value and verify the result").is_empty());
+        // The plan editor's placeholders, never typed over.
+        let todo = check(
+            "claim: C-1 What must be true at the end\na @alice:app verify=test claims=C-1 What to do",
+        );
+        assert_eq!(
+            todo,
+            [
+                "E a: the task is still \"What to do\": say what the step should do",
+                "W : claim C-1 still says \"What must be true at the end\": say what must be true",
+            ]
         );
     }
 

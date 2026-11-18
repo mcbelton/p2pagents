@@ -605,6 +605,11 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 
+A step line is `name [after steps] @peer[:folder] or #squad [options] what to do`: options
+go before the task text (the plan check warns about one typed after it). Repeating an
+option that takes a list adds to it: `skill=adr skill=api-contract` is
+`skill=adr,api-contract`. `attempts`, `apply` and `save` are given once.
+
 **3. Agents do the work, and each result comes back with signed evidence.**
 
 - Every delegated result carries an evidence record: the checks and their results, the
@@ -1024,12 +1029,14 @@ p2pagents --name me --providers copilot --serve --ui
   results and errors, and has a **Cancel** button on running tasks.
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
   Ctrl+Enter runs it), or press **Open editor** for a full-size editor with everything a
-  plan can use beside it, inserted at the cursor: line templates (claim, step, sign-off),
-  connected peers and their folders, squads, the folders' checks and MCP servers, skills,
-  knowledge topics, `after` and other options. The plan is checked as you type. Steps show
-  which steps they wait for, and skipped steps are flagged. **Schedule…** runs the plan
-  on its own at set times ([scheduled plans](#scheduled-plans)). "What is a plan?" stays
-  folded until you open it.
+  plan can use beside it: line templates (claim, step, sign-off), connected peers and
+  their folders, squads, the folders' checks and MCP servers, skills, knowledge topics,
+  `after` and other options. A click adds to the step your cursor is on, in the place the
+  plan syntax expects (skills you click add up, who runs it is replaced), or starts a new
+  step on an empty line, then selects what to type next. The plan is checked as you type.
+  Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
+  the plan on its own at set times ([scheduled plans](#scheduled-plans)). "What is a
+  plan?" stays folded until you open it.
 - **Schedules**: each schedule in plain words, its next run, its last run's result (with
   a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.
 - **Plugins & tools**: import [plugins](#plugins-skills-and-mcp-servers-packaged-together)

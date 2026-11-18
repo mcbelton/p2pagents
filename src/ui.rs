@@ -40,6 +40,7 @@ const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_CSS: &str = include_str!("../ui/app.css");
 const APP_JS: &str = include_str!("../ui/app.js");
 const TOOLS_JS: &str = include_str!("../ui/tools.js");
+const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
 const FEED_LIMIT: usize = 500;
 
 /// What the UI shows about this agent besides live state.
@@ -481,6 +482,10 @@ pub async fn start(
         .route(
             "/tools.js",
             get(|| async { asset("text/javascript; charset=utf-8", TOOLS_JS) }),
+        )
+        .route(
+            "/plan-text.js",
+            get(|| async { asset("text/javascript; charset=utf-8", PLAN_TEXT_JS) }),
         )
         // Outside the token check: the unguessable capability in the path is the
         // authorization, and the content runs in a CSP sandbox (see crate::preview).

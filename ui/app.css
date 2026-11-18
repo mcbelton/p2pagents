@@ -504,13 +504,16 @@ dialog.editor-dialog { width: min(1240px, calc(100vw - 32px)); height: calc(100v
 .editor-main { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
 #plan-editor-text {
   flex: 1; min-height: 160px; resize: none; padding: 12px; line-height: 1.7; font-size: 13px;
-  white-space: pre; overflow: auto; tab-size: 2; overscroll-behavior: contain;
+  /* Long lines wrap, like the composer's: the start of every line (a step's name) stays in view. */
+  white-space: pre-wrap; overflow-wrap: break-word;
+  overflow-x: hidden; overflow-y: auto; tab-size: 2; overscroll-behavior: contain;
 }
 .editor-main .plan-problems { margin: 0; flex: none; max-height: 30%; }
 .palette { min-height: 0; overflow-y: auto; overscroll-behavior: contain; border-left: 1px solid var(--border); padding-left: 16px; }
 .palette-section + .palette-section { margin-top: 14px; }
 .palette h4 { margin: 0 0 4px; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
 .palette p { margin: 0 0 6px; }
+.palette .palette-hint { margin-bottom: 12px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .insert {
   font: 12px var(--mono); color: var(--text); background: var(--surface-2); cursor: pointer;

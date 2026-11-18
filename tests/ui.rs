@@ -1548,6 +1548,7 @@ async fn the_page_follows_the_ux_guidelines() {
     let page = request(port, "GET", "/", &host, None, None).await.body;
     assert!(page.contains(r#"<meta name="theme-color""#));
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
+    assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     for id in [
         "confirm-dialog",
         "plan-editor",
@@ -1582,7 +1583,7 @@ async fn the_page_follows_the_ux_guidelines() {
             &d[1]
         );
     }
-    for script in ["/app.js", "/tools.js"] {
+    for script in ["/app.js", "/tools.js", "/plan-text.js"] {
         let js = request(port, "GET", script, &host, None, None).await;
         assert_eq!(js.status, 200, "{script}");
         assert!(
@@ -1604,6 +1605,24 @@ async fn the_page_follows_the_ux_guidelines() {
     .unwrap();
     assert!(guide.contains("## Definition of done"));
     agent.shutdown().await;
+}
+
+/// The plan editor's palette (ui/plan-text.js) puts each part where the plan syntax
+/// expects it: its cases (tests/plan_text.test.cjs) run in node, which loads the
+/// script the way the page does.
+#[test]
+fn the_plan_editor_puts_each_part_where_it_belongs() {
+    let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plan_text.test.cjs");
+    let out = std::process::Command::new("node")
+        .arg(&cases)
+        .output()
+        .expect("node must be installed to run the plan editor's tests");
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("ok: "), "{stdout}");
 }
 
 fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
