@@ -50,6 +50,25 @@ pub struct ShareInfo {
     pub worktrees: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<String>,
+    /// What each of those MCP servers is for, in its owner's words.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_about: BTreeMap<String, String>,
+}
+
+/// How an owner offers an MCP server in a shared folder (see [`ShareStore::offer_mcp`]).
+#[derive(Debug, Clone)]
+pub struct McpOffer {
+    pub share: String,
+    /// The name tasks use for it.
+    pub name: String,
+    /// The least access a peer's task needs to use it.
+    pub access: Access,
+    /// The tools tasks may call (empty: the server's own list, else all).
+    pub tools: Vec<String>,
+    /// What it is for (peers see it).
+    pub description: String,
+    /// Replace a server the share offers under that name.
+    pub replace: bool,
 }
 
 /// Parses `name=command` check definitions.
@@ -120,11 +139,22 @@ impl ShareStore {
                 .cloned()
                 .collect(),
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(&owned)?)
-            .with_context(|| format!("writing {}", path.display()))
+        crate::store::write_atomic(path, &serde_json::to_vec_pretty(&owned)?)
+    }
+
+    /// Loads the shares at `path`, changes them with `change` and saves them, holding
+    /// their lock, so the web UI and the CLI never overwrite each other's changes.
+    /// Returns `change`'s result and the saved shares (to give the running agent).
+    pub fn update<T>(
+        path: &Path,
+        data: PathBuf,
+        change: impl FnOnce(&mut ShareStore) -> Result<T>,
+    ) -> Result<(T, ShareStore)> {
+        let _lock = crate::store::FileLock::acquire(path)?;
+        let mut store = Self::load(path, data)?;
+        let out = change(&mut store)?;
+        store.save(path)?;
+        Ok((out, store))
     }
 
     /// Shares `path` (an existing folder) as `name`, replacing a share of that name
@@ -187,6 +217,57 @@ impl ShareStore {
         Ok(())
     }
 
+    /// Offers the server `make` returns for the share's folder as `offer.name`, with
+    /// the offer's access, tools (none: the server's own list) and description.
+    /// Fails if the share offers that name already, unless `offer.replace`.
+    pub fn offer_mcp(
+        &mut self,
+        offer: &McpOffer,
+        make: impl FnOnce(&Path) -> Result<McpServer>,
+    ) -> Result<McpServer> {
+        let share = self
+            .get(&offer.share)
+            .with_context(|| format!("no share named '{}'", offer.share))?;
+        if !offer.replace && share.mcp.contains_key(&offer.name) {
+            bail!(
+                "'{}' already offers an MCP server named '{}': pick another name, or change that one",
+                offer.share,
+                offer.name
+            );
+        }
+        let mut server = make(&share.path)?;
+        server.access = offer.access;
+        if !offer.tools.is_empty() {
+            server.tools = offer.tools.clone();
+        }
+        server.description = offer.description.trim().to_owned();
+        self.add_mcp(&offer.share, &offer.name, server.clone())?;
+        Ok(server)
+    }
+
+    /// Changes MCP server `name` offered in `share` with `change`; the result must
+    /// still be valid.
+    pub fn edit_mcp(
+        &mut self,
+        share: &str,
+        name: &str,
+        change: impl FnOnce(&mut McpServer) -> Result<()>,
+    ) -> Result<()> {
+        let server = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == share)
+            .with_context(|| format!("no share named '{share}'"))?
+            .mcp
+            .get_mut(name)
+            .with_context(|| format!("'{share}' offers no MCP server named '{name}'"))?;
+        let mut changed = server.clone();
+        change(&mut changed)?;
+        changed.validate(name)?;
+        *server = changed;
+        Ok(())
+    }
+
     /// Stops offering MCP server `name` in share `share`; whether it was offered.
     pub fn remove_mcp(&mut self, share: &str, name: &str) -> Result<bool> {
         let share = self
@@ -217,16 +298,21 @@ impl ShareStore {
             .filter(|s| granted.contains(&s.name))
             .map(|s| {
                 let access = effective_access(grant, s.max_access);
+                let offered: Vec<(&String, &McpServer)> = s
+                    .mcp
+                    .iter()
+                    .filter(|(_, server)| server.offered(access))
+                    .collect();
                 ShareInfo {
                     name: s.name.clone(),
                     access,
                     checks: s.checks.keys().cloned().collect(),
                     worktrees: s.worktrees,
-                    mcp: s
-                        .mcp
+                    mcp: offered.iter().map(|(name, _)| (*name).clone()).collect(),
+                    mcp_about: offered
                         .iter()
-                        .filter(|(_, server)| server.allows(access))
-                        .map(|(name, _)| name.clone())
+                        .filter(|(_, server)| !server.description.is_empty())
+                        .map(|(name, server)| ((*name).clone(), server.description.clone()))
                         .collect(),
                 }
             })

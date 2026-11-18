@@ -231,7 +231,7 @@ pub async fn run_built_in(name: &str, dir: &Path) -> CheckResult {
         exit_code: Some(if passed { 0 } else { 1 }),
         passed,
         millis: started.elapsed().as_millis() as u64,
-        output: tail(&report.text(), OUTPUT_TAIL),
+        output: tail(&crate::redact::redact(&report.text()).0, OUTPUT_TAIL),
     }
 }
 
@@ -282,13 +282,15 @@ pub async fn run_check(name: &str, command: &str, dir: &Path, timeout: Duration)
             }
         }
     };
+    // Results leave this machine: redact the whole output before keeping its end,
+    // so a secret cut in half (e.g. a key block's BEGIN line) can't slip through.
     CheckResult {
         name: name.to_owned(),
-        command: command.to_owned(),
+        command: crate::redact::redact(command).0,
         exit_code,
         passed: exit_code == Some(0),
         millis: started.elapsed().as_millis() as u64,
-        output: tail(&output, OUTPUT_TAIL),
+        output: tail(&crate::redact::redact(&output).0, OUTPUT_TAIL),
     }
 }
 
@@ -454,6 +456,36 @@ mod tests {
             "only failures are reported"
         );
         assert!(prompt.ends_with("The task:\nFix the parser"));
+
+        // A key printed before a lot of other output, and a password in the command.
+        let key = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEA".repeat(200)
+        );
+        std::fs::write(
+            dir.path().join("key.txt"),
+            format!("{key}\n{}", "noise line\n".repeat(90)),
+        )
+        .unwrap();
+        let show = if cfg!(windows) {
+            "type key.txt & rem pass="
+        } else {
+            "cat key.txt # pass="
+        };
+        let leak = run_check(
+            "leak",
+            &format!("{show}x && echo postgres://app:S3cretPw@db/app"),
+            dir.path(),
+            CHECK_TIMEOUT,
+        )
+        .await;
+        assert!(
+            !leak.output.contains("MIIEow"),
+            "the key body never survives the tail"
+        );
+        assert!(
+            leak.command.contains("[REDACTED:url-password]") && !leak.command.contains("S3cretPw")
+        );
     }
 
     #[tokio::test]

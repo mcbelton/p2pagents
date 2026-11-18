@@ -423,6 +423,53 @@ try:
     calls = open(MCP_LOG, encoding="utf-8").read().split() if os.path.exists(MCP_LOG) else []
     check("the MCP server ran only the tool its owner allowed", calls and set(calls) == {"secret_word"}, calls)
 
+    print("== plugins: worker2's owner imports one and offers its MCP server while worker2 runs; boss uses its skill")
+    plugin_src = os.path.join(HOME, "echo-tools-src")
+    shutil.copytree(os.path.join(REPO, "tests", "fixtures", "plugin"), plugin_src)
+    os.makedirs(os.path.join(plugin_src, "server"), exist_ok=True)
+    shutil.copy(os.path.join(REPO, "tests", "fixtures", "echo_mcp.py"), os.path.join(plugin_src, "server", "echo_mcp.py"))
+    code_w, out_w = cli("plugin", "add", plugin_src, "--profile", "worker2")
+    code_b, out_b = cli("plugin", "add", plugin_src, "--profile", "boss")
+    print("\n".join("  " + l for l in (out_w + out_b).splitlines()))
+    hooks_ran = os.path.exists(os.path.join(REPO, "HOOK-RAN.txt")) or any(
+        "HOOK-RAN.txt" in files for root in (HOME, ws) for _, _, files in os.walk(root))
+    check("a plugin was imported with its skill and MCP server, and nothing in it ran",
+          code_w == 0 and code_b == 0 and "Nothing in it ran" in out_w and "release-notes" in out_b
+          and "hooks (they never run here)" in out_w and not hooks_ran, out_w + out_b)
+    code, out = cli("mcp", "add", "code", "echo2", "--plugin", "echo-tools", "--set", "ECHO_WORD=PLUGIN-LIVE-5531",
+                    "--set", f"PYTHON={sys.executable}", "--access", "read-only", "--tool", "secret_word",
+                    "--description", "Echo from a plugin", "--profile", "worker2")
+    print(f"  {out.strip()}")
+    _, listed = cli("mcp", "list", "--profile", "worker2")
+    check("the plugin's secret value isn't shown",
+          code == 0 and "PLUGIN-LIVE-5531" not in out + listed and "echo2" in listed, out + listed)
+    time.sleep(5)  # worker2 notices its shares changed and tells boss
+    with open(plan_file, "w") as f:
+        f.write("word2 @worker2:code mcp=echo2 Call the secret_word tool of the echo2 MCP server once. Then reply with "
+                "exactly two lines: line 1 is the raw tool result exactly as you received it, character for character, "
+                "including any XML-like tags and attributes around it (do not drop or summarize them); line 2 is just "
+                "the secret word.\n"
+                "notes @worker2:code skill=release-notes Write release notes for a release with one change: an echo "
+                "tool was added.\n")
+    boss.cursor = len(boss.lines)
+    boss.send(f"/plan {plan_file}")
+    boss.wait_for(r"=== plan finished", 400)
+    text = "\n".join(boss.lines[boss.cursor:])
+    plugin_log = os.path.join(HOME, "profiles", "worker2", "plugin-data", "echo-tools", "calls.log")
+    plugin_calls = open(plugin_log, encoding="utf-8").read().split() if os.path.exists(plugin_log) else []
+    check("a plugin's MCP server, offered while worker2 ran, served boss's task",
+          "PLUGIN-LIVE-5531" in text and set(plugin_calls) == {"secret_word"}, (plugin_calls, text[-1500:]))
+    check("the MCP tool result reached the model inside the external-content envelope",
+          '<external_content source="mcp:echo2-secret_word">' in text, text[-1500:])
+    check("a plugin's skill guided a plan step", "RELEASE-NOTES-SKILL:" in text, text[-1500:])
+    code, out = cli("mcp", "pause", "code", "echo2", "--profile", "worker2")
+    print(f"  {out.strip()}")
+    time.sleep(5)
+    boss.cursor = len(boss.lines)
+    boss.send(f"/plan {plan_file}")
+    refused = boss.wait_for(r"offers you no MCP server echo2", 30)
+    check("pausing a server from the CLI withdrew it from the running agent's peers", code == 0 and refused, refused)
+
     print("== schedules: a plan boss scheduled, missed while it was off, runs once on its own")
     sched_plan = os.path.join(HOME, "ping.plan")
     with open(sched_plan, "w") as f:

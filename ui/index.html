@@ -4,9 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" id="theme-color" content="#f5f6f8">
   <title>p2pagents</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
+  <script src="/tools.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#composer-input">Skip to message box</a>
@@ -77,6 +79,14 @@
         <div id="github"></div>
       </section>
 
+      <section class="card" aria-labelledby="tools-h">
+        <div class="card-head">
+          <h2 id="tools-h">Plugins &amp; tools</h2>
+          <button type="button" class="btn small" id="tools-open">Manage</button>
+        </div>
+        <p class="muted small" id="tools-summary">Skills, MCP servers and plugins for your agents and your peers' tasks.</p>
+      </section>
+
       <section class="card" aria-labelledby="ticket-h">
         <div class="card-head"><h2 id="ticket-h">Your ticket</h2></div>
         <p class="muted small">Give this to peers so they can allowlist this agent.</p>
@@ -128,6 +138,8 @@
               <select id="playbook"><option value="">Write your own…</option></select>
             </label>
             <button type="button" class="btn small" id="playbook-use">Use</button>
+            <button type="button" class="btn small" id="plan-expand"
+                    title="Edit the plan in a large editor, with peers, folders, skills and checks to insert">Open editor</button>
             <button type="button" class="btn small" id="schedule-open"
                     title="Run this plan on its own at set times (e.g. weekdays 09:00)">Schedule…</button>
           </div>
@@ -177,7 +189,7 @@
         <ul class="kb-list" id="kb-list"></ul>
         <details class="skills-box">
           <summary id="skills-summary">Skills</summary>
-          <p class="muted small">Instructions agents follow in plan steps (<span class="mono">skill=name</span>). Add or replace with <span class="mono">p2pagents skill add</span>.</p>
+          <p class="muted small">Instructions agents follow in plan steps (<span class="mono">skill=name</span>). Add your own or import them in <strong>Plugins &amp; tools</strong>.</p>
           <ul class="kb-list" id="skill-list"></ul>
         </details>
       </section>
@@ -253,28 +265,110 @@
   <dialog id="schedule-dialog" aria-labelledby="schedule-h">
     <form method="dialog" id="schedule-form" novalidate>
       <h2 id="schedule-h">Schedule this plan</h2>
-      <p class="muted small">This agent runs the plan in the editor on its own at these times, while it runs. Each run is saved under Evidence runs.</p>
+      <p class="muted small" id="schedule-desc">This agent runs the plan on its own while it runs, in its local time. Each run is saved under Evidence runs, and a run never overlaps the previous one.</p>
       <label class="field">
         <span>Name</span>
-        <input id="schedule-name" type="text" maxlength="64" spellcheck="false" placeholder="e.g. nightly-learn">
+        <input id="schedule-name" type="text" maxlength="64" spellcheck="false" autocomplete="off" placeholder="e.g. nightly-learn…">
       </label>
-      <label class="field">
-        <span>When (local time)</span>
-        <input id="schedule-when" type="text" list="schedule-when-examples" spellcheck="false" placeholder="e.g. weekdays 09:00">
-        <span class="muted small">every 30m · every 2h · daily 09:00 · weekdays 08:30 · mon,fri 17:00</span>
+      <fieldset class="field when-picker">
+        <legend>When</legend>
+        <div class="when-row">
+          <label class="field-inline">
+            <span>Repeat</span>
+            <select id="when-repeat">
+              <option value="daily">Every day</option>
+              <option value="weekdays">Weekdays (Monday to Friday)</option>
+              <option value="weekends">Weekends</option>
+              <option value="days">On days I pick</option>
+              <option value="interval">Every few minutes, hours or days</option>
+              <option value="custom">Custom (as text)</option>
+            </select>
+          </label>
+          <label class="field-inline" id="when-time-field">
+            <span>at</span>
+            <input id="when-time" type="time" value="09:00">
+          </label>
+          <span class="field-inline" id="when-interval-field" hidden>
+            <span>every</span>
+            <input id="when-every" type="number" min="1" max="999" value="1" aria-label="How many">
+            <select id="when-unit" aria-label="Unit">
+              <option value="m">minutes</option>
+              <option value="h" selected>hours</option>
+              <option value="d">days</option>
+            </select>
+          </span>
+        </div>
+        <div class="day-toggles" id="when-days" role="group" aria-label="Days" hidden></div>
+        <div class="field" id="when-custom-field" hidden>
+          <label for="when-custom">When, as text</label>
+          <input id="when-custom" type="text" spellcheck="false" autocomplete="off" placeholder="e.g. mon,wed,fri 17:00…" aria-describedby="when-custom-hint">
+          <span class="muted small" id="when-custom-hint">every 30m · every 2h · daily 09:00 · weekdays 08:30 · mon,fri 17:00</span>
+        </div>
+        <p class="when-preview" id="when-preview" role="status" aria-live="polite"></p>
+      </fieldset>
+      <label class="check" id="schedule-replan-field" hidden>
+        <input id="schedule-replan" type="checkbox">
+        <span>Also replace its plan with the one in the editor</span>
       </label>
-      <datalist id="schedule-when-examples">
-        <option value="every 1h"></option>
-        <option value="daily 09:00"></option>
-        <option value="weekdays 08:30"></option>
-        <option value="mon,wed,fri 17:00"></option>
-      </datalist>
       <p class="form-error" id="schedule-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="schedule-cancel">Cancel</button>
-        <button type="submit" class="btn primary">Schedule</button>
+        <button type="submit" class="btn primary" id="schedule-submit">Schedule</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-h" aria-describedby="confirm-body">
+    <form method="dialog" id="confirm-form">
+      <h2 id="confirm-h">Are you sure?</h2>
+      <p id="confirm-body" class="confirm-body"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="confirm-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="confirm-ok" value="ok">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="plan-editor" class="editor-dialog" aria-labelledby="plan-editor-h">
+    <div class="editor-shell">
+      <div class="editor-head">
+        <h2 id="plan-editor-h">Plan editor</h2>
+        <span class="muted small">Claims first, then one step per line · Ctrl+Enter runs the plan</span>
+        <button type="button" class="btn small" id="plan-editor-close">Done</button>
+      </div>
+      <div class="editor-body">
+        <div class="editor-main">
+          <label for="plan-editor-text" class="visually-hidden">Plan</label>
+          <textarea id="plan-editor-text" class="mono" spellcheck="false" autocomplete="off"></textarea>
+          <div id="plan-editor-check" class="plan-problems" role="status" aria-live="polite"></div>
+        </div>
+        <aside class="palette" aria-labelledby="palette-h">
+          <h3 id="palette-h" class="visually-hidden">Insert into the plan</h3>
+          <div id="plan-palette"></div>
+        </aside>
+      </div>
+      <div class="editor-foot">
+        <button type="button" class="btn" id="plan-editor-schedule">Schedule…</button>
+        <button type="button" class="btn primary" id="plan-editor-run">Run plan</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="tools-dialog" class="wide tall" aria-labelledby="tools-dialog-h">
+    <div class="dialog-body">
+      <div class="card-head">
+        <h2 id="tools-dialog-h">Plugins &amp; tools</h2>
+        <button type="button" class="btn small" id="tools-close">Close</button>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Plugins and tools">
+        <button type="button" role="tab" id="tab-plugins" data-tab="plugins" aria-controls="panel-plugins" aria-selected="true">Plugins</button>
+        <button type="button" role="tab" id="tab-mcp" data-tab="mcp" aria-controls="panel-mcp" aria-selected="false" tabindex="-1">MCP servers</button>
+        <button type="button" role="tab" id="tab-skills" data-tab="skills" aria-controls="panel-skills" aria-selected="false" tabindex="-1">Skills</button>
+      </div>
+      <section role="tabpanel" id="panel-plugins" aria-labelledby="tab-plugins" class="tab-panel" tabindex="0"></section>
+      <section role="tabpanel" id="panel-mcp" aria-labelledby="tab-mcp" class="tab-panel" tabindex="0" hidden></section>
+      <section role="tabpanel" id="panel-skills" aria-labelledby="tab-skills" class="tab-panel" tabindex="0" hidden></section>
+    </div>
   </dialog>
 
   <dialog id="squad-dialog" aria-labelledby="squad-h">

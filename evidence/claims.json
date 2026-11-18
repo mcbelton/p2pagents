@@ -552,23 +552,28 @@
         "lib::boundary::external_content_cannot_close_or_reopen_its_envelope",
         "lib::plan::steps_use_and_grow_the_knowledge_base",
         "agents::plans_run_dependent_steps_across_squads",
-        "ui::ui_runs_plans_and_shows_squads"
+        "ui::ui_runs_plans_and_shows_squads",
+        "lib::llm::copilot::mcp_results_reach_the_model_in_an_envelope"
       ],
-      "live": ["boss's plan ran a dependent step with its prerequisite's result"]
+      "live": [
+        "boss's plan ran a dependent step with its prerequisite's result",
+        "the MCP tool result reached the model inside the external-content envelope"
+      ]
     },
     {
       "id": "SEC-6",
       "area": "security",
-      "claim": "Results, failing check output, error messages, knowledge topics and incident alerts leave the machine with known secret formats redacted (private keys, GitHub, AWS, Slack, OpenAI, Anthropic, Google and npm tokens, JWTs, connection strings, signed URLs, bearer tokens, passwords), with a note of how many; the evidence is signed for the redacted output.",
+      "claim": "Results, failing check output and the check commands, error messages, knowledge topics and incident alerts leave the machine with known secret formats redacted (private keys and PGP key blocks, GitHub, AWS access and secret keys, Slack, OpenAI, Anthropic, Google and npm tokens, JWTs, connection strings, signed URLs, bearer tokens, password settings such as DB_PASSWORD=), with a note of how many; check output is redacted before it is cut to its end, so a key printed early can't leak in part, and the evidence is signed for the redacted output.",
       "tests": [
         "lib::redact::known_secret_formats_are_redacted_and_ordinary_text_is_not",
+        "lib::evidence::checks_report_exit_codes_and_output",
         "agents::delegates_tasks_to_a_peer_that_serves_the_provider"
       ]
     },
     {
       "id": "MCP-1",
       "area": "shared folders",
-      "claim": "A shared folder's owner offers MCP servers to peers' tasks (a local command or an https URL, the tools tasks may call, the least access needed); peers learn only the names they may use, never commands, variables, headers or URLs, and the owner's web UI shows them without their secrets. A task gets only the servers it asks for (mcp= in a plan step, or picked in the web UI) that its folder offers at its access; Codex tasks can't use them, and plans are checked before they run.",
+      "claim": "A shared folder's owner offers MCP servers to peers' tasks (a local command or an https URL, the tools tasks may call, the least access needed); peers learn only the names they may use and what their owner says each is for, never commands, variables, headers or URLs, and the owner's web UI shows them without their secrets. A task gets only the servers it asks for (mcp= in a plan step, or picked in the web UI) that its folder offers at its access; Codex tasks can't use them, and plans are checked before they run.",
       "tests": [
         "lib::mcp::servers_are_validated_and_secrets_never_listed",
         "lib::shares::mcp_servers_are_offered_by_name_only_at_enough_access",
@@ -591,7 +596,7 @@
     {
       "id": "SCH-1",
       "area": "squads",
-      "claim": "Plans and playbooks run on their own at set times (every N minutes, hours or days, daily, on weekdays or given days, in local time) while the agent runs: due schedules start without overlapping themselves, a run missed while the agent was off runs once when it starts, and each run is a saved evidence run whose verdict is recorded; schedules are managed from the CLI and the web UI (add, pause, resume, run now, delete).",
+      "claim": "Plans and playbooks run on their own at set times (every N minutes, hours or days, daily, on weekdays or given days, in local time) while the agent runs: due schedules start without overlapping themselves, a run missed while the agent was off runs once when it starts (when its peers are back), and each run is a saved evidence run whose verdict is recorded; schedules are managed from the CLI and the web UI (add, pause, resume, run now, delete).",
       "tests": [
         "lib::schedule::when_reads_intervals_times_and_days",
         "lib::schedule::next_run_follows_the_last_run",
@@ -612,6 +617,89 @@
         "bin::all_checks_include_the_rehearsal_only_once_there_is_one"
       ],
       "live": ["design init scaffolds a design package and review pack that pass every check"]
+    },
+    {
+      "id": "PLG-1",
+      "area": "plugins",
+      "claim": "A profile imports plugins from a folder, a GitHub repository (private ones with the profile's GitHub sign-in) or a git URL, in the layouts GitHub Copilot CLI, Claude Code and Agent Plugins use, or picks one from a marketplace; its owner reviews what a plugin contains (skills, MCP servers and the values they need, what isn't used) before anything is kept, and importing runs nothing: agents, commands, hooks and LSP servers are listed and left out.",
+      "tests": [
+        "lib::plugins::sources_are_folders_github_repositories_or_git_urls",
+        "lib::plugins::plugins_are_inspected_in_every_layout_and_import_runs_nothing",
+        "lib::plugins::git_sources_are_cloned_and_marketplace_entries_resolved",
+        "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
+      ],
+      "live": ["a plugin was imported with its skill and MCP server, and nothing in it ran"]
+    },
+    {
+      "id": "PLG-2",
+      "area": "plugins",
+      "claim": "A plugin's skills guide plan steps like the profile's own (by name when no other skill has it, always as plugin.skill), and its MCP servers are templates its owner offers in a folder with the values they need, the access and the tools; turning a plugin off withdraws both, updating it pauses offered servers that would now start differently, and removing it removes the servers it offered.",
+      "tests": [
+        "lib::plugins::plugins_install_offer_update_disable_and_remove",
+        "lib::skills::plugin_skills_are_found_by_name_or_as_plugin_dot_skill_and_skill_files_import",
+        "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
+      ],
+      "live": [
+        "a plugin's skill guided a plan step",
+        "a plugin's MCP server, offered while worker2 ran, served boss's task"
+      ]
+    },
+    {
+      "id": "MCP-3",
+      "area": "shared folders",
+      "claim": "Owners configure MCP servers in the web UI and the CLI: offer one by hand, from an MCP configuration (mcp.json, .mcp.json or VS Code's, placeholders filled in for the folder) or from a plugin, with secret values typed hidden and never shown again; pause, resume, change or remove it. Changes reach a running agent's peers within seconds, also when made from the CLI, and concurrent changes never overwrite each other.",
+      "tests": [
+        "lib::mcp::configurations_are_read_and_templates_filled_in_per_folder",
+        "lib::mcp::servers_are_validated_and_secrets_never_listed",
+        "lib::store::writes_are_atomic_and_locks_exclusive",
+        "agents::peers_use_only_the_mcp_servers_a_folder_offers_them",
+        "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
+      ],
+      "live": [
+        "the plugin's secret value isn't shown",
+        "pausing a server from the CLI withdrew it from the running agent's peers"
+      ]
+    },
+    {
+      "id": "SKL-2",
+      "area": "knowledge",
+      "claim": "Owners add their own skills in the web UI (pasted or loaded from a file, named by its front matter) or the CLI (skill import of a SKILL.md, its folder or a Markdown file, at most 64 KB), and remove them; built-in skills can be replaced but not removed, and a plugin's go with their plugin.",
+      "tests": [
+        "lib::skills::plugin_skills_are_found_by_name_or_as_plugin_dot_skill_and_skill_files_import",
+        "lib::skills::built_in_skills_are_listed_and_profile_skills_replace_them",
+        "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
+      ]
+    },
+    {
+      "id": "SEC-7",
+      "area": "security",
+      "claim": "MCP tool results reach the model inside the external-content envelope: Copilot sessions rewrite each MCP tool's result in a post-tool hook, keeping its shape, and run no repository hooks; Claude's post-tool hook does the same; prompts of tasks that use MCP servers carry the standing rule. Server names stay unambiguous, so a task can't reach another server's tools.",
+      "tests": [
+        "lib::llm::copilot::mcp_results_reach_the_model_in_an_envelope",
+        "lib::llm::copilot::mcp_calls_only_reach_the_tasks_servers_and_allowed_tools",
+        "lib::mcp::servers_are_validated_and_secrets_never_listed",
+        "bridge::claude_tool_policy_confines_paths_and_tools"
+      ],
+      "live": ["the MCP tool result reached the model inside the external-content envelope"]
+    },
+    {
+      "id": "SCH-2",
+      "area": "squads",
+      "claim": "A due scheduled run that can't start (e.g. its peer is still reconnecting after a restart) is tried again every two minutes for an hour, then recorded as missed with why; Run now says why it can't start; resuming counts from now without a made-up run; a run that crashes never leaves its schedule stuck as running; schedules are edited in the web UI with a picker that previews the next runs.",
+      "tests": [
+        "lib::schedule::the_scheduler_runs_due_schedules_once_at_a_time_and_records_verdicts",
+        "lib::store::writes_are_atomic_and_locks_exclusive",
+        "ui::ui_runs_plans_and_shows_squads"
+      ]
+    },
+    {
+      "id": "UX-1",
+      "area": "ui",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor that inserts peers, folders, squads, checks, MCP servers, skills and knowledge; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "tests": [
+        "ui::the_page_follows_the_ux_guidelines",
+        "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
+      ]
     },
     {
       "id": "BRG-1",

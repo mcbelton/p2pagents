@@ -541,11 +541,45 @@ async fn ui_runs_plans_and_shows_squads() {
     };
     let too_often = post("/api/schedules", schedule("every 1m")).await;
     assert_eq!(too_often.status, 400, "{}", too_often.body);
+    let preview = post("/api/schedule-preview", r#"{"when":"every 2h"}"#.into())
+        .await
+        .json();
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert_eq!(preview["parts"]["every_minutes"], 120);
+    assert_eq!(preview["next"].as_array().unwrap().len(), 3);
+    let bad = post("/api/schedule-preview", r#"{"when":"every 1m"}"#.into())
+        .await
+        .json();
+    assert!(
+        bad["error"].as_str().unwrap().contains("5 minutes"),
+        "{bad}"
+    );
     let added = post("/api/schedules", schedule("daily 02:00")).await;
     assert_eq!(added.status, 200, "{}", added.body);
     let added = added.json();
     assert_eq!(added["schedules"][0]["enabled"], true);
     assert!(added["schedules"][0]["next_unix"].as_i64().is_some());
+    assert_eq!(
+        added["schedules"][0]["next_runs"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(added["schedules"][0]["when_parts"]["time"], "02:00");
+    let twice = post("/api/schedules", schedule("daily 03:00")).await;
+    assert!(twice.body.contains("already exists"), "{}", twice.body);
+    let edit = |body: &'static str| {
+        request(
+            port,
+            "PUT",
+            "/api/schedules/nightly",
+            &host,
+            Some(token),
+            Some(body),
+        )
+    };
+    let edited = edit(r#"{"when":"weekdays 08:30"}"#).await.json();
+    assert_eq!(edited["schedules"][0]["when"], "weekdays 08:30");
+    assert_eq!(edited["schedules"][0]["when_parts"]["days"][0], "mon");
+    assert_eq!(edit(r#"{"plan":"not a plan"}"#).await.status, 400);
     let ran = post("/api/schedules/nightly/run", String::new()).await;
     assert_eq!(ran.status, 200, "{}", ran.body);
     let last = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1062,4 +1096,471 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
     assert_eq!(page.body, "<h1>Proto</h1>");
     waiting.abort();
     agent.shutdown().await;
+}
+
+/// Copies the fixture plugin (with the echo MCP server) into `dir`.
+fn fixture_plugin(dir: &std::path::Path) {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    copy(&fixtures.join("plugin"), dir);
+    std::fs::create_dir_all(dir.join("server")).unwrap();
+    std::fs::copy(fixtures.join("echo_mcp.py"), dir.join("server/echo_mcp.py")).unwrap();
+}
+
+#[tokio::test]
+async fn ui_imports_plugins_and_configures_mcp_servers_and_skills() {
+    let home = tempfile::tempdir().unwrap();
+    let app = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let profile = Profile::open_in(home.path(), "owner").unwrap();
+    let mut shares = profile.shares().unwrap();
+    shares.add("app", app.path(), Access::ReadOnly).unwrap();
+    shares.save(&profile.shares_path()).unwrap();
+    let mut config = AgentConfig::new("owner", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.shares = shares;
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: profile.clone(),
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let call = |method: &'static str, path: String, body: Value| {
+        let (host, token) = (host.clone(), token.to_owned());
+        async move {
+            let body = (!body.is_null()).then(|| body.to_string());
+            request(port, method, &path, &host, Some(&token), body.as_deref()).await
+        }
+    };
+    let offered_to_peers = || {
+        agent.shares().visible(&["app".into()], Access::ReadOnly)[0]
+            .mcp
+            .clone()
+    };
+
+    // A marketplace lists its plugins; picking one fetches it for review. Nothing
+    // is kept until it is imported, and nothing in it runs.
+    let market = sources.path().join("team-market");
+    fixture_plugin(&market.join("plugins/echo"));
+    std::fs::create_dir_all(market.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        market.join(".claude-plugin/marketplace.json"),
+        r#"{"name": "team", "plugins": [{"name": "echo-tools", "description": "Echo", "source": "./plugins/echo"},
+            {"name": "elsewhere", "source": {"source": "npm", "package": "x"}}]}"#,
+    )
+    .unwrap();
+    let listing = call(
+        "POST",
+        "/api/plugin-preview".into(),
+        serde_json::json!({ "source": market }),
+    )
+    .await;
+    assert_eq!(listing.status, 200, "{}", listing.body);
+    let listing = listing.json();
+    assert_eq!(
+        (listing["kind"].as_str(), listing["name"].as_str()),
+        (Some("marketplace"), Some("team"))
+    );
+    assert_eq!(listing["plugins"][1]["source"]["kind"], "unsupported");
+    let review = call(
+        "POST",
+        "/api/plugin-preview".into(),
+        serde_json::json!({ "token": listing["token"], "plugin": "echo-tools" }),
+    )
+    .await;
+    assert_eq!(review.status, 200, "{}", review.body);
+    let review = review.json();
+    assert_eq!(
+        (review["kind"].as_str(), review["market"].as_str()),
+        (Some("plugin"), Some("team"))
+    );
+    let plugin = &review["plugin"];
+    assert_eq!(plugin["name"], "echo-tools");
+    assert_eq!(plugin["skills"][0]["name"], "release-notes");
+    let inputs = &plugin["mcp"][0]["inputs"];
+    assert!(
+        inputs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["name"] == "ECHO_WORD" && i["secret"] == true),
+        "{inputs}"
+    );
+    assert!(
+        plugin["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("hooks (they never run here)")
+    );
+    let listed = call("GET", "/api/plugins".into(), Value::Null).await.json();
+    assert_eq!(
+        listed["plugins"],
+        serde_json::json!([]),
+        "nothing kept before import"
+    );
+
+    let installed = call(
+        "POST",
+        "/api/plugins".into(),
+        serde_json::json!({ "token": review["token"] }),
+    )
+    .await;
+    assert_eq!(installed.status, 200, "{}", installed.body);
+    assert_eq!(
+        installed.json()["plugin"]["skills"][0]["use"],
+        "release-notes"
+    );
+    let again = call(
+        "POST",
+        "/api/plugins".into(),
+        serde_json::json!({ "token": review["token"] }),
+    )
+    .await;
+    assert_eq!(again.status, 400, "a review is imported once");
+    assert!(
+        walkdir(home.path())
+            .iter()
+            .all(|p| !p.ends_with("HOOK-RAN.txt")),
+        "the plugin's hook never ran"
+    );
+    let skills = call("GET", "/api/skills".into(), Value::Null).await.json();
+    assert!(
+        skills["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "release-notes" && s["source"] == "plugin"),
+        "{skills}"
+    );
+
+    // Offering a plugin's MCP server in a folder, with the values it needs; the
+    // values stay in the profile, peers learn the name and the description.
+    let offer = |values: Value| {
+        serde_json::json!({
+            "share": "app", "name": "echo", "plugin": "echo-tools", "access": "read-only",
+            "description": "Says the word", "values": values,
+        })
+    };
+    let missing = call("POST", "/api/mcp".into(), offer(serde_json::json!({}))).await;
+    assert_eq!(missing.status, 400);
+    assert!(
+        missing.body.contains("needs a value for ECHO_WORD"),
+        "{}",
+        missing.body
+    );
+    let made = call(
+        "POST",
+        "/api/mcp".into(),
+        offer(serde_json::json!({ "ECHO_WORD": "PLUM-7781", "PYTHON": "python" })),
+    )
+    .await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    assert!(!made.body.contains("PLUM-7781"));
+    assert_eq!(
+        made.json()["server"]["plugin"]["values"],
+        serde_json::json!(["ECHO_WORD", "PYTHON"])
+    );
+    let duplicate = call(
+        "POST",
+        "/api/mcp".into(),
+        offer(serde_json::json!({ "ECHO_WORD": "x" })),
+    )
+    .await;
+    assert!(
+        duplicate.body.contains("already offers"),
+        "{}",
+        duplicate.body
+    );
+    assert_eq!(offered_to_peers(), ["echo"]);
+    assert_eq!(
+        agent.shares().visible(&["app".into()], Access::ReadOnly)[0].mcp_about["echo"],
+        "Says the word"
+    );
+    let state = call("GET", "/api/mcp".into(), Value::Null).await;
+    assert!(
+        !state.body.contains("PLUM-7781"),
+        "values are never sent to the page"
+    );
+    let state = state.json();
+    assert_eq!(state["shares"][0]["mcp"][0]["name"], "echo");
+    assert_eq!(state["templates"][0]["server"], "echo");
+
+    // Pausing stops offering it; new values make it again from the template.
+    let paused = call(
+        "PATCH",
+        "/api/mcp/app/echo".into(),
+        serde_json::json!({ "paused": true }),
+    )
+    .await;
+    assert_eq!(paused.status, 200, "{}", paused.body);
+    assert!(offered_to_peers().is_empty());
+    let resumed = call(
+        "PATCH",
+        "/api/mcp/app/echo".into(),
+        serde_json::json!({ "paused": false, "values": { "ECHO_WORD": "NEW-WORD-1", "PYTHON": "" } }),
+    )
+    .await;
+    assert_eq!(resumed.status, 200, "{}", resumed.body);
+    assert_eq!(offered_to_peers(), ["echo"]);
+    let saved = std::fs::read_to_string(profile.shares_path()).unwrap();
+    assert!(
+        saved.contains("NEW-WORD-1") && !saved.contains("PLUM-7781"),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("\"PYTHON\": \"python\""),
+        "a blank value keeps the current one"
+    );
+
+    // Turning the plugin off withdraws its skills and servers until it is on again.
+    let off = call(
+        "PATCH",
+        "/api/plugins/echo-tools".into(),
+        serde_json::json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(off.status, 200, "{}", off.body);
+    assert!(offered_to_peers().is_empty());
+    let skills = call("GET", "/api/skills".into(), Value::Null).await.json();
+    assert!(!skills.to_string().contains("release-notes"));
+    call(
+        "PATCH",
+        "/api/plugins/echo-tools".into(),
+        serde_json::json!({ "enabled": true }),
+    )
+    .await;
+    assert_eq!(offered_to_peers(), ["echo"]);
+
+    // An MCP configuration (VS Code format) is reviewed, then a server offered.
+    let config = r#"{"inputs": [{"id": "docs-token", "description": "Docs token", "password": true}],
+        "servers": {"docs": {"type": "http", "url": "https://docs.example.com/mcp",
+        "headers": {"Authorization": "Bearer ${input:docs-token}"}}}}"#;
+    let parsed = call(
+        "POST",
+        "/api/mcp/parse".into(),
+        serde_json::json!({ "json": config }),
+    )
+    .await
+    .json();
+    assert_eq!(parsed["servers"][0]["name"], "docs");
+    assert_eq!(parsed["servers"][0]["inputs"][0]["secret"], true);
+    let docs = call(
+        "POST",
+        "/api/mcp".into(),
+        serde_json::json!({ "share": "app", "name": "docs", "config": config, "server": "docs",
+            "values": { "docs-token": "tok-5531" } }),
+    )
+    .await;
+    assert_eq!(docs.status, 200, "{}", docs.body);
+    assert_eq!(
+        docs.json()["server"]["describe"],
+        "https://docs.example.com/mcp [Authorization=***]"
+    );
+
+    // By hand: a command line, with the tools tasks may call.
+    let web = call(
+        "POST",
+        "/api/mcp".into(),
+        serde_json::json!({ "share": "app", "name": "web", "command_line": "npx -y \"@playwright/mcp\" --headless",
+            "access": "full", "tools": ["browser_snapshot", " "] }),
+    )
+    .await;
+    assert_eq!(web.status, 200, "{}", web.body);
+    let web = web.json();
+    assert_eq!(
+        web["server"]["describe"],
+        "npx -y @playwright/mcp --headless"
+    );
+    assert_eq!(
+        web["server"]["tools"],
+        serde_json::json!(["browser_snapshot"])
+    );
+    let data = call(
+        "POST",
+        "/api/mcp".into(),
+        serde_json::json!({ "share": "data", "name": "web", "command_line": "npx x" }),
+    )
+    .await;
+    assert_eq!(data.status, 400, "the data folder offers no servers");
+    assert_eq!(
+        call("DELETE", "/api/mcp/app/web".into(), Value::Null)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        call("DELETE", "/api/mcp/app/web".into(), Value::Null)
+            .await
+            .status,
+        400
+    );
+    let all = call("GET", "/api/mcp".into(), Value::Null).await;
+    assert!(!all.body.contains("tok-5531"));
+
+    // The profile's own skills: named by their front matter, removable; built-ins aren't.
+    let added = call(
+        "POST",
+        "/api/skills".into(),
+        serde_json::json!({ "text": "---\nname: house-style\ndescription: How we write\n---\nWrite plainly." }),
+    )
+    .await;
+    assert_eq!(added.json()["name"], "house-style");
+    let skill = call("GET", "/api/skills/house-style".into(), Value::Null)
+        .await
+        .json();
+    assert!(skill["text"].as_str().unwrap().contains("Write plainly."));
+    let nameless = call(
+        "POST",
+        "/api/skills".into(),
+        serde_json::json!({ "text": "No name." }),
+    )
+    .await;
+    assert_eq!(nameless.status, 400);
+    assert_eq!(
+        call("DELETE", "/api/skills/house-style".into(), Value::Null)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        call("DELETE", "/api/skills/house-style".into(), Value::Null)
+            .await
+            .status,
+        404
+    );
+    let built_in = call("DELETE", "/api/skills/security-review".into(), Value::Null).await;
+    assert!(built_in.body.contains("built in"), "{}", built_in.body);
+
+    // Removing the plugin removes the servers it offered, and only those.
+    let removed = call("DELETE", "/api/plugins/echo-tools".into(), Value::Null).await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert!(
+        removed.body.contains("MCP server echo removed from 'app'"),
+        "{}",
+        removed.body
+    );
+    let left: Vec<String> = agent
+        .shares()
+        .get("app")
+        .unwrap()
+        .mcp
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(left, ["docs"]);
+    assert!(
+        offered_to_peers().is_empty(),
+        "docs needs full access; this folder allows read-only"
+    );
+    agent.shutdown().await;
+}
+
+/// The page follows docs/ux-guidelines.md where a machine can tell: its theme color,
+/// in-page confirmations (never window.confirm), no HTML built from strings.
+#[tokio::test]
+async fn the_page_follows_the_ux_guidelines() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home.path(), "solo").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let port: u16 = rest.split_once("/#t=").unwrap().0.parse().unwrap();
+    let host = format!("127.0.0.1:{port}");
+    let page = request(port, "GET", "/", &host, None, None).await.body;
+    assert!(page.contains(r#"<meta name="theme-color""#));
+    assert!(page.contains(r#"<script src="/tools.js" defer>"#));
+    for id in [
+        "confirm-dialog",
+        "plan-editor",
+        "tools-dialog",
+        "when-repeat",
+        "when-preview",
+    ] {
+        assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
+    }
+    let confirm = regex::Regex::new(r"\bconfirm\(").unwrap();
+    let html =
+        regex::Regex::new(r"\.(inner|outer)HTML\b|insertAdjacentHTML|document\.write").unwrap();
+    for script in ["/app.js", "/tools.js"] {
+        let js = request(port, "GET", script, &host, None, None).await;
+        assert_eq!(js.status, 200, "{script}");
+        assert!(
+            js.headers.contains("content-type: text/javascript"),
+            "{script}"
+        );
+        assert!(
+            !confirm.is_match(&js.body),
+            "{script} asks with window.confirm"
+        );
+        assert!(
+            !html.is_match(&js.body),
+            "{script} builds HTML from strings"
+        );
+    }
+    let guide = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/ux-guidelines.md"),
+    )
+    .unwrap();
+    assert!(guide.contains("## Definition of done"));
+    agent.shutdown().await;
+}
+
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walkdir(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }

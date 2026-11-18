@@ -144,16 +144,59 @@ const HOME_SECRETS = [
 /** How Claude names MCP servers and tools in `mcp__<server>__<tool>`. */
 const mcpName = (name) => String(name).replace(/[^a-zA-Z0-9_-]/g, "_");
 
+/**
+ * The server and tool of Claude tool name `mcp__<server>__<tool>`. p2pagents' server
+ * names have no `__` and don't start or end with `_`, so the first `__` after
+ * `mcp__` ends the server's name.
+ */
+function mcpParts(tool) {
+  if (typeof tool !== "string" || !tool.startsWith("mcp__")) return null;
+  const rest = tool.slice(5);
+  const end = rest.indexOf("__");
+  if (end <= 0) return null;
+  return { server: rest.slice(0, end), tool: rest.slice(end + 2) };
+}
+
 /** Why Claude may not call MCP tool `tool` (`mcp__<server>__<tool>`), or null. */
 export function mcpRefusal(mcp, tool) {
-  for (const [name, server] of Object.entries(mcp ?? {})) {
-    const prefix = `mcp__${mcpName(name)}__`;
-    if (!tool.startsWith(prefix)) continue;
-    const allowed = server.tools ?? [];
-    if (allowed.length === 0 || allowed.some((t) => prefix + mcpName(t) === tool)) return null;
-    return `${tool} is not one of the tools the owner allows on MCP server ${name}`;
+  const parts = mcpParts(tool);
+  const entry = parts && Object.entries(mcp ?? {}).find(([name]) => mcpName(name) === parts.server);
+  if (!entry) return `${tool} is not from an MCP server this task may use`;
+  const [name, server] = entry;
+  const allowed = server.tools ?? [];
+  if (allowed.length === 0 || allowed.some((t) => mcpName(t) === parts.tool)) return null;
+  return `${tool} is not one of the tools the owner allows on MCP server ${name}`;
+}
+
+// Same envelope as src/boundary.rs: MCP results are external content.
+const TAG = "external_content";
+
+/** `body` in an `<external_content source="...">` envelope it can't close or reopen. */
+export function externalContent(source, body) {
+  const label = String(source).replace(/[^\p{L}\p{N} :._\-/@]/gu, "_").slice(0, 120);
+  const text = String(body)
+    .replace(/<\s*\/\s*external_content\b[^>]*>/gi, `<\\/${TAG}>`)
+    .replace(/<\s*external_content\b/gi, `<\\${TAG}`);
+  return `<${TAG} source="${label}">\n${text.trimEnd()}\n</${TAG}>`;
+}
+
+/** A tool's output with every text the model reads in an envelope. */
+export function wrapToolOutput(source, output) {
+  if (typeof output === "string") return externalContent(source, output);
+  if (Array.isArray(output)) {
+    return output.map((item) => {
+      if (typeof item === "string") return externalContent(source, item);
+      if (item && typeof item === "object" && typeof item.text === "string") {
+        return { ...item, text: externalContent(source, item.text) };
+      }
+      return item;
+    });
   }
-  return `${tool} is not from an MCP server this task may use`;
+  if (output && typeof output === "object") {
+    if (Array.isArray(output.content)) return { ...output, content: wrapToolOutput(source, output.content) };
+    if (typeof output.text === "string") return { ...output, text: externalContent(source, output.text) };
+  }
+  return externalContent(source, JSON.stringify(output ?? null));
 }
 
 /** The task's MCP servers in the Claude Agent SDK's form, and the tools to pre-approve. */
@@ -206,6 +249,17 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
       },
     };
   };
+  // MCP results come from outside the task: the model gets them in an envelope.
+  const spotlight = async (input) => {
+    const parts = mcpParts(input.tool_name);
+    if (!parts) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PostToolUse",
+        updatedToolOutput: wrapToolOutput(`mcp:${parts.server}/${parts.tool}`, input.tool_response),
+      },
+    };
+  };
   let result;
   for await (const message of query({
     prompt,
@@ -223,7 +277,7 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
       sandbox: claudeSandbox(access),
       abortController,
       // Checks every tool call's paths, including pre-approved tools.
-      hooks: { PreToolUse: [{ hooks: [guard] }] },
+      hooks: { PreToolUse: [{ hooks: [guard] }], PostToolUse: [{ hooks: [spotlight] }] },
     },
   })) {
     if (message.type === "result") result = message;

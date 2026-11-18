@@ -554,12 +554,19 @@ p2pagents schedule pause smoke --profile boss   # resume / remove
   with the CLI are picked up within 30 seconds, without a restart.
 - A schedule never overlaps itself: if a run is still going when the next one is due, the
   next one is skipped. A run missed while the agent was off runs **once** when it starts.
-- The plan is checked like any other before it runs. If a peer it needs is offline, the
-  run is recorded as not run, with the reason.
-- In the web UI, **Plan** mode has **Schedule…** to schedule the plan in the editor. The
-  **Schedules** panel shows each schedule's next run and last verdict, with
-  **Run now**, **Pause**/**Resume** and **Delete**. Steps of scheduled runs appear as
-  tasks, like any plan.
+- The plan is checked like any other before it runs. If it can't start (say a peer it
+  needs is still reconnecting after a restart), it is tried again every 2 minutes for an
+  hour, then recorded as **missed** with the reason, and the schedule counts on from then.
+  **Run now** says at once why a run can't start.
+- Resuming a paused schedule counts from the moment you resume it: paused runs are not
+  caught up.
+- In the web UI, **Plan** mode has **Schedule…** to schedule the plan in the editor: pick
+  how often (every day, weekdays, weekends, days you pick, every few minutes, hours or
+  days, or the text form) and see the next three runs before you save. The
+  **Schedules** panel shows each schedule in plain words ("Weekdays at 08:30"), when it
+  runs next ("in 3 hours"), its last run's result with a link to the evidence run, and
+  **Run now**, **Pause**/**Resume**, **Edit** and **Delete**. Steps of scheduled runs
+  appear as tasks, like any plan.
 
 ### Evidence-driven development with agents
 
@@ -708,7 +715,12 @@ Add your team's own, or replace a built-in one with the same name:
 p2pagents skill list --profile boss
 p2pagents skill show security-review --profile boss
 p2pagents skill add security-review .\our-security-checklist.md --profile boss   # front matter: name, description
+p2pagents skill import .\skills\release-notes --profile boss                      # a SKILL.md or its folder; named by its front matter
 ```
+
+In the web UI, **Plugins & tools › Skills** adds a skill (pasted, or loaded from a
+`SKILL.md`) and lists yours, those of your plugins and the built-in ones. Skills also come
+in [plugins](#plugins-skills-and-mcp-servers-packaged-together).
 
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
@@ -972,9 +984,10 @@ p2pagents playbook show rehearse --set peer=alice --set folder=shop --set change
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
-`p2pagents share add|list|remove`, `p2pagents mcp add|list|remove`, `p2pagents worker create|list`,
+`p2pagents share add|list|remove`, `p2pagents mcp add|import|list|pause|resume|remove`,
+`p2pagents plugin add|list|show|update|enable|disable|remove`, `p2pagents worker create|list`,
 `p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
-`p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|remove`, `p2pagents github login|status|logout`,
+`p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|import|remove`, `p2pagents github login|status|logout`,
 `p2pagents repo link|list|sync|branches|pr|unlink`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `P2PAGENTS_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30).
@@ -999,14 +1012,24 @@ p2pagents --name me --providers copilot --serve --ui
   tasks peers delegate to you.
 - **Run task**: pick a provider and where to run it (*This agent*, a named peer, or *Any peer*
   when several serve it), and the peer's folder. If that folder offers MCP servers, tick
-  the ones the task may use.
+  the ones the task may use (each shows what its owner says it is for).
   The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
   results and errors, and has a **Cancel** button on running tasks.
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
-  Ctrl+Enter runs it). Steps show which steps they wait for, and skipped steps are flagged.
-  **Schedule…** runs the plan on its own at set times ([scheduled plans](#scheduled-plans)).
-- **Schedules**: each schedule's next run and last verdict, with Run now, Pause/Resume and
-  Delete.
+  Ctrl+Enter runs it), or press **Open editor** for a full-size editor with everything a
+  plan can use beside it, inserted at the cursor: line templates (claim, step, sign-off),
+  connected peers and their folders, squads, the folders' checks and MCP servers, skills,
+  knowledge topics, `after` and other options. The plan is checked as you type. Steps show
+  which steps they wait for, and skipped steps are flagged. **Schedule…** runs the plan
+  on its own at set times ([scheduled plans](#scheduled-plans)). "What is a plan?" stays
+  folded until you open it.
+- **Schedules**: each schedule in plain words, its next run, its last run's result (with
+  a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.
+- **Plugins & tools**: import [plugins](#plugins-skills-and-mcp-servers-packaged-together)
+  (review what one contains first; importing runs nothing), offer, pause, change or remove
+  [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks) in your shared
+  folders (by hand, from an MCP configuration file or from a plugin), and add or remove
+  your own skills.
 - **Squads**: create, view (members, who is online, running tasks) and remove squads.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
@@ -1017,7 +1040,13 @@ p2pagents --name me --providers copilot --serve --ui
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
-  windows, honours reduced motion.
+  windows, honours reduced motion. From 1180 px wide down the page scrolls instead of
+  squeezing the composer. Anything that deletes or withdraws something asks first, in the
+  page, saying what stays.
+
+The UI follows the written [UX design guidelines](docs/ux-guidelines.md) (principles,
+layout, tokens, components, states, forms, microcopy, accessibility and a definition of
+done for UI changes).
 
 Security: the UI listens on `127.0.0.1` only. Each run creates a new random access token,
 passed in the link's `#t=` fragment (never sent in requests or logged; the page moves it to
@@ -1102,12 +1131,15 @@ Always enforced, at every level and for local tasks too:
   instructions found inside it (prompt-injection *spotlighting*). The envelope can't be
   closed or reopened from inside: forged tags are escaped.
 - **Secrets are redacted before results leave the machine.** Results, failing check
-  output, error messages, knowledge topics and incident alerts are scanned for known
-  secret formats before they are sent or saved, and each match is replaced with
-  `[REDACTED:<kind>]`, with a note saying how many. The formats: private keys, GitHub,
-  AWS, Slack, OpenAI, Anthropic, Google and npm tokens, JWTs, connection-string keys,
-  signed URLs, bearer tokens and `password=` values. The worker signs the evidence for the
-  redacted output. This is a safety net; the credential-file rules above still apply.
+  output and check commands, error messages, knowledge topics and incident alerts are
+  scanned for known secret formats before they are sent or saved, and each match is
+  replaced with `[REDACTED:<kind>]`, with a note saying how many. The formats: private keys
+  (also PGP key blocks), GitHub, AWS (access and secret keys), Slack, OpenAI, Anthropic,
+  Google and npm tokens, JWTs, connection-string keys, signed URLs, bearer tokens and
+  password settings (`password=`, `DB_PASSWORD=`, `PGPASSWORD=`...). Check output is
+  redacted before it is cut to its end, so a key printed early can't leak in part. The
+  worker signs the evidence for the redacted output. This is a safety net; the
+  credential-file rules above still apply.
 
 Per provider:
 
@@ -1126,12 +1158,22 @@ on a shared folder, like its checks:
 ```powershell
 # a local server (stdio): only two of its tools, for any peer with access to 'app'
 p2pagents mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot `
-  --profile alice -- npx @playwright/mcp@latest --headless
+  --description "A headless browser for checking pages" --profile alice -- npx @playwright/mcp@latest --headless
 # a remote server (https): all its tools, for peers with full access; the header stays on this machine
 p2pagents mcp add app docs --url https://docs.example.com/mcp --header "Authorization=Bearer <token>" --profile alice
+# the servers of an MCP configuration file (mcp.json, .mcp.json, .vscode/mcp.json); ${workspaceFolder} becomes the folder
+p2pagents mcp import .vscode\mcp.json --share app --server playwright --access read-only --profile alice
 p2pagents mcp list --profile alice     # values of variables and headers are hidden
+p2pagents mcp pause app docs --profile alice    # offered to no task until you resume it
 p2pagents mcp remove app docs --profile alice
 ```
+
+Changes take effect for a running agent's peers within seconds, also when made from the
+command line. In the web UI, **Plugins & tools › MCP servers** does the same: offer a
+server by hand, from a pasted (or loaded) MCP configuration or from a
+[plugin](#plugins-skills-and-mcp-servers-packaged-together), type the values it needs
+(secrets in hidden fields; they are never shown again), and pause, edit or remove offered
+servers. It warns when a server needs more access than its folder ever gives.
 
 A plan step asks for servers by name with `mcp=` (or ticks them under **MCP** when
 running a task in the web UI):
@@ -1142,16 +1184,53 @@ look @alice:app mcp=browser Open http://localhost:3000 and report what the home 
 
 | | |
 | --- | --- |
-| What peers learn | Only the **names** of the servers they may use, per folder (`/peers`, the web UI). Never commands, URLs, environment variables or headers. |
-| Who can use a server | Peers whose access in that folder is at least the server's `--access` (default `full`: a server runs with your rights and may reach the network). |
+| What peers learn | Only the **names** of the servers they may use, per folder, and what their owner says each is for (`--description`). Never commands, URLs, environment variables or headers. |
+| Who can use a server | Peers whose access in that folder is at least the server's `--access` (default `full`: a server runs with your rights and may reach the network). A paused server, or one whose plugin is off, is offered to nobody. |
 | What a task gets | Only the servers it asks for, and only their allowed tools (`--tool`, default all). A name the folder doesn't offer, or doesn't offer at the peer's access, is refused before the model starts. |
-| Copilot | The servers are added to the task's session and their allowed tools to its tool allowlist, under the names `mcp-<server>-<tool>`, so no server can pass for a built-in tool. The permission handler approves only those servers and tools. |
-| Claude | The servers are passed with `strictMcpConfig` (no other MCP configuration is loaded), their tools are pre-approved as `mcp__<server>__<tool>`, and the tool hook refuses any other. |
+| Copilot | The servers are added to the task's session and their allowed tools to its tool allowlist, under the names `mcp-<server>-<tool>`, so no server can pass for a built-in tool. The permission handler approves only those servers and tools. A post-tool hook puts every result in the external-content envelope, and the repository's own hooks never run. |
+| Claude | The servers are passed with `strictMcpConfig` (no other MCP configuration is loaded), their tools are pre-approved as `mcp__<server>__<tool>`, and the tool hook refuses any other. A post-tool hook puts every result in the external-content envelope. Server names can't contain `__`, so no server can pass for another. |
 | Codex | Can't use MCP servers here; such tasks are refused. |
-| Results | MCP tool results are external content: the model is told to treat them as data, never as instructions. |
+| Results | MCP tool results reach the model inside the `<external_content>` envelope, and the task's prompt carries the rule to treat them as data, never as instructions. |
 
 Servers run on your machine with your rights, outside the shell sandbox, so offer only
 servers you trust. Remote URLs must be `https://`, except `http://` on this machine.
+
+### Plugins: skills and MCP servers, packaged together
+
+A **plugin** bundles skills and MCP servers, in the layouts GitHub Copilot CLI
+(`plugin.json`, `.github/plugin/plugin.json`), Claude Code (`.claude-plugin/plugin.json`)
+and Agent Plugins (`plugin.json` with its `$schema`, `skills/`, `mcp.json`) use, or a bare
+folder of `skills/*/SKILL.md` and `.mcp.json`. A marketplace (`marketplace.json`) lists
+several; pick one with `--plugin`.
+
+```powershell
+p2pagents plugin add .\team-tools --profile alice                          # a folder
+p2pagents plugin add octo-org/agent-plugins:plugins/reviewer --profile alice  # GitHub (private ones with the profile's GitHub sign-in)
+p2pagents plugin add octo-org/marketplace --plugin reviewer --profile alice   # from a marketplace
+p2pagents plugin show reviewer --profile alice     # its skills, MCP servers, the values they need, where they're offered
+# offer one of its MCP servers in a shared folder, with the values it needs
+p2pagents mcp add app tickets --plugin reviewer --set TICKETS_TOKEN=<token> --access read-only --profile alice
+p2pagents plugin update reviewer --profile alice   # fetch it again
+p2pagents plugin disable reviewer --profile alice  # enable / remove
+```
+
+- **Importing runs nothing.** The plugin's files are copied into the profile. Agents,
+  commands, hooks and LSP servers are listed as not used and never run.
+- **Skills** become usable in plan steps (`skill=name`, or `skill=plugin.name` when
+  another skill has that name), and peers' steps get their `SKILL.md` text like any skill.
+- **MCP servers** are templates: nothing is offered until you offer one in a folder, with
+  the values it needs (a plugin's `userConfig`, `${input:x}`, `${env:X}` or `${X}`
+  placeholders; values not given with `--set` come from environment variables of the same
+  name). `${PLUGIN_ROOT}` (and the Claude and Copilot spellings) becomes the plugin's
+  folder, `${PLUGIN_DATA}` a folder it may write to, `${workspaceFolder}` the shared folder.
+- **Turning a plugin off** withdraws its skills and the servers it offered; turning it on
+  offers them again. **Updating** keeps each offer's access, tools and values, and pauses
+  servers that would now start differently until you look at them and resume them.
+  **Removing** a plugin removes the servers it offered.
+- In the web UI, **Plugins & tools › Plugins** fetches a plugin for review (what it
+  contains, the values its servers need, what isn't used) before you import it, lists a
+  marketplace's plugins to pick from, and turns plugins on and off, updates and removes
+  them.
 
 ### The shell sandbox (`full`)
 
@@ -1289,7 +1368,9 @@ Workflow for a change:
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
 - [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access, their checks and MCP servers)
-- [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config)
+- [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
+- [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)
+- [src/store.rs](src/store.rs): atomic writes and file locks for the profile's JSON files
 - [src/boundary.rs](src/boundary.rs): the external-content envelope and standing rule against prompt injection
 - [src/redact.rs](src/redact.rs): secret redaction of results, check output, knowledge and alerts
 - [src/schedule.rs](src/schedule.rs): scheduled plans (`--when` parsing, `schedules.json`, the scheduler)
@@ -1310,11 +1391,12 @@ Workflow for a change:
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
-- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events
-- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes
+- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API
+- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog
+- [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
-- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server for the live test
+- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run) for the tests
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 
 ## License

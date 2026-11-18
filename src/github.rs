@@ -136,7 +136,7 @@ fn gh_program() -> PathBuf {
 
 impl GithubCredentials {
     /// git configuration (through the environment) that authenticates to the host.
-    fn git_env(&self) -> Vec<(String, String)> {
+    pub(crate) fn git_env(&self) -> Vec<(String, String)> {
         let basic =
             data_encoding::BASE64.encode(format!("x-access-token:{}", self.token).as_bytes());
         vec![

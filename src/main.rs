@@ -62,6 +62,11 @@ enum Command {
     /// to peers' tasks: you define them, peers only learn their names.
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Plugins: skills and MCP servers packaged together (GitHub Copilot CLI, Claude
+    /// Code or Agent Plugins layouts, or one picked from a marketplace). Importing
+    /// runs nothing: you offer a plugin's MCP servers in a folder when you choose.
+    #[command(subcommand)]
+    Plugin(PluginCommand),
     /// Create digital workers: agents with their own peer identity that run on
     /// their owner's accounts.
     #[command(subcommand)]
@@ -362,6 +367,16 @@ Use it in a plan step with skill=security-review.")]
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Import a skill: a SKILL.md, a folder with one (e.g. from a skills repository)
+    /// or a Markdown file. Its name comes from its front matter, else the file or folder.
+    Import {
+        path: PathBuf,
+        /// Save it under another name.
+        #[arg(long = "as", value_name = "NAME")]
+        rename: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -658,10 +673,13 @@ enum McpCommand {
 examples:
   p2pagents mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot -- npx @playwright/mcp@latest --headless
   p2pagents mcp add app docs --url https://docs.example.com/mcp --header \"Authorization=Bearer <token>\"
+  p2pagents mcp add app tickets --plugin team-tools --set TICKETS_TOKEN=<token> --description \"Our ticket system\"
   plan step:  check @alice:app mcp=browser Open http://localhost:3000 and report what the home page shows
 The server runs on this machine with your rights; commands, variables, headers and
-URLs stay here (peers learn only the names they may use). Tasks call only the tools
-you list (default: all), and tool results are treated as untrusted data.")]
+URLs stay here (peers learn only the names they may use, and descriptions you give).
+Tasks call only the tools you list (default: all), and tool results reach the model
+marked as untrusted content. A plugin server's values not given with --set are
+taken from environment variables of the same name.")]
     Add {
         /// The shared folder whose tasks may use the server.
         share: String,
@@ -679,26 +697,143 @@ you list (default: all), and tool results are treated as untrusted data.")]
         /// An environment variable for a local server: NAME=VALUE (repeatable).
         #[arg(long = "env", value_name = "NAME=VALUE")]
         env: Vec<String>,
+        /// Make the server from an imported plugin (see `plugin show`).
+        #[arg(long, conflicts_with_all = ["url", "command", "env"])]
+        plugin: Option<String>,
+        /// The plugin's server (default: the one called NAME, or its only one).
+        #[arg(long, requires = "plugin")]
+        server: Option<String>,
+        /// A value the plugin's server needs: NAME=VALUE (repeatable).
+        #[arg(long = "set", value_name = "NAME=VALUE", requires = "plugin")]
+        set: Vec<String>,
         /// A tool tasks may call (repeatable; default: all of the server's tools).
         #[arg(long = "tool", value_name = "TOOL")]
         tools: Vec<String>,
         /// The least access a peer's task needs to use the server.
         #[arg(long, value_enum, default_value_t = Access::Full)]
         access: Access,
+        /// What the server is for, in a line (peers see it next to its name).
+        #[arg(long)]
+        description: Option<String>,
         #[command(flatten)]
         profile: ProfileArg,
         /// A local server: its command and arguments, after `--`.
         #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
+    /// Offer the servers of an MCP configuration file (mcp.json, .mcp.json,
+    /// .vscode/mcp.json) in a shared folder.
+    #[command(after_help = "\
+examples:
+  p2pagents mcp import .vscode/mcp.json --share app --server playwright --access read-only
+  p2pagents mcp import mcp.json --share app --set API_KEY=<key>
+${workspaceFolder} becomes the shared folder. Values the servers need (${input:x},
+${env:X}) come from --set, else environment variables of the same name. Disabled
+servers and WebSocket servers are left out.")]
+    Import {
+        file: PathBuf,
+        /// The shared folder whose tasks may use the servers.
+        #[arg(long)]
+        share: String,
+        /// Only this server (repeatable; default: all of them).
+        #[arg(long = "server", value_name = "NAME")]
+        servers: Vec<String>,
+        /// A value the servers need: NAME=VALUE (repeatable).
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// The least access a peer's task needs to use them.
+        #[arg(long, value_enum, default_value_t = Access::Full)]
+        access: Access,
+        /// Replace servers the folder offers under the same names.
+        #[arg(long)]
+        replace: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// List the MCP servers a profile's shared folders offer (secrets hidden).
     List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Stop offering an MCP server for now; it keeps its settings.
+    Pause {
+        share: String,
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Offer a paused MCP server again.
+    Resume {
+        share: String,
+        name: String,
         #[command(flatten)]
         profile: ProfileArg,
     },
     /// Stop offering an MCP server.
     Remove {
         share: String,
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Import a plugin from a folder, a GitHub repository or a git URL. Nothing in it
+    /// runs: its skills become usable in plan steps, its MCP servers become templates
+    /// you can offer in a folder (mcp add --plugin).
+    #[command(after_help = "\
+examples:
+  p2pagents plugin add ./team-tools
+  p2pagents plugin add octo-org/agent-plugins:plugins/reviewer
+  p2pagents plugin add octo-org/marketplace --plugin reviewer
+  p2pagents plugin add https://git.example.com/tools.git#plugins/qa --as qa-tools
+Private GitHub repositories use the profile's GitHub sign-in (p2pagents github login).")]
+    Add {
+        /// A folder, owner/repo[:path], host/owner/repo[:path] or a git URL (#path for a folder in it).
+        source: String,
+        /// The plugin to import, when the source is a marketplace.
+        #[arg(long)]
+        plugin: Option<String>,
+        /// Import it under another name.
+        #[arg(long = "as", value_name = "NAME")]
+        rename: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// List imported plugins.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Show what a plugin contains and where its MCP servers are offered.
+    Show {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Fetch a plugin again from where it came from. MCP servers that now start
+    /// differently are paused until you review and resume them.
+    Update {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Turn a plugin on: its skills and offered MCP servers apply again.
+    Enable {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Turn a plugin off: its skills and MCP servers stop applying (settings kept).
+    Disable {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Remove a plugin, its files and the MCP servers it offered.
+    Remove {
         name: String,
         #[command(flatten)]
         profile: ProfileArg,
@@ -904,6 +1039,7 @@ async fn main() -> Result<()> {
         Some(Command::Peers(command)) => run_peers(command),
         Some(Command::Share(command)) => run_share(command),
         Some(Command::Mcp(command)) => run_mcp(command),
+        Some(Command::Plugin(command)) => run_plugin(command).await,
         Some(Command::Worker(command)) => run_worker(command),
         Some(Command::Squad(command)) => run_squad(command),
         Some(Command::Runs(command)) => run_runs(command),
@@ -1095,7 +1231,7 @@ fn share_extras(share: &p2pagents::shares::Share) -> String {
 /// Runs the profile's scheduled plans in the background while the agent runs (the
 /// web UI runs its own, so their steps show up there).
 fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
-    use p2pagents::schedule::{Launch, Schedule, ScheduleStore, Scheduler};
+    use p2pagents::schedule::{Launch, Outcome, Schedule, ScheduleStore, Scheduler};
     let store = ScheduleStore::load(&profile.schedules_path())?;
     if !store.schedules.is_empty() {
         println!(
@@ -1115,21 +1251,22 @@ fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
     }
     let (agent, owner) = (agent.clone(), profile.clone());
     let launch: Launch = Arc::new(move |s: Schedule| {
-        let (agent, profile) = (agent.clone(), owner.clone());
-        Box::pin(async move {
+        let ready = p2pagents::plan::start(&agent, &owner, &s.plan)?;
+        let agent = agent.clone();
+        Ok(Box::pin(async move {
             println!("=== scheduled plan '{}' started ({}) ===", s.name, s.when);
-            let run = p2pagents::plan::execute(&agent, &profile, &s.plan, print_step).await;
-            match &run {
-                Ok(run) => println!(
-                    "=== scheduled plan '{}' finished: {} (runs show {}) ===",
-                    s.name,
-                    run.verdict_line(),
-                    run.id
-                ),
-                Err(e) => eprintln!("scheduled plan '{}' did not run: {e:#}", s.name),
+            let run = ready.run(&agent, print_step).await;
+            println!(
+                "=== scheduled plan '{}' finished: {} (runs show {}) ===",
+                s.name,
+                run.verdict_line(),
+                run.id
+            );
+            Outcome {
+                verdict: run.verdict_line(),
+                run_id: Some(run.id),
             }
-            Ok(run?.verdict_line())
-        })
+        }))
     });
     let tick = std::env::var("P2PAGENTS_SCHEDULE_TICK_SECS")
         .ok()
@@ -1616,6 +1753,28 @@ fn run_skill(command: SkillCommand) -> Result<()> {
                 bail!("profile has no skill '{name}' of its own");
             }
         }
+        SkillCommand::Import {
+            path,
+            rename,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let (found, text) = p2pagents::skills::read_skill_file(&path)?;
+            let name = rename.unwrap_or(found);
+            let skills = profile.skills();
+            let replaces = skills.list().into_iter().find(|s| s.name == name);
+            skills.add(&name, &text)?;
+            println!(
+                "profile '{}': imported skill {name}{}. Use it with skill={name} in a plan step.",
+                profile.name,
+                match replaces.map(|s| s.source) {
+                    Some("built-in") => " (replaces the built-in one)",
+                    Some("profile") => " (replaces the profile's own)",
+                    Some(_) => " (used instead of the plugin's)",
+                    None => "",
+                }
+            );
+        }
     }
     Ok(())
 }
@@ -1710,11 +1869,11 @@ fn run_schedule(command: ScheduleCommand) -> Result<()> {
                 _ => bail!("give the plan to run: --plan FILE or --playbook NAME (with --set)"),
             };
             let schedule = Schedule::new(&name, &at, &text, &source)?;
-            let path = profile.schedules_path();
-            let mut store = ScheduleStore::load(&path)?;
             let next = when(&schedule);
-            store.add(schedule);
-            store.save(&path)?;
+            ScheduleStore::update(&profile.schedules_path(), |store| {
+                store.add(schedule);
+                Ok(())
+            })?;
             println!(
                 "profile '{}': scheduled '{name}' ({at}; next run {next}). It runs while this profile's agent runs; each run is an evidence run.",
                 profile.name
@@ -1738,12 +1897,12 @@ fn run_schedule(command: ScheduleCommand) -> Result<()> {
         }
         ScheduleCommand::Remove { name, profile } => {
             let profile = Profile::open(&profile.name)?;
-            let path = profile.schedules_path();
-            let mut store = ScheduleStore::load(&path)?;
-            if !store.remove(&name) {
-                bail!("profile '{}' has no schedule named '{name}'", profile.name);
-            }
-            store.save(&path)?;
+            ScheduleStore::update(&profile.schedules_path(), |store| {
+                if !store.remove(&name) {
+                    bail!("profile '{}' has no schedule named '{name}'", profile.name);
+                }
+                Ok(())
+            })?;
             println!("profile '{}': removed schedule '{name}'", profile.name);
         }
         ScheduleCommand::Pause { name, profile } => set_enabled(&name, &profile.name, false)?,
@@ -1755,21 +1914,21 @@ fn run_schedule(command: ScheduleCommand) -> Result<()> {
 fn set_enabled(name: &str, profile: &str, enabled: bool) -> Result<()> {
     use p2pagents::schedule::ScheduleStore;
     let profile = Profile::open(profile)?;
-    let path = profile.schedules_path();
-    let mut store = ScheduleStore::load(&path)?;
-    let schedule = store
-        .get_mut(name)
-        .with_context(|| format!("profile '{}' has no schedule named '{name}'", profile.name))?;
-    schedule.enabled = enabled;
-    if enabled {
-        // Resuming starts the clock again instead of catching up on paused runs.
-        schedule.last_run_unix = Some(chrono::Local::now().timestamp());
-    }
-    store.save(&path)?;
+    ScheduleStore::update(&profile.schedules_path(), |store| {
+        store
+            .get_mut(name)
+            .with_context(|| format!("profile '{}' has no schedule named '{name}'", profile.name))?
+            .set_enabled(enabled);
+        Ok(())
+    })?;
     println!(
         "profile '{}': schedule '{name}' {}",
         profile.name,
-        if enabled { "resumed" } else { "paused" }
+        if enabled {
+            "resumed (its time counts from now)"
+        } else {
+            "paused"
+        }
     );
     Ok(())
 }
@@ -2011,7 +2170,15 @@ fn run_share(command: ShareCommand) -> Result<()> {
 }
 
 fn run_mcp(command: McpCommand) -> Result<()> {
-    use p2pagents::mcp::{McpServer, parse_pairs};
+    use p2pagents::mcp::{Fill, McpServer, McpTemplate, parse_config, parse_pairs, server_name};
+    use p2pagents::shares::McpOffer;
+    let tools_text = |tools: &[String]| {
+        if tools.is_empty() {
+            "all".to_owned()
+        } else {
+            tools.join(", ")
+        }
+    };
     match command {
         McpCommand::Add {
             share,
@@ -2020,72 +2187,437 @@ fn run_mcp(command: McpCommand) -> Result<()> {
             headers,
             sse,
             env,
+            plugin,
+            server,
+            set,
             tools,
             access,
+            description,
             profile,
             command,
         } => {
             let profile = Profile::open(&profile.name)?;
-            let mut shares = profile.shares()?;
-            let mut server = match (url, command.split_first()) {
-                (Some(url), None) => McpServer::remote(url, sse),
-                (None, Some((cmd, args))) => McpServer::local(cmd.clone(), args.to_vec()),
-                (Some(_), Some(_)) => bail!("give either --url or a command after --, not both"),
-                (None, None) => {
-                    bail!("give the server's command after -- (local) or its --url (remote)")
-                }
+            let offer = McpOffer {
+                share: share.clone(),
+                name: name.clone(),
+                access,
+                tools,
+                description: description.unwrap_or_default(),
+                replace: true,
             };
-            server.env = parse_pairs(&env, "variable")?;
-            server.headers = parse_pairs(&headers, "header")?;
-            server.tools = tools;
-            server.access = access;
-            shares.add_mcp(&share, &name, server.clone())?;
-            shares.save(&profile.shares_path())?;
+            let (server, _) = if let Some(plugin) = plugin {
+                let store = profile.plugins();
+                let p = store.get(&plugin)?;
+                let template = p.pick_server(server.as_deref(), &name)?;
+                let mut values = parse_pairs(&set, "value")?;
+                values_from_env(&p.mcp[&template], &mut values);
+                profile.update_shares(|shares| {
+                    shares.offer_mcp(&offer, |folder| {
+                        store.instantiate(&plugin, &template, folder, &values)
+                    })
+                })?
+            } else {
+                let mut server = match (url, command.split_first()) {
+                    (Some(url), None) => McpServer::remote(url, sse),
+                    (None, Some((cmd, args))) => McpServer::local(cmd.clone(), args.to_vec()),
+                    (Some(_), Some(_)) => {
+                        bail!("give either --url or a command after --, not both")
+                    }
+                    (None, None) => bail!(
+                        "give the server's command after -- (local), its --url (remote) or --plugin"
+                    ),
+                };
+                server.env = parse_pairs(&env, "variable")?;
+                server.headers = parse_pairs(&headers, "header")?;
+                profile.update_shares(|shares| shares.offer_mcp(&offer, |_| Ok(server)))?
+            };
             println!(
                 "profile '{}': tasks in '{share}' with at least {access} access may use MCP server '{name}' ({}); tools: {}. Peers ask for it with mcp={name} in a plan step.",
                 profile.name,
                 server.describe(),
-                if server.tools.is_empty() {
-                    "all".to_owned()
-                } else {
-                    server.tools.join(", ")
-                }
+                tools_text(&server.tools)
             );
+        }
+        McpCommand::Import {
+            file,
+            share,
+            servers,
+            set,
+            access,
+            replace,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let text = read_input(&file)?;
+            let config: serde_json::Value =
+                serde_json::from_str(text.trim_start_matches('\u{feff}'))
+                    .with_context(|| format!("{} isn't valid JSON", file.display()))?;
+            let (mut found, notes) = parse_config(&config, &Default::default())?;
+            for note in &notes {
+                println!("  note: {note}");
+            }
+            let chosen: Vec<(String, McpTemplate)> = if servers.is_empty() {
+                found.into_iter().collect()
+            } else {
+                let all = found.keys().cloned().collect::<Vec<_>>().join(", ");
+                servers
+                    .iter()
+                    .map(|s| {
+                        found.remove(s).map(|t| (s.clone(), t)).with_context(|| {
+                            format!("{} has no server '{s}' (it has: {all})", file.display())
+                        })
+                    })
+                    .collect::<Result<_>>()?
+            };
+            if chosen.is_empty() {
+                bail!("{} has no servers to offer", file.display());
+            }
+            let mut values = parse_pairs(&set, "value")?;
+            for (_, template) in &chosen {
+                values_from_env(template, &mut values);
+            }
+            let (offered, _) = profile.update_shares(|shares| {
+                let mut offered = Vec::new();
+                for (original, template) in &chosen {
+                    let offer = McpOffer {
+                        share: share.clone(),
+                        name: server_name(original),
+                        access,
+                        tools: Vec::new(),
+                        description: String::new(),
+                        replace,
+                    };
+                    let server = shares
+                        .offer_mcp(&offer, |folder| {
+                            template.instantiate(&Fill {
+                                plugin_root: None,
+                                data_dir: None,
+                                folder,
+                                values: &values,
+                            })
+                        })
+                        .with_context(|| format!("server '{original}'"))?;
+                    offered.push((offer.name, server));
+                }
+                Ok(offered)
+            })?;
+            for (name, server) in offered {
+                println!(
+                    "profile '{}': '{share}' offers MCP server '{name}' ({}) to tasks with at least {access} access; tools: {}",
+                    profile.name,
+                    server.describe(),
+                    tools_text(&server.tools)
+                );
+            }
         }
         McpCommand::List { profile } => {
             let profile = Profile::open(&profile.name)?;
             for share in profile.shares()?.shares {
                 for (name, server) in &share.mcp {
+                    let state = match (server.paused, server.plugin_off) {
+                        (_, true) => "  [plugin off]",
+                        (true, _) => "  [paused]",
+                        _ => "",
+                    };
                     println!(
-                        "  {:<20} {}+ access, tools: {}  {}",
+                        "  {:<20} {}+ access, tools: {}  {}{}{state}",
                         format!("{}/{name}", share.name),
                         server.access,
-                        if server.tools.is_empty() {
-                            "all".to_owned()
-                        } else {
-                            server.tools.join(",")
-                        },
-                        server.describe()
+                        tools_text(&server.tools).replace(", ", ","),
+                        server.describe(),
+                        server
+                            .from
+                            .as_ref()
+                            .map(|f| format!("  (plugin {}: {})", f.plugin, f.server))
+                            .unwrap_or_default(),
                     );
+                    if !server.description.is_empty() {
+                        println!("  {:<20} {}", "", server.description);
+                    }
                 }
             }
         }
+        McpCommand::Pause {
+            share,
+            name,
+            profile,
+        } => set_mcp_paused(&share, &name, &profile.name, true)?,
+        McpCommand::Resume {
+            share,
+            name,
+            profile,
+        } => set_mcp_paused(&share, &name, &profile.name, false)?,
         McpCommand::Remove {
             share,
             name,
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
-            let mut shares = profile.shares()?;
-            if !shares.remove_mcp(&share, &name)? {
-                bail!("folder '{share}' offers no MCP server named '{name}'");
-            }
-            shares.save(&profile.shares_path())?;
+            profile.update_shares(|shares| {
+                if !shares.remove_mcp(&share, &name)? {
+                    bail!("folder '{share}' offers no MCP server named '{name}'");
+                }
+                Ok(())
+            })?;
             println!(
-                "profile '{}': '{share}' no longer offers MCP server '{name}'",
+                "profile '{}': '{share}' no longer offers MCP server '{name}' (a running agent stops offering it within seconds)",
                 profile.name
             );
         }
+    }
+    Ok(())
+}
+
+/// Fills values a server template needs, not given with --set, from environment
+/// variables of the same name.
+fn values_from_env(
+    template: &p2pagents::mcp::McpTemplate,
+    values: &mut std::collections::BTreeMap<String, String>,
+) {
+    for input in &template.inputs {
+        if !values.contains_key(&input.name)
+            && let Ok(value) = std::env::var(&input.name)
+            && !value.is_empty()
+        {
+            println!("  using {} from the environment", input.name);
+            values.insert(input.name.clone(), value);
+        }
+    }
+}
+
+fn set_mcp_paused(share: &str, name: &str, profile: &str, paused: bool) -> Result<()> {
+    let profile = Profile::open(profile)?;
+    profile.update_shares(|shares| {
+        shares.edit_mcp(share, name, |server| {
+            server.paused = paused;
+            Ok(())
+        })
+    })?;
+    println!(
+        "profile '{}': MCP server '{name}' in '{share}' is {}",
+        profile.name,
+        if paused {
+            "paused (offered to no task)"
+        } else {
+            "offered again"
+        }
+    );
+    Ok(())
+}
+
+async fn run_plugin(command: PluginCommand) -> Result<()> {
+    use p2pagents::plugins::{Inspection, Source, fetch, inspect};
+    let print_changes = |lines: &[String]| {
+        for line in lines {
+            println!("  {line}");
+        }
+    };
+    match command {
+        PluginCommand::Add {
+            source,
+            plugin,
+            rename,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let store = profile.plugins();
+            let creds = profile.github().ok();
+            let fetched = fetch(&Source::parse(&source)?, &store.staging(), creds.as_ref()).await?;
+            let entry = match inspect(&fetched.root)? {
+                Inspection::Plugin(_) if plugin.is_some() => {
+                    bail!("{source} is a plugin, not a marketplace: leave out --plugin")
+                }
+                Inspection::Plugin(_) => None,
+                Inspection::Marketplace { name, plugins } => {
+                    let Some(pick) = plugin else {
+                        println!("{source} is the marketplace '{name}'. Its plugins:");
+                        for e in &plugins {
+                            println!("  {:<24} {}", e.name, e.description);
+                        }
+                        bail!("pick one: p2pagents plugin add {source} --plugin NAME");
+                    };
+                    let entry = plugins
+                        .iter()
+                        .find(|e| e.name == pick)
+                        .with_context(|| format!("marketplace '{name}' has no plugin '{pick}'"))?;
+                    Some(
+                        fetched
+                            .entry(entry, &store.staging(), creds.as_ref())
+                            .await?,
+                    )
+                }
+            };
+            let installed = store.install(entry.as_ref().unwrap_or(&fetched), rename.as_deref())?;
+            print_plugin(&installed, &profile)?;
+            println!(
+                "\nprofile '{}': imported plugin '{}'. Nothing in it ran.",
+                profile.name, installed.name
+            );
+            if let Some((server, _)) = installed.mcp.iter().next() {
+                println!(
+                    "Offer its MCP servers in a shared folder: p2pagents mcp add <folder> {server} --plugin {} [--set NAME=VALUE]",
+                    installed.name
+                );
+            }
+        }
+        PluginCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let plugins = profile.plugins().list()?;
+            if plugins.is_empty() {
+                println!(
+                    "profile '{}' has no plugins: p2pagents plugin add <source>",
+                    profile.name
+                );
+            }
+            for p in plugins {
+                println!(
+                    "  {:<20} {:<10} {:<4} {} skills, {} MCP servers  {}",
+                    p.name,
+                    if p.version.is_empty() {
+                        "-"
+                    } else {
+                        &p.version
+                    },
+                    if p.enabled { "on" } else { "off" },
+                    p.skills.len(),
+                    p.mcp.len(),
+                    p.source
+                );
+            }
+        }
+        PluginCommand::Show { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            print_plugin(&profile.plugins().get(&name)?, &profile)?;
+        }
+        PluginCommand::Update { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let store = profile.plugins();
+            let old = store.get(&name)?;
+            let creds = profile.github().ok();
+            let fetched = fetch(
+                &Source::parse(&old.source)?,
+                &store.staging(),
+                creds.as_ref(),
+            )
+            .await?;
+            let ((plugin, changes), _) =
+                profile.update_shares(|shares| store.update(&name, &fetched, shares))?;
+            println!(
+                "profile '{}': updated plugin '{}':",
+                profile.name, plugin.name
+            );
+            print_changes(&changes.lines);
+        }
+        PluginCommand::Enable { name, profile } => set_plugin_enabled(&name, &profile.name, true)?,
+        PluginCommand::Disable { name, profile } => {
+            set_plugin_enabled(&name, &profile.name, false)?
+        }
+        PluginCommand::Remove { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let store = profile.plugins();
+            let (changes, _) = profile.update_shares(|shares| store.remove(&name, shares))?;
+            println!("profile '{}': removed plugin '{name}'", profile.name);
+            print_changes(&changes.lines);
+        }
+    }
+    Ok(())
+}
+
+fn set_plugin_enabled(name: &str, profile: &str, enabled: bool) -> Result<()> {
+    let profile = Profile::open(profile)?;
+    let store = profile.plugins();
+    let (changes, _) = profile.update_shares(|shares| store.set_enabled(name, enabled, shares))?;
+    println!(
+        "profile '{}': plugin '{name}' is {}",
+        profile.name,
+        if enabled {
+            "on"
+        } else {
+            "off: its skills and MCP servers no longer apply"
+        }
+    );
+    for line in changes.lines {
+        println!("  {line}");
+    }
+    Ok(())
+}
+
+/// Prints what plugin `p` contains and where its MCP servers are offered.
+fn print_plugin(p: &p2pagents::plugins::Plugin, profile: &Profile) -> Result<()> {
+    println!(
+        "{} {}({}, {})",
+        p.name,
+        if p.version.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", p.version)
+        },
+        p.format,
+        if p.enabled { "on" } else { "off" }
+    );
+    if !p.description.is_empty() {
+        println!("  {}", p.description);
+    }
+    println!(
+        "  from {}{}",
+        p.source,
+        p.commit
+            .as_deref()
+            .map(|c| format!(" at {}", &c[..c.len().min(12)]))
+            .unwrap_or_default()
+    );
+    if !p.skills.is_empty() {
+        println!("  skills (use with skill=NAME in a plan step):");
+        for s in &p.skills {
+            println!("    {:<24} {}", s.name, s.description);
+        }
+    }
+    if !p.mcp.is_empty() {
+        let shares = profile.shares()?;
+        println!(
+            "  MCP servers (offer one with: mcp add <folder> <name> --plugin {}):",
+            p.name
+        );
+        for (name, t) in &p.mcp {
+            println!("    {:<24} {}", name, t.describe());
+            if !t.inputs.is_empty() {
+                let needs: Vec<String> = t
+                    .inputs
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "{}{}{}",
+                            i.name,
+                            if i.secret { " (secret)" } else { "" },
+                            i.default
+                                .as_deref()
+                                .map(|d| format!(" [default {d}]"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                println!("    {:<24} needs: {}", "", needs.join(", "));
+            }
+            for share in &shares.shares {
+                for (offered, def) in &share.mcp {
+                    if def
+                        .from
+                        .as_ref()
+                        .is_some_and(|f| f.plugin == p.name && &f.server == name)
+                    {
+                        println!(
+                            "    {:<24} offered in '{}' as {offered}{}",
+                            "",
+                            share.name,
+                            if def.paused { " (paused)" } else { "" }
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for note in &p.notes {
+        println!("  note: {note}");
     }
     Ok(())
 }
@@ -2325,6 +2857,11 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         }
         Agent::bind(config).await?
     };
+    agent.watch_shares(
+        profile.shares_path(),
+        profile.data_folder(),
+        Duration::from_secs(2),
+    );
     println!(
         "{} [profile '{}'] endpoint id {}",
         agent.name(),

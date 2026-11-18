@@ -893,6 +893,58 @@ async fn peers_use_only_the_mcp_servers_a_folder_offers_them() {
         let err = boss.delegate(worker.id(), task).await.unwrap_err();
         assert!(err.to_string().contains(why), "{err}");
     }
+
+    // Its owner pauses it and describes it: peers see that at once, and the worker
+    // refuses tasks that ask for a paused server.
+    let mut shares = worker.shares();
+    shares
+        .edit_mcp("app", "browser", |s| {
+            s.paused = true;
+            s.description = "A headless browser".into();
+            Ok(())
+        })
+        .unwrap();
+    worker.set_shares(shares.clone());
+    wait_until(|| boss.peers()[0].shares[0].mcp.is_empty()).await;
+    let err = boss
+        .delegate(worker.id(), using(Provider::Copilot, &["browser"]))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("is paused by its owner"), "{err}");
+
+    // Changes to the shares file (e.g. `p2pagents mcp resume` while the agent runs)
+    // reach the running agent and its peers.
+    let file = dir.path().join("shares.json");
+    shares.save(&file).unwrap();
+    worker.watch_shares(
+        file.clone(),
+        dir.path().join("data"),
+        Duration::from_millis(50),
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    shares
+        .edit_mcp("app", "browser", |s| {
+            s.paused = false;
+            Ok(())
+        })
+        .unwrap();
+    shares.save(&file).unwrap();
+    wait_until(|| boss.peers()[0].shares[0].mcp == ["browser"]).await;
+    assert_eq!(
+        boss.peers()[0].shares[0].mcp_about["browser"],
+        "A headless browser"
+    );
+}
+
+/// Waits up to 10 s for `done`.
+async fn wait_until(done: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("in time");
 }
 
 #[tokio::test]

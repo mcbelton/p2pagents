@@ -10,8 +10,9 @@
 //! - `mon,wed,fri 17:00`.
 //!
 //! A schedule never overlaps itself: a run that is due while the previous one is
-//! still going is skipped. Runs missed while the agent was off run once when it
-//! starts again.
+//! still going is skipped. A due run that can't start (e.g. its peer is offline) is
+//! tried again every two minutes for an hour, then recorded as missed; runs missed
+//! while the agent was off run once when it starts again, within that hour.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -145,6 +146,11 @@ fn yes() -> bool {
     true
 }
 
+/// How long after a failed start (e.g. a peer still reconnecting) a due run is tried again.
+pub const RETRY_SECS: i64 = 120;
+/// How long a due run that can't start is retried before it is counted as missed.
+pub const GRACE_SECS: i64 = 3600;
+
 /// A plan the agent runs on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
@@ -159,11 +165,21 @@ pub struct Schedule {
     #[serde(default = "yes")]
     pub enabled: bool,
     pub created_unix: i64,
+    /// When its time counts from, if later than its last run: when it was resumed,
+    /// changed, or a run was missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_unix: Option<i64>,
     /// The last run's verdict, or why it didn't run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<String>,
+    /// The last run's evidence run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_id: Option<String>,
+    /// A due run couldn't start: try again at this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_unix: Option<i64>,
 }
 
 impl Schedule {
@@ -179,9 +195,19 @@ impl Schedule {
             source: source.to_owned(),
             enabled: true,
             created_unix: Local::now().timestamp(),
+            anchor_unix: None,
             last_run_unix: None,
             last_result: None,
+            last_run_id: None,
+            retry_unix: None,
         })
+    }
+
+    /// The time its next run counts from.
+    fn since(&self) -> i64 {
+        self.created_unix
+            .max(self.last_run_unix.unwrap_or(i64::MIN))
+            .max(self.anchor_unix.unwrap_or(i64::MIN))
     }
 
     /// When it runs next (`None` when disabled or `when` is invalid).
@@ -189,14 +215,97 @@ impl Schedule {
         if !self.enabled {
             return None;
         }
-        let since = self.last_run_unix.unwrap_or(self.created_unix);
-        let since = Local.timestamp_opt(since, 0).single()?;
+        let since = Local.timestamp_opt(self.since(), 0).single()?;
         Some(When::parse(&self.when).ok()?.next_after(&since))
+    }
+
+    /// Its next `n` run times.
+    pub fn next_runs(&self, n: usize) -> Vec<DateTime<Local>> {
+        let (Some(mut at), Ok(when)) = (self.next_run(), When::parse(&self.when)) else {
+            return Vec::new();
+        };
+        let mut runs = vec![at];
+        while runs.len() < n {
+            at = when.next_after(&at);
+            runs.push(at);
+        }
+        runs
     }
 
     pub fn due(&self, now: &DateTime<Local>) -> bool {
         self.next_run().is_some_and(|next| next <= *now)
+            && self.retry_unix.is_none_or(|retry| retry <= now.timestamp())
     }
+
+    /// Sets when it runs, counting from now.
+    pub fn set_when(&mut self, when: &str) -> Result<()> {
+        When::parse(when)?;
+        self.when = when.trim().to_owned();
+        self.anchor_unix = Some(Local::now().timestamp());
+        self.retry_unix = None;
+        Ok(())
+    }
+
+    /// Sets the plan it runs; fails unless the plan is valid.
+    pub fn set_plan(&mut self, plan: &str) -> Result<()> {
+        crate::plan::Plan::parse(plan).context("the scheduled plan is invalid")?;
+        self.plan = plan.to_owned();
+        Ok(())
+    }
+
+    /// Pauses it, or resumes it counting from now (a paused time is not caught up).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled && !self.enabled {
+            self.anchor_unix = Some(Local::now().timestamp());
+        }
+        self.enabled = enabled;
+        self.retry_unix = None;
+    }
+
+    /// The last run's state: `running`, `passed`, `failed`, `no-claims`,
+    /// `not-run` (it couldn't start), `missed` or `cancelled`.
+    pub fn last_status(&self) -> Option<&'static str> {
+        let r = self.last_result.as_deref()?;
+        Some(if r == "running" {
+            "running"
+        } else if r.starts_with("PASS") {
+            "passed"
+        } else if r.starts_with("FAIL") {
+            "failed"
+        } else if r.starts_with("NO CLAIMS") {
+            "no-claims"
+        } else if r.starts_with("missed") {
+            "missed"
+        } else if r.starts_with("cancelled") {
+            "cancelled"
+        } else {
+            "not-run"
+        })
+    }
+}
+
+/// When a schedule runs, for display: `{"every_minutes": 30}` or
+/// `{"days": ["mon", ...], "time": "09:00"}` (no days: every day).
+pub fn when_parts(when: &str) -> Option<serde_json::Value> {
+    Some(match When::parse(when).ok()? {
+        When::Every(minutes) => serde_json::json!({ "every_minutes": minutes }),
+        When::At { days, time } => serde_json::json!({
+            "days": days.iter().map(|d| d.to_string().to_ascii_lowercase()).collect::<Vec<_>>(),
+            "time": time.format("%H:%M").to_string(),
+        }),
+    })
+}
+
+/// The first `n` times a new schedule running `when` would run after `from`.
+pub fn upcoming(when: &str, from: &DateTime<Local>, n: usize) -> Result<Vec<DateTime<Local>>> {
+    let when = When::parse(when)?;
+    let mut at = *from;
+    Ok((0..n)
+        .map(|_| {
+            at = when.next_after(&at);
+            at
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,11 +325,20 @@ impl ScheduleStore {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+        crate::store::write_atomic(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Loads the store at `path`, changes it with `change` and saves it, holding its
+    /// lock, so changes from the agent, the web UI and the CLI never overwrite each other.
+    pub fn update<T>(
+        path: &Path,
+        change: impl FnOnce(&mut ScheduleStore) -> Result<T>,
+    ) -> Result<T> {
+        let _lock = crate::store::FileLock::acquire(path)?;
+        let mut store = Self::load(path)?;
+        let out = change(&mut store)?;
+        store.save(path)?;
+        Ok(out)
     }
 
     /// Adds `schedule`, replacing one of the same name.
@@ -244,9 +362,29 @@ impl ScheduleStore {
     }
 }
 
-/// Runs one schedule's plan; returns the run's verdict line.
+/// How a run ended: its verdict line and its evidence run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub verdict: String,
+    pub run_id: Option<String>,
+}
+
+/// Starts one schedule's plan: checks it (peers, folders, checks...) and returns
+/// the run to await, or why it can't start now.
 pub type Launch =
-    Arc<dyn Fn(Schedule) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
+    Arc<dyn Fn(Schedule) -> Result<Pin<Box<dyn Future<Output = Outcome> + Send>>> + Send + Sync>;
+
+/// Removes a schedule from the running set however its run ends (even a panic).
+struct Running {
+    set: Arc<Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.name);
+    }
+}
 
 /// Starts schedules when they are due (or on request), one run per schedule at a
 /// time, and records each run's start and verdict in the store.
@@ -255,8 +393,10 @@ pub struct Scheduler {
     path: PathBuf,
     launch: Launch,
     running: Arc<Mutex<HashSet<String>>>,
-    /// Serializes this agent's updates to the store.
-    write: Arc<Mutex<()>>,
+    changed: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs that fell due before this were missed while the agent was off: their
+    /// grace period counts from here, so peers have time to reconnect.
+    started_unix: i64,
 }
 
 impl Scheduler {
@@ -265,8 +405,15 @@ impl Scheduler {
             path,
             launch,
             running: Arc::default(),
-            write: Arc::default(),
+            changed: None,
+            started_unix: Local::now().timestamp(),
         }
+    }
+
+    /// Calls `changed` whenever the scheduler records a start, a verdict, a retry or a miss.
+    pub fn on_change(mut self, changed: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.changed = Some(changed);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -277,12 +424,13 @@ impl Scheduler {
         self.running.lock().unwrap().contains(name)
     }
 
-    /// Checks for due schedules every `tick`. The store is read each time, so
-    /// schedules added or changed while the agent runs are picked up.
+    /// Checks for due schedules every `tick`, the first time after one `tick` (so
+    /// peers have reconnected). The store is read each time, so schedules added or
+    /// changed while the agent runs are picked up.
     pub fn spawn(&self, tick: Duration) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
-            let mut ticks = tokio::time::interval(tick);
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
             loop {
                 ticks.tick().await;
                 this.run_due(&Local::now());
@@ -290,67 +438,108 @@ impl Scheduler {
         })
     }
 
-    /// Starts every enabled schedule due at `now` that isn't running; returns their names.
+    /// Starts every enabled schedule due at `now` that isn't running; returns the
+    /// names of those that started. A due run that can't start (e.g. its peer is
+    /// offline) is tried again every [`RETRY_SECS`] for [`GRACE_SECS`], then
+    /// counted as missed.
     pub fn run_due(&self, now: &DateTime<Local>) -> Vec<String> {
         let Ok(store) = ScheduleStore::load(&self.path) else {
             return Vec::new();
         };
-        store
-            .schedules
-            .into_iter()
-            .filter(|s| s.due(now))
-            .filter_map(|s| {
-                let name = s.name.clone();
-                self.start(s, now).then_some(name)
-            })
-            .collect()
+        let mut started = Vec::new();
+        for s in store.schedules.into_iter().filter(|s| s.due(now)) {
+            if self.is_running(&s.name) {
+                continue;
+            }
+            let name = s.name.clone();
+            let due_unix = s
+                .next_run()
+                .map_or(now.timestamp(), |t| t.timestamp())
+                .max(self.started_unix);
+            match self.start(s, now) {
+                Ok(()) => started.push(name),
+                Err(e) => {
+                    let late = now.timestamp() - due_unix > GRACE_SECS;
+                    let at = now.timestamp();
+                    self.record(&name, |s| {
+                        if late {
+                            s.last_result = Some(format!("missed: {e:#}"));
+                            s.anchor_unix = Some(at);
+                            s.retry_unix = None;
+                        } else {
+                            s.last_result = Some(format!("not run yet (trying again): {e:#}"));
+                            s.retry_unix = Some(at + RETRY_SECS);
+                        }
+                    });
+                }
+            }
+        }
+        started
     }
 
-    /// Runs schedule `name` now (enabled or not), unless it is running.
+    /// Runs schedule `name` now (enabled or not); fails if it is running or can't start.
     pub fn trigger(&self, name: &str) -> Result<()> {
         let store = ScheduleStore::load(&self.path)?;
         let schedule = store
             .get(name)
             .cloned()
             .with_context(|| format!("no schedule named '{name}'"))?;
-        if !self.start(schedule, &Local::now()) {
+        if self.is_running(name) {
             bail!("schedule '{name}' is already running");
         }
-        Ok(())
+        self.start(schedule, &Local::now())
     }
 
-    fn start(&self, schedule: Schedule, now: &DateTime<Local>) -> bool {
-        if !self.running.lock().unwrap().insert(schedule.name.clone()) {
-            return false;
-        }
+    fn start(&self, schedule: Schedule, now: &DateTime<Local>) -> Result<()> {
         let name = schedule.name.clone();
-        let started = now.timestamp();
+        if !self.running.lock().unwrap().insert(name.clone()) {
+            bail!("schedule '{name}' is already running");
+        }
+        let guard = Running {
+            set: self.running.clone(),
+            name: name.clone(),
+        };
+        let run = (self.launch)(schedule)?;
+        let at = now.timestamp();
         self.record(&name, |s| {
-            s.last_run_unix = Some(started);
+            s.last_run_unix = Some(at);
             s.last_result = Some("running".into());
+            s.last_run_id = None;
+            s.retry_unix = None;
         });
         let this = self.clone();
         tokio::spawn(async move {
-            let result = match (this.launch)(schedule).await {
-                Ok(verdict) => verdict,
-                Err(e) => format!("not run: {e:#}"),
-            };
-            this.record(&name, |s| s.last_result = Some(result));
-            this.running.lock().unwrap().remove(&name);
+            let _guard = guard;
+            use futures_util::FutureExt;
+            let outcome = std::panic::AssertUnwindSafe(run)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Outcome {
+                    verdict: "cancelled: the run stopped unexpectedly".into(),
+                    run_id: None,
+                });
+            this.record(&name, |s| {
+                s.last_result = Some(outcome.verdict);
+                s.last_run_id = outcome.run_id;
+            });
         });
-        true
+        Ok(())
     }
 
     fn record(&self, name: &str, update: impl FnOnce(&mut Schedule)) {
-        let _guard = self.write.lock().unwrap();
-        let Ok(mut store) = ScheduleStore::load(&self.path) else {
-            return;
-        };
-        if let Some(s) = store.get_mut(name) {
-            update(s);
-            if let Err(e) = store.save(&self.path) {
-                eprintln!("could not record schedule '{name}': {e:#}");
+        let result = ScheduleStore::update(&self.path, |store| {
+            if let Some(s) = store.get_mut(name) {
+                update(s);
             }
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                if let Some(changed) = &self.changed {
+                    changed();
+                }
+            }
+            Err(e) => eprintln!("could not record schedule '{name}': {e:#}"),
         }
     }
 }
@@ -358,7 +547,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{Timelike, Utc};
 
     fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
@@ -444,68 +633,141 @@ mod tests {
         let mut off = hourly.clone();
         off.name = "off".into();
         off.enabled = false;
-        let nightly = Schedule::new("nightly", "daily 03:00", plan, "").unwrap();
-        store.add(hourly);
-        store.add(off);
-        store.add(nightly);
+        let mut offline = hourly.clone();
+        offline.name = "offline".into();
+        offline.created_unix += 30 * 60; // due half an hour ago: well inside the grace period
+        let mut downtime = offline.clone();
+        downtime.name = "offline-long".into();
+        downtime.created_unix -= 2 * 86400; // fell due while the agent was off
+        let mut boom = hourly.clone();
+        boom.name = "boom".into();
+        boom.enabled = false;
+        let nightly_hour = (Local::now().hour() + 12) % 24;
+        let nightly =
+            Schedule::new("nightly", &format!("daily {nightly_hour:02}:00"), plan, "").unwrap();
+        for s in [hourly, off, offline, downtime, boom, nightly] {
+            store.add(s);
+        }
         store.save(&path).unwrap();
         assert!(Schedule::new("bad", "every 1h", "not a plan", "").is_err());
         assert!(Schedule::new("../x", "every 1h", plan, "").is_err());
 
         let (release, wait) = tokio::sync::watch::channel(false);
         let launch: Launch = Arc::new(move |s: Schedule| {
+            if s.name.starts_with("offline") {
+                bail!("worker is not connected");
+            }
             let mut wait = wait.clone();
-            Box::pin(async move {
+            Ok(Box::pin(async move {
                 wait.wait_for(|go| *go).await.unwrap();
-                if s.name == "off" {
-                    bail!("peer gone");
+                if s.name == "boom" {
+                    panic!("the run panics");
                 }
-                Ok(format!("PASS: ran {}", s.name))
-            })
+                Outcome {
+                    verdict: format!("PASS: ran {}", s.name),
+                    run_id: Some(format!("run-{}", s.name)),
+                }
+            }))
         });
         let scheduler = Scheduler::new(path.clone(), launch);
         let now = Local::now();
         assert_eq!(
             scheduler.run_due(&now),
             ["hourly"],
-            "only due, enabled ones"
+            "only due, enabled ones that can start"
         );
         let saved = ScheduleStore::load(&path).unwrap();
-        assert_eq!(
-            saved.get("hourly").unwrap().last_result.as_deref(),
-            Some("running")
-        );
-        assert!(
-            !saved.get("hourly").unwrap().due(&now),
-            "next run is an hour later"
-        );
-        assert!(
-            scheduler
-                .run_due(&(now + chrono::Duration::hours(2)))
-                .is_empty(),
-            "no overlap"
-        );
+        let hourly = saved.get("hourly").unwrap();
+        assert_eq!(hourly.last_status(), Some("running"));
+        assert!(!hourly.due(&now), "next run is an hour later");
         assert!(scheduler.trigger("hourly").is_err(), "already running");
-        scheduler.trigger("off").unwrap();
         assert!(scheduler.trigger("missing").is_err());
 
+        // A due run that can't start is tried again later, then counted as missed.
+        let offline = saved.get("offline").unwrap().clone();
+        assert!(
+            offline
+                .last_result
+                .as_deref()
+                .unwrap()
+                .starts_with("not run yet (trying again): worker is not connected")
+        );
+        assert!(offline.last_run_unix.is_none(), "it didn't run");
+        assert!(!offline.due(&(now + chrono::Duration::seconds(60))));
+        assert!(offline.due(&(now + chrono::Duration::seconds(RETRY_SECS + 1))));
+        let downtime = saved.get("offline-long").unwrap();
+        assert_eq!(
+            downtime.last_status(),
+            Some("not-run"),
+            "its peers get time to reconnect after a restart"
+        );
+        let later = now + chrono::Duration::hours(2);
+        assert!(
+            scheduler.run_due(&later).is_empty(),
+            "hourly is still running (no overlap); offline can't start"
+        );
+        let offline = ScheduleStore::load(&path)
+            .unwrap()
+            .get("offline")
+            .unwrap()
+            .clone();
+        assert_eq!(offline.last_status(), Some("missed"), "over an hour late");
+        assert_eq!(
+            offline.next_run().unwrap().timestamp(),
+            later.timestamp() + 3600,
+            "counts from the miss"
+        );
+        let err = scheduler.trigger("offline").unwrap_err().to_string();
+        assert!(err.contains("not connected"), "Run now says why: {err}");
+
+        // A run that panics still frees its schedule.
+        scheduler.trigger("boom").unwrap();
         release.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while scheduler.is_running("hourly") || scheduler.is_running("off") {
+            while scheduler.is_running("hourly") || scheduler.is_running("boom") {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
         let saved = ScheduleStore::load(&path).unwrap();
+        let hourly = saved.get("hourly").unwrap();
+        assert_eq!(hourly.last_result.as_deref(), Some("PASS: ran hourly"));
         assert_eq!(
-            saved.get("hourly").unwrap().last_result.as_deref(),
-            Some("PASS: ran hourly")
+            (hourly.last_status(), hourly.last_run_id.as_deref()),
+            (Some("passed"), Some("run-hourly"))
         );
         assert_eq!(
-            saved.get("off").unwrap().last_result.as_deref(),
-            Some("not run: peer gone")
+            saved.get("boom").unwrap().last_status(),
+            Some("cancelled"),
+            "not stuck at running"
         );
         assert!(saved.get("nightly").unwrap().last_run_unix.is_none());
+
+        // Pausing and resuming counts from the resume, without a made-up last run.
+        ScheduleStore::update(&path, |store| {
+            let s = store.get_mut("off").unwrap();
+            s.set_enabled(true);
+            Ok(())
+        })
+        .unwrap();
+        let off = ScheduleStore::load(&path)
+            .unwrap()
+            .get("off")
+            .unwrap()
+            .clone();
+        assert!(off.last_run_unix.is_none() && !off.due(&Local::now()));
+        assert_eq!(off.next_runs(3).len(), 3);
+        assert_eq!(when_parts("weekdays 08:30").unwrap()["days"][0], "mon");
+        assert_eq!(when_parts("every 2h").unwrap()["every_minutes"], 120);
+        let from = Local::now();
+        let next = upcoming("every 2h", &from, 3).unwrap();
+        assert_eq!(
+            next.iter()
+                .map(|t| t.timestamp() - from.timestamp())
+                .collect::<Vec<_>>(),
+            [7200, 14400, 21600]
+        );
+        assert!(upcoming("every 1m", &from, 3).is_err());
     }
 }

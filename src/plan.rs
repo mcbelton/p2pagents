@@ -756,28 +756,16 @@ pub fn choose_peer(
     squads: &SquadStore,
     busy: &HashMap<String, usize>,
 ) -> Result<PeerInfo> {
-    let capable = |p: &&PeerInfo| {
-        p.capabilities.contains(&step.provider)
-            && step
-                .share
-                .as_ref()
-                .is_none_or(|s| p.shares.iter().any(|shared| &shared.name == s))
-    };
+    // The same test as the plan check: provider, folder, checks, access, MCP servers.
+    let capable = |p: &&PeerInfo| unable(step, p).is_none();
     match &step.target {
         Target::Peer(name) => {
             let peer = peers
                 .iter()
                 .find(|p| &p.name == name)
                 .ok_or_else(|| anyhow!("{name} is not connected"))?;
-            if !capable(&peer) {
-                bail!(
-                    "{name} doesn't serve {}{}",
-                    step.provider,
-                    step.share
-                        .as_ref()
-                        .map(|s| format!(" in a folder named '{s}' shared with you"))
-                        .unwrap_or_default()
-                );
+            if let Some(why) = unable(step, peer) {
+                bail!("{why}");
             }
             Ok(peer.clone())
         }
@@ -785,20 +773,26 @@ pub fn choose_peer(
             let squad = squads
                 .get(name)
                 .ok_or_else(|| anyhow!("there is no squad named {name}"))?;
-            peers
+            let online: Vec<&PeerInfo> = peers
                 .iter()
                 .filter(|p| squad.members.contains(&p.name))
+                .collect();
+            online
+                .iter()
+                .copied()
                 .filter(capable)
                 .min_by_key(|p| (busy.get(&p.name).copied().unwrap_or(0), p.name.clone()))
                 .cloned()
                 .ok_or_else(|| {
+                    let reasons: Vec<String> =
+                        online.iter().filter_map(|p| unable(step, p)).collect();
                     anyhow!(
-                        "no online member of squad {name} serves {}{}",
-                        step.provider,
-                        step.share
-                            .as_ref()
-                            .map(|s| format!(" with a folder named '{s}'"))
-                            .unwrap_or_default()
+                        "no online member of squad {name} can run it{}",
+                        if reasons.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", reasons.join("; "))
+                        }
                     )
                 })
         }
@@ -843,15 +837,20 @@ fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
     found
 }
 
-/// Checks, runs and records plan `text` as `profile`'s agent, as `/plan` and the web
-/// UI do: preflight, skills and knowledge, the run, its saved evidence record and
-/// the knowledge its verified steps produced. Returns the saved run.
-pub async fn execute(
-    agent: &Agent,
-    profile: &crate::profile::Profile,
-    text: &str,
-    on_update: impl FnMut(&str, &StepState),
-) -> Result<crate::runs::RunRecord> {
+/// A plan checked and ready to run as `profile`'s agent (see [`start`]).
+pub struct ReadyRun {
+    text: String,
+    plan: Plan,
+    ready: Plan,
+    squads: SquadStore,
+    kb: KnowledgeBase,
+    runs_dir: std::path::PathBuf,
+}
+
+/// Checks plan `text` as `/plan` and the web UI do (preflight against connected
+/// peers, folders, checks, MCP servers, squads, knowledge and skills) and prepares
+/// it; fails with every problem if it can't run now.
+pub fn start(agent: &Agent, profile: &crate::profile::Profile, text: &str) -> Result<ReadyRun> {
     let plan = Plan::parse(text)?;
     let kb = profile.knowledge();
     let skills = profile.skills();
@@ -868,20 +867,51 @@ pub async fn execute(
         bail!("{}", errors.join("; "));
     }
     let ready = plan.prepare(&kb, &skills)?;
-    let started = crate::runs::unix_now();
-    let states = run_plan(agent, &squads, &ready, on_update).await;
-    let mut run = crate::runs::RunRecord::new(
-        agent.name(),
-        &agent.id().to_string(),
-        text,
-        &plan,
-        &states,
-        started,
-    );
-    run.peer_ids = crate::runs::peer_ids(agent);
-    run.save(&profile.runs_dir())?;
-    save_knowledge(&kb, &plan, &states, &run.id);
-    Ok(run)
+    Ok(ReadyRun {
+        text: text.to_owned(),
+        plan,
+        ready,
+        squads,
+        kb,
+        runs_dir: profile.runs_dir(),
+    })
+}
+
+impl ReadyRun {
+    /// Runs it, then saves its evidence record and the knowledge its verified steps
+    /// produced. Returns the run (saved unless saving failed, which is printed).
+    pub async fn run(
+        self,
+        agent: &Agent,
+        on_update: impl FnMut(&str, &StepState),
+    ) -> crate::runs::RunRecord {
+        let started = crate::runs::unix_now();
+        let states = run_plan(agent, &self.squads, &self.ready, on_update).await;
+        let mut run = crate::runs::RunRecord::new(
+            agent.name(),
+            &agent.id().to_string(),
+            &self.text,
+            &self.plan,
+            &states,
+            started,
+        );
+        run.peer_ids = crate::runs::peer_ids(agent);
+        if let Err(e) = run.save(&self.runs_dir) {
+            eprintln!("could not save the run: {e:#}");
+        }
+        save_knowledge(&self.kb, &self.plan, &states, &run.id);
+        run
+    }
+}
+
+/// [`start`] then [`ReadyRun::run`].
+pub async fn execute(
+    agent: &Agent,
+    profile: &crate::profile::Profile,
+    text: &str,
+    on_update: impl FnMut(&str, &StepState),
+) -> Result<crate::runs::RunRecord> {
+    Ok(start(agent, profile, text)?.run(agent, on_update).await)
 }
 
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
@@ -1304,6 +1334,7 @@ mod tests {
             } else {
                 vec![]
             },
+            mcp_about: Default::default(),
         };
         let peer = |name: &str, shares: Vec<ShareInfo>| PeerInfo {
             name: name.into(),
@@ -1458,5 +1489,21 @@ mod tests {
         assert!(choose_peer(&nosquad, &peers, &squads, &busy).is_err());
         let direct = Plan::parse("t @dave:code review").unwrap().steps.remove(0);
         assert!(choose_peer(&direct, &peers, &squads, &busy).is_err());
+        // A squad step that needs an MCP server goes only to members that offer it.
+        let mut with_mcp = peers.clone();
+        with_mcp[1].shares[1].mcp = vec!["browser".into()];
+        let look = Plan::parse("t #qa:code mcp=browser look")
+            .unwrap()
+            .steps
+            .remove(0);
+        assert_eq!(
+            choose_peer(&look, &with_mcp, &squads, &busy).unwrap().name,
+            "bob",
+            "alice is less busy but offers no browser"
+        );
+        let err = choose_peer(&look, &peers, &squads, &busy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("offers you no MCP server browser"), "{err}");
     }
 }

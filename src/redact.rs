@@ -12,7 +12,13 @@ use regex::Regex;
 const PATTERNS: &[(&str, &str, usize)] = &[
     (
         "private-key",
-        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----",
+        0,
+    ),
+    // A key block whose end was cut off (output tails): everything after BEGIN.
+    (
+        "private-key",
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*",
         0,
     ),
     ("github-token", r"\bgithub_pat_[A-Za-z0-9_]{40,}", 0),
@@ -23,6 +29,16 @@ const PATTERNS: &[(&str, &str, usize)] = &[
         0,
     ),
     ("aws-access-key", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", 0),
+    (
+        "aws-secret-key",
+        r#"(?i)aws_?secret_?access_?key["']?\s*[=:]\s*["']?([A-Za-z0-9/+]{40})"#,
+        1,
+    ),
+    (
+        "aws-session-token",
+        r#"(?i)aws_?session_?token["']?\s*[=:]\s*["']?([A-Za-z0-9/+=]{100,})"#,
+        1,
+    ),
     ("slack-token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}", 0),
     ("anthropic-key", r"\bsk-ant-[A-Za-z0-9_-]{20,}", 0),
     (
@@ -43,9 +59,10 @@ const PATTERNS: &[(&str, &str, usize)] = &[
         r"(?i)\b(?:authorization:\s*)?bearer\s+([A-Za-z0-9._~+/-]{24,}=*)",
         1,
     ),
+    // `password=`, `DB_PASSWORD=`, `PGPASSWORD:`, `"password": "..."`.
     (
         "password",
-        r"(?i)\b(?:password|pwd)\s*=\s*([^;\s'\x22]{4,})",
+        r#"(?i)(?:\b|_)(?:[a-z0-9]*password|passwd|pwd)["']?\s*[=:]\s*["']?([^;\s'"]{4,})"#,
         1,
     ),
     (
@@ -142,6 +159,32 @@ mod tests {
             redact_with_note(&gh, "worker").ends_with(
                 "_worker redacted 1 secret from this result before it left the machine._"
             )
+        );
+
+        // Settings as `env` or `docker compose config` print them, and cut-off keys.
+        let aws_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let settings = format!(
+            "POSTGRES_PASSWORD=Sup3rS3cret\nDB_PASSWORD: \"letmein99\"\nPGPASSWORD=pg-pass-1\n\
+             AWS_SECRET_ACCESS_KEY={aws_secret}\n\"password\": \"json-secret\"\n\
+             -----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----\n\
+             ...\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow-tail-cut-here"
+        );
+        let (clean, count) = redact(&settings);
+        assert_eq!(count, 7, "{clean}");
+        for gone in [
+            "Sup3rS3cret",
+            "letmein99",
+            "pg-pass-1",
+            aws_secret,
+            "json-secret",
+            "lQOYBF",
+            "MIIEow",
+        ] {
+            assert!(!clean.contains(gone), "{gone} in {clean}");
+        }
+        assert!(
+            clean.contains("POSTGRES_PASSWORD=[REDACTED:password]"),
+            "{clean}"
         );
     }
 }

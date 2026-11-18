@@ -408,9 +408,14 @@ impl Profile {
         crate::knowledge::KnowledgeBase::new(self.dir.join("knowledge"))
     }
 
-    /// Built-in skills plus this profile's own (`skills/`).
+    /// Built-in skills, this profile's own (`skills/`) and those of its enabled plugins.
     pub fn skills(&self) -> crate::skills::Skills {
-        crate::skills::Skills::new(self.dir.join("skills"))
+        crate::skills::Skills::new(self.dir.join("skills")).with_plugins(self.plugins().skills())
+    }
+
+    /// Plugins imported into this profile (see [`crate::plugins`]).
+    pub fn plugins(&self) -> crate::plugins::PluginStore {
+        crate::plugins::PluginStore::new(&self.dir)
     }
 
     /// Metrics and incident logs.
@@ -510,6 +515,15 @@ impl Profile {
     /// The folders this profile shares (always including `data`).
     pub fn shares(&self) -> Result<crate::shares::ShareStore> {
         crate::shares::ShareStore::load(&self.shares_path(), self.data_folder())
+    }
+
+    /// Changes this profile's shares under their lock (see
+    /// [`crate::shares::ShareStore::update`]); returns `change`'s result and the saved shares.
+    pub fn update_shares<T>(
+        &self,
+        change: impl FnOnce(&mut crate::shares::ShareStore) -> Result<T>,
+    ) -> Result<(T, crate::shares::ShareStore)> {
+        crate::shares::ShareStore::update(&self.shares_path(), self.data_folder(), change)
     }
 
     /// Deletes the profile: its identity, stored secrets and folder (including

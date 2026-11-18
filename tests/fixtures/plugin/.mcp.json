@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "echo": {
+      "command": "${PYTHON:-python}",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/echo_mcp.py", "${user_config.ECHO_WORD}"],
+      "env": { "ECHO_MCP_LOG": "${CLAUDE_PLUGIN_DATA}/calls.log" }
+    }
+  }
+}

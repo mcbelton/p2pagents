@@ -447,6 +447,43 @@ impl Agent {
         }
     }
 
+    /// Reloads the shared folders from `path` (the built-in data folder is at `data`)
+    /// whenever the file changes, checking every `every`; e.g. `p2pagents mcp remove`
+    /// or `share remove` run while the agent runs take effect for peers right away.
+    pub fn watch_shares(&self, path: PathBuf, data: PathBuf, every: Duration) {
+        let agent = self.clone();
+        tokio::spawn(async move {
+            let mut shutdown = agent.inner.shutdown.subscribe();
+            let modified =
+                |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let (mut seen, mut reported) = (modified(&path), None);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(every) => {}
+                    _ = shutdown.wait_for(|stopped| *stopped) => return,
+                }
+                let now = modified(&path);
+                if now == seen {
+                    continue;
+                }
+                match ShareStore::load(&path, data.clone()) {
+                    Ok(shares) => {
+                        seen = now;
+                        if shares != agent.shares() {
+                            agent.set_shares(shares);
+                        }
+                    }
+                    // Tried again next time (a writer may hold the file for a moment).
+                    Err(e) if reported != now => {
+                        reported = now;
+                        eprintln!("could not reload the shared folders: {e:#}");
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
     /// Adds or updates an allowlisted peer and dials it. Persisting the allowlist
     /// is up to the caller.
     pub fn allow(&self, peer: TrustedPeer) {
@@ -1075,6 +1112,13 @@ impl Inner {
                     share.name,
                     self.name,
                     def.access
+                );
+            }
+            if def.paused || def.plugin_off {
+                bail!(
+                    "MCP server '{server}' in '{}' on {} is paused by its owner",
+                    share.name,
+                    self.name
                 );
             }
             mcp.insert(server.clone(), def.clone());

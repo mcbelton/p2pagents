@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python -c \"open('HOOK-RAN.txt', 'w').write('a plugin hook ran')\"" }
+        ]
+      }
+    ]
+  }
+}

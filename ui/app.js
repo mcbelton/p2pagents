@@ -49,6 +49,7 @@ function applyTheme() {
   const choice = themeChoice();
   const effective = choice === "system" ? (media.matches ? "dark" : "light") : choice;
   document.documentElement.dataset.theme = effective;
+  $("#theme-color")?.setAttribute("content", effective === "dark" ? "#0d1016" : "#f5f6f8");
   for (const btn of document.querySelectorAll("[data-theme-choice]")) {
     const on = btn.dataset.themeChoice === choice;
     btn.setAttribute("aria-checked", String(on));
@@ -56,6 +57,40 @@ function applyTheme() {
   }
 }
 media.addEventListener("change", applyTheme);
+
+// ---------- dialogs ----------
+/// Asks before something is lost, in the page (never window.confirm). Resolves
+/// true when confirmed. `body` says what is lost and what stays.
+function confirmDialog({ title, body, confirm = "Confirm", danger = false }) {
+  const dialog = $("#confirm-dialog");
+  const opener = document.activeElement;
+  $("#confirm-h").textContent = title;
+  $("#confirm-body").textContent = body;
+  const ok = $("#confirm-ok");
+  ok.textContent = confirm;
+  ok.classList.toggle("danger-fill", danger);
+  ok.classList.toggle("primary", !danger);
+  dialog.returnValue = "";
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      resolve(dialog.returnValue === "ok");
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    }, { once: true });
+    dialog.showModal();
+    (danger ? $("#confirm-cancel") : ok).focus();
+  });
+}
+
+/// A dialog closes on a backdrop click only while nothing was typed in it, so a
+/// stray click never discards input (Escape and Cancel still close it).
+function guardDialog(dialog) {
+  let dirty = false;
+  dialog.addEventListener("input", () => { dirty = true; });
+  dialog.addEventListener("close", () => { dirty = false; });
+  dialog.addEventListener("click", (e) => {
+    if (e.target === dialog && !dirty) dialog.close();
+  });
+}
 
 // Radio groups: click and arrow keys (WAI-ARIA radiogroup pattern).
 function radioGroup(container, onSelect) {
@@ -552,7 +587,13 @@ async function submitSquad(e) {
 }
 
 async function removeSquad(name) {
-  if (!confirm(`Remove squad #${name}? Its members stay on the allowlist.`)) return;
+  const ok = await confirmDialog({
+    title: `Remove squad #${name}?`,
+    body: "Plans that name it will no longer run. Its members stay on the allowlist.",
+    confirm: "Remove squad",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await api(`/api/squads/${encodeURIComponent(name)}`, { method: "DELETE" });
     toast(`Squad #${name} removed`);
@@ -651,13 +692,66 @@ async function loadRuns() {
 }
 
 // ---------- schedules ----------
+const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+const andList = new Intl.ListFormat(undefined, { type: "conjunction" });
+const DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const LAST_STATUS = {
+  running: ["running", "Running"],
+  passed: ["done", "Passed"],
+  failed: ["failed", "Failed"],
+  "no-claims": ["skipped", "No claims"],
+  "not-run": ["cancelled", "Didn't start"],
+  missed: ["failed", "Missed"],
+  cancelled: ["cancelled", "Cancelled"],
+};
+
+/// An absolute time in the browser's locale: "today 09:00", "Tue, Mar 4 09:00".
 function when(unix) {
   if (!unix) return "";
   const d = new Date(unix * 1000);
-  const today = new Date();
   const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  if (d.toDateString() === today.toDateString()) return `today ${time}`;
+  if (d.toDateString() === new Date().toDateString()) return `today ${time}`;
   return `${d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${time}`;
+}
+
+/// A time relative to now: "in 3 hours", "5 minutes ago".
+function fromNow(unix) {
+  const secs = unix - Date.now() / 1000;
+  const abs = Math.abs(secs);
+  const [value, unit] = abs < 45 ? [secs, "second"] : abs < 2700 ? [secs / 60, "minute"]
+    : abs < 64800 ? [secs / 3600, "hour"] : [secs / 86400, "day"];
+  return relative.format(Math.round(value), unit);
+}
+
+function timeEl(unix, text) {
+  return el("time", { datetime: new Date(unix * 1000).toISOString(), title: when(unix), text });
+}
+
+function dayName(key, style = "short") {
+  // 1 January 2024 was a Monday.
+  return new Date(2024, 0, 1 + DAY_KEYS.indexOf(key)).toLocaleDateString([], { weekday: style });
+}
+
+function timeText(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  return new Date(2024, 0, 1, h, m).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/// When a schedule runs, in plain words: "Every 2 hours", "Weekdays at 08:30".
+function describeWhen(parts, raw) {
+  if (!parts) return raw;
+  if (parts.every_minutes) {
+    const m = parts.every_minutes;
+    const [n, unit] = m % 1440 === 0 ? [m / 1440, "day"] : m % 60 === 0 ? [m / 60, "hour"] : [m, "minute"];
+    return n === 1 ? `Every ${unit}` : `Every ${n} ${unit}s`;
+  }
+  const days = [...(parts.days ?? [])].sort((a, b) => DAY_KEYS.indexOf(a) - DAY_KEYS.indexOf(b));
+  const at = timeText(parts.time);
+  const key = days.join(",");
+  if (!days.length) return `Every day at ${at}`;
+  if (key === "mon,tue,wed,thu,fri") return `Weekdays at ${at}`;
+  if (key === "sat,sun") return `Weekends at ${at}`;
+  return `${andList.format(days.map((d) => dayName(d, "long")))} at ${at}`;
 }
 
 async function loadSchedules() {
@@ -685,14 +779,31 @@ function renderSchedules(schedules) {
   for (const s of schedules) {
     const status = s.running ? ["running", "Running"] : s.enabled ? ["done", "Active"] : ["skipped", "Paused"];
     const path = `/api/schedules/${encodeURIComponent(s.name)}`;
-    const meta = [s.when, s.enabled && s.next_unix ? `next ${when(s.next_unix)}` : null, `${s.steps} step${s.steps === 1 ? "" : "s"}`, s.source || null]
+    const meta = [describeWhen(s.when_parts, s.when), `${s.steps} step${s.steps === 1 ? "" : "s"}`, s.source || null]
       .filter(Boolean).join(" · ");
+    const next = s.enabled && s.next_unix && !s.running
+      ? el("div", { class: "task-meta" }, "Next run ", timeEl(s.next_unix, fromNow(s.next_unix)), ` · ${when(s.next_unix)}`)
+      : null;
+    let last = null;
+    let why = null;
+    if (s.last_status && s.last_status !== "running") {
+      const [cls, label] = LAST_STATUS[s.last_status] ?? ["skipped", s.last_status];
+      last = el("div", { class: "last-run" },
+        el("span", { class: "muted small", text: "Last run" }),
+        el("span", { class: `status ${cls}`, text: label }),
+        s.last_run_unix ? el("span", { class: "muted small" }, timeEl(s.last_run_unix, fromNow(s.last_run_unix))) : null,
+        s.last_run_id ? el("button", { type: "button", class: "btn link small", onclick: () => openRun(s.last_run_id) }, "Open run") : null);
+      const detail = (s.last_result ?? "").replace(/^(not run yet \(trying again\)|missed|cancelled):\s*/, "");
+      why = s.retry_unix
+        ? el("div", { class: "task-meta warn-text" }, "Trying again ", timeEl(s.retry_unix, fromNow(s.retry_unix)), `: ${detail}`)
+        : detail ? el("div", { class: "task-meta", text: detail }) : null;
+    }
     list.append(el("li", { class: "task schedule" },
       el("div", { class: "task-top" },
         el("span", { class: "task-title", text: s.name }),
         el("span", { class: `status ${status[0]}`, text: status[1] })),
       el("div", { class: "task-meta", text: meta }),
-      s.last_result ? el("div", { class: "task-meta", text: `Last run ${when(s.last_run_unix)}: ${s.last_result}` }) : null,
+      next, last, why,
       el("details", {}, el("summary", { text: "Plan" }), el("pre", { text: s.plan })),
       el("div", { class: "task-actions" },
         el("button", {
@@ -701,50 +812,182 @@ function renderSchedules(schedules) {
         }, "Run now"),
         el("button", {
           type: "button", class: "btn small",
-          onclick: (e) => act(e.currentTarget, path, { method: "PATCH", body: JSON.stringify({ enabled: !s.enabled }) }),
+          title: s.enabled ? "Stop running it until you resume it" : "Run it again; its time counts from now",
+          onclick: (e) => act(e.currentTarget, path, { method: "PATCH", body: JSON.stringify({ enabled: !s.enabled }) },
+            s.enabled ? `Paused '${s.name}'` : `Resumed '${s.name}'`),
         }, s.enabled ? "Pause" : "Resume"),
+        el("button", { type: "button", class: "btn small", onclick: () => openScheduleDialog(s) }, "Edit"),
         el("button", {
           type: "button", class: "btn small danger",
-          onclick: (e) => confirm(`Delete schedule '${s.name}'? Its past runs stay under Evidence runs.`)
-            && act(e.currentTarget, path, { method: "DELETE" }, `Deleted '${s.name}'`),
+          onclick: async (e) => {
+            const button = e.currentTarget;
+            const ok = await confirmDialog({
+              title: `Delete schedule ${s.name}?`,
+              body: "It stops running. Its past runs stay under Evidence runs.",
+              confirm: "Delete schedule",
+              danger: true,
+            });
+            if (ok) act(button, path, { method: "DELETE" }, `Deleted '${s.name}'`);
+          },
         }, "Delete"))));
   }
 }
 
-async function openScheduleDialog() {
-  const text = $("#composer-input").value.trim();
+let scheduleEditing = null;
+
+function buildDayToggles() {
+  const box = $("#when-days");
+  if (box.childElementCount) return;
+  box.append(...DAY_KEYS.map((d) => el("label", { class: "day", title: dayName(d, "long") },
+    el("input", { type: "checkbox", value: d }), el("span", { text: dayName(d) }))));
+}
+
+function syncWhenPicker() {
+  const repeat = $("#when-repeat").value;
+  $("#when-time-field").hidden = repeat === "interval" || repeat === "custom";
+  $("#when-interval-field").hidden = repeat !== "interval";
+  $("#when-days").hidden = repeat !== "days";
+  $("#when-custom-field").hidden = repeat !== "custom";
+  previewWhen();
+}
+
+/// The schedule's `when` from the picker ("" while incomplete).
+function whenFromPicker() {
+  const repeat = $("#when-repeat").value;
+  const time = $("#when-time").value;
+  if (repeat === "interval") {
+    const n = Number($("#when-every").value);
+    return Number.isInteger(n) && n > 0 ? `every ${n}${$("#when-unit").value}` : "";
+  }
+  if (repeat === "custom") return $("#when-custom").value.trim();
+  if (repeat === "days") {
+    const days = [...$("#when-days").querySelectorAll("input:checked")].map((i) => i.value);
+    return days.length && time ? `${days.join(",")} ${time}` : "";
+  }
+  return time ? `${repeat} ${time}` : "";
+}
+
+/// Sets the picker from a schedule's `when` and its parts, as the agent read them.
+function setWhenPicker(text, parts) {
+  buildDayToggles();
+  for (const box of $("#when-days").querySelectorAll("input")) box.checked = false;
+  $("#when-custom").value = text ?? "";
+  if (!parts) {
+    $("#when-repeat").value = text ? "custom" : "daily";
+  } else if (parts.every_minutes) {
+    const m = parts.every_minutes;
+    const [n, unit] = m % 1440 === 0 ? [m / 1440, "d"] : m % 60 === 0 ? [m / 60, "h"] : [m, "m"];
+    $("#when-repeat").value = "interval";
+    $("#when-every").value = String(n);
+    $("#when-unit").value = unit;
+  } else {
+    const key = parts.days.join(",");
+    $("#when-time").value = parts.time;
+    $("#when-repeat").value = !parts.days.length ? "daily" : key === "mon,tue,wed,thu,fri" ? "weekdays"
+      : key === "sat,sun" ? "weekends" : "days";
+    for (const box of $("#when-days").querySelectorAll("input")) box.checked = parts.days.includes(box.value);
+  }
+  syncWhenPicker();
+}
+
+let whenTimer = null;
+/// Shows, as the picker changes, what the schedule means and its next runs.
+function previewWhen() {
+  clearTimeout(whenTimer);
+  const out = $("#when-preview");
+  const text = whenFromPicker();
   if (!text) {
+    out.dataset.state = "bad";
+    out.textContent = $("#when-repeat").value === "days" ? "Pick at least one day." : "";
+    return;
+  }
+  whenTimer = setTimeout(async () => {
+    try {
+      const res = await api("/api/schedule-preview", { method: "POST", body: JSON.stringify({ when: text }) });
+      if (whenFromPicker() !== text) return;
+      out.dataset.state = res.ok ? "ok" : "bad";
+      out.textContent = res.ok
+        ? `${describeWhen(res.parts, text)}. Next runs: ${res.next.map(when).join(" · ")}`
+        : res.error;
+    } catch (err) {
+      out.dataset.state = "bad";
+      out.textContent = err.message;
+    }
+  }, 250);
+}
+
+/// Schedules the plan in the composer, or (`edit`) changes an existing schedule.
+function openScheduleDialog(edit = null) {
+  const text = $("#composer-input").value.trim();
+  if (!edit && !text) {
     toast("Write or pick a plan first, then schedule it", "error");
     $("#composer-input").focus();
     return;
   }
+  scheduleEditing = edit;
   $("#schedule-error").textContent = "";
-  const book = $("#playbook").value;
-  if (!$("#schedule-name").value && book) $("#schedule-name").value = book;
+  $("#schedule-h").textContent = edit ? `Edit schedule ${edit.name}` : "Schedule this plan";
+  $("#schedule-submit").textContent = edit ? "Save changes" : "Schedule";
+  const name = $("#schedule-name");
+  if (edit) {
+    name.value = edit.name;
+    name.dataset.edit = "1";
+  } else if (name.dataset.edit) {
+    name.value = "";
+    delete name.dataset.edit;
+  }
+  name.disabled = Boolean(edit);
+  if (!edit && !name.value && $("#playbook").value) name.value = $("#playbook").value;
+  $("#schedule-replan-field").hidden = !(edit && text && text !== edit.plan.trim());
+  $("#schedule-replan").checked = false;
+  if (edit) setWhenPicker(edit.when, edit.when_parts);
+  else {
+    buildDayToggles();
+    syncWhenPicker();
+  }
   $("#schedule-dialog").showModal();
-  $(($("#schedule-name").value ? "#schedule-when" : "#schedule-name")).focus();
+  (edit || name.value ? $("#when-repeat") : name).focus();
 }
 
 async function submitSchedule(e) {
   e.preventDefault();
+  const error = $("#schedule-error");
   const name = $("#schedule-name").value.trim();
-  const at = $("#schedule-when").value.trim();
-  if (!name || !at) {
-    $("#schedule-error").textContent = "Give the schedule a name and a time.";
+  const at = whenFromPicker();
+  if (!scheduleEditing && !name) {
+    error.textContent = "Give the schedule a name.";
+    $("#schedule-name").focus();
     return;
   }
-  const book = $("#playbook").value;
+  if (!at) {
+    error.textContent = $("#when-repeat").value === "days" ? "Pick at least one day." : "Say when it runs.";
+    $("#when-repeat").focus();
+    return;
+  }
+  const button = $("#schedule-submit");
+  button.disabled = true;
   try {
-    const res = await api("/api/schedules", {
-      method: "POST",
-      body: JSON.stringify({ name, when: at, plan: $("#composer-input").value, source: book ? `playbook ${book}` : "" }),
-    });
+    const editing = scheduleEditing;
+    let res;
+    if (editing) {
+      const body = { when: at };
+      if ($("#schedule-replan").checked) body.plan = $("#composer-input").value;
+      res = await api(`/api/schedules/${encodeURIComponent(editing.name)}`, { method: "PUT", body: JSON.stringify(body) });
+    } else {
+      const book = $("#playbook").value;
+      res = await api("/api/schedules", {
+        method: "POST",
+        body: JSON.stringify({ name, when: at, plan: $("#composer-input").value, source: book ? `playbook ${book}` : "" }),
+      });
+    }
     renderSchedules(res.schedules);
+    const saved = res.schedules.find((s) => s.name === (editing?.name ?? name));
     $("#schedule-dialog").close();
-    const next = res.schedules.find((s) => s.name === name)?.next_unix;
-    toast(`Scheduled '${name}'${next ? `; next run ${when(next)}` : ""}`);
+    toast(`${editing ? "Saved" : "Scheduled"} '${saved?.name ?? name}'${saved?.next_unix ? `; next run ${when(saved.next_unix)}` : ""}`);
   } catch (err) {
-    $("#schedule-error").textContent = err.message;
+    error.textContent = err.message;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -817,8 +1060,15 @@ function renderPlanExplain() {
     text = PLAN_INTRO;
   }
   box.hidden = !text;
-  if (text) box.replaceChildren(el("details", { open: "" }, el("summary", { text: p ? `What "${p.name}" does` : "What is a plan?" }), renderMarkdown(text)));
+  if (text) {
+    // Collapsed unless its owner opened it (remembered): the plan box stays in view.
+    const details = el("details", { open: localStorage.getItem(EXPLAIN_KEY) === "open" },
+      el("summary", { text: p ? `What "${p.name}" does` : "What is a plan?" }), renderMarkdown(text));
+    details.addEventListener("toggle", () => localStorage.setItem(EXPLAIN_KEY, details.open ? "open" : "closed"));
+    box.replaceChildren(details);
+  }
 }
+const EXPLAIN_KEY = "p2pagents-plan-explain";
 
 const CHECK_VARS = new Set(["build", "test", "lint", "secscan", "licenses", "secrets"]);
 const APPROVER_VARS = new Set(["approver", "privacy_approver", "product_owner", "tech_lead", "security_champion", "leader"]);
@@ -923,9 +1173,8 @@ async function submitPlaybook(e) {
 }
 
 /// Checks the plan against connected peers, folders, checks, squads, knowledge and
-/// skills; shows the problems under the editor; true if it can run.
-async function checkPlan(text) {
-  const box = $("#plan-problems");
+/// skills; shows the problems in `box` (under the editor); true if it can run.
+async function checkPlan(text, box = $("#plan-problems")) {
   if (!text.trim()) {
     box.hidden = true;
     return false;
@@ -948,6 +1197,113 @@ function schedulePlanCheck() {
   clearTimeout(planCheckTimer);
   if (state.mode !== "plan") return;
   planCheckTimer = setTimeout(() => checkPlan($("#composer-input").value).catch(() => {}), 900);
+}
+
+// ---------- plan editor ----------
+/// The first word of each step line ("fix @alice:app ..." is step fix).
+function stepIds(text) {
+  return text.split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !/^(claim:|#|\/\/)/i.test(l))
+    .map((l) => l.split(/\s+/)[0])
+    .filter((id) => /^[A-Za-z0-9_-]+$/.test(id));
+}
+
+function claimIds(text) {
+  return text.split("\n").map((l) => l.trim().match(/^claim:\s*(\S+)/i)?.[1]).filter(Boolean);
+}
+
+/// Opens the plan in a large editor, with what can go into it beside it.
+function openPlanEditor() {
+  const editor = $("#plan-editor-text");
+  editor.value = $("#composer-input").value;
+  renderPalette();
+  $("#plan-editor").showModal();
+  editor.focus();
+  checkPlan(editor.value, $("#plan-editor-check")).catch(() => {});
+}
+
+/// Inserts `text` at the cursor: a token joins the line with a space, a line
+/// template goes on a line of its own.
+function insertIntoPlan(text, line = false) {
+  const editor = $("#plan-editor-text");
+  const { selectionStart: start, selectionEnd: end, value } = editor;
+  const before = value.slice(0, start);
+  let insert = text;
+  if (line) {
+    if (before && !before.endsWith("\n")) insert = `\n${insert}`;
+    if (!value.slice(end).startsWith("\n")) insert += "\n";
+  } else if (before && !/\s$/.test(before)) {
+    insert = ` ${insert}`;
+  }
+  editor.setRangeText(insert, start, end, "end");
+  editor.focus();
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function renderPalette() {
+  const text = $("#plan-editor-text").value;
+  const chip = (label, insert, title, line = false) => el("button", {
+    type: "button", class: "insert", title: title ?? `Insert ${insert}`, onclick: () => insertIntoPlan(insert, line),
+  }, label);
+  const section = (title, hint, items) => items.length
+    ? el("section", { class: "palette-section" }, el("h4", { text: title }),
+      hint ? el("p", { class: "muted small", text: hint }) : null,
+      el("div", { class: "chips" }, ...items))
+    : null;
+  const workers = state.peers.filter((p) => p.capabilities.length);
+  const shares = workers.flatMap((p) => (p.shares ?? []).map((s) => ({ peer: p.name, ...s })));
+  const steps = stepIds(text);
+  const claims = claimIds(text);
+  let n = steps.length + 1;
+  while (steps.includes(`step${n}`)) n++;
+  const firstShare = shares.find((s) => s.name !== "data");
+  const target = firstShare ? `@${firstShare.peer}:${firstShare.name}` : workers[0] ? `@${workers[0].name}` : "@peer:folder";
+  const check = firstShare?.checks?.[0];
+  const claim = claims[0] ?? "C-1";
+  const about = (name) => shares.find((s) => s.mcp_about?.[name])?.mcp_about?.[name];
+  const sections = [
+    section("Add a line", null, [
+      chip("Claim", `claim: C-${claims.length + 1} What must be true at the end`, "Something the run must prove", true),
+      chip("Step", `step${n} ${target}${check ? ` verify=${check}` : ""} claims=${claim} What to do`, "Who does what, and how it is checked", true),
+      chip("Sign-off", `review after ${steps.at(-1) ?? "step1"} approve @me claims=${claim} Approve it`, "A person signs off; their answer is signed evidence", true),
+    ]),
+    section("Who runs it", "Peers, the folders they share with you, and squads", [
+      ...workers.flatMap((p) => [
+        chip(`@${p.name}`, `@${p.name}`, `${p.name}, in its data folder`),
+        ...(p.shares ?? []).filter((s) => s.name !== "data").map((s) =>
+          chip(`@${p.name}:${s.name}`, `@${p.name}:${s.name}`, `${p.name}'s ${s.name} folder (${ACCESS_SHORT[s.access] ?? s.access})`)),
+      ]),
+      ...(state.squads ?? []).map((s) => chip(`#${s.name}`, `#${s.name}`, `Any online member of squad ${s.name}`)),
+    ]),
+    section("Checks and MCP servers", "What those folders' owners offer", [
+      ...[...new Set(shares.flatMap((s) => s.checks ?? []))].map((c) =>
+        chip(`verify=${c}`, `verify=${c}`, `After the step, the peer's runtime runs its ${c} check`)),
+      ...[...new Set(shares.flatMap((s) => s.mcp ?? []))].map((m) =>
+        chip(`mcp=${m}`, `mcp=${m}`, about(m) ? `${m}: ${about(m)}` : `Let the step use MCP server ${m}`)),
+    ]),
+    section("Skills", "Instructions the step follows", (state.skills ?? []).map((s) =>
+      chip(`skill=${s.name}`, `skill=${s.name}`, s.description || s.name))),
+    section("Knowledge", "What agents learned, given to the step", (state.knowledge ?? []).map((k) =>
+      chip(`context=${k.name}`, `context=${k.name}`, `Give the step the topic ${k.name}`))),
+    section("Order and options", null, [
+      ...steps.map((id) => chip(`after ${id}`, `after ${id}`, `Run once step ${id} is done`)),
+      ...claims.map((id) => chip(`claims=${id}`, `claims=${id}`, `This step proves ${id}`)),
+      chip("attempts=3", "attempts=3", "Retry a failing step with its failures, up to 3 times"),
+      chip("approve @me", "approve @me", "You sign off on this step"),
+      chip("save=topic", "save=topic", "Save what the step learned under a knowledge topic"),
+    ]),
+  ].filter(Boolean);
+  $("#plan-palette").replaceChildren(...sections);
+}
+
+let editorTimer = null;
+function onPlanEditorInput() {
+  clearTimeout(editorTimer);
+  editorTimer = setTimeout(() => {
+    renderPalette();
+    checkPlan($("#plan-editor-text").value, $("#plan-editor-check")).catch(() => {});
+  }, 600);
 }
 
 // ---------- health and knowledge ----------
@@ -981,6 +1337,7 @@ async function loadOps() {
         e.text.split("\n")[0])))));
   }
   const kb = $("#kb-list");
+  state.knowledge = ops.knowledge;
   $("#kb-count").textContent = ops.knowledge.length;
   kb.replaceChildren(...(ops.knowledge.length ? ops.knowledge.map((k) => el("li", {},
     el("button", { type: "button", class: "run-open", onclick: () => openTopic(k.name), "aria-label": `Open knowledge topic ${k.name}` },
@@ -992,6 +1349,7 @@ async function loadOps() {
 
 async function loadSkills() {
   const res = await api("/api/skills");
+  state.skills = res.skills;
   $("#skills-summary").textContent = `Skills (${res.skills.length})`;
   $("#skill-list").replaceChildren(...res.skills.map((s) => el("li", {},
     el("button", { type: "button", class: "run-open", onclick: () => openSkill(s.name), "aria-label": `Open skill ${s.name}` },
@@ -1139,7 +1497,13 @@ async function syncRepo(r, button) {
 }
 
 async function unlinkRepo(r) {
-  if (!confirm(`Stop sharing ${r.slug} as folder ${r.name}? The clone stays on disk.`)) return;
+  const ok = await confirmDialog({
+    title: `Stop sharing ${r.slug}?`,
+    body: `Peers can no longer use the folder ${r.name}. The clone and its branches stay on this machine.`,
+    confirm: "Stop sharing",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await api(`/api/repos/${encodeURIComponent(r.name)}`, { method: "DELETE" });
     await loadGithub();
@@ -1247,15 +1611,21 @@ function renderShareOptions() {
   renderMcpOptions();
 }
 
-/** MCP servers the chosen folder offers (Copilot and Claude tasks only). */
+/** MCP servers the chosen folder offers (Copilot and Claude tasks only), with what
+ * their owner says each is for. */
 function renderMcpOptions() {
   const peer = state.peers.find((p) => p.id === $("#target").value);
   const share = (peer?.shares ?? []).find((s) => s.name === $("#share").value);
   const servers = $("#share-field").hidden || $("#provider").value === "codex" ? [] : share?.mcp ?? [];
   const checked = new Set(selectedMcp());
   $("#mcp-field").hidden = !servers.length;
-  $("#mcp-options").replaceChildren(...servers.map((name) => el("label", {},
-    el("input", { type: "checkbox", value: name, checked: checked.has(name) }), name)));
+  $("#mcp-options").replaceChildren(...servers.map((name) => {
+    const about = share?.mcp_about?.[name];
+    return el("label", { class: "mcp-chip", title: about ? `${name}: ${about}` : `MCP server ${name}` },
+      el("input", { type: "checkbox", value: name, checked: checked.has(name) }),
+      el("span", { class: "mono", text: name }),
+      about ? el("span", { class: "about", text: about }) : null);
+  }));
 }
 
 function selectedMcp() {
@@ -1272,6 +1642,7 @@ function updateComposer() {
   const noProviders = task && !availableProviders().length;
   $("#task-opts").hidden = !task;
   $("#playbook-opts").hidden = !plan;
+  if (!plan) $("#plan-problems").hidden = true;
   renderPlanExplain();
   input.rows = plan ? 6 : 2;
   input.placeholder = plan
@@ -1395,7 +1766,13 @@ async function submitAdd(e) {
 }
 
 async function removePeer(t) {
-  if (!confirm(`Remove ${t.name} from the allowlist? It will be disconnected and can no longer connect.`)) return;
+  const ok = await confirmDialog({
+    title: `Remove ${t.name} from the allowlist?`,
+    body: "It is disconnected and can no longer connect or run tasks here. You can add it again with its ticket.",
+    confirm: "Remove peer",
+    danger: true,
+  });
+  if (!ok) return;
   try {
     await api(`/api/trust/${encodeURIComponent(t.id)}`, { method: "DELETE" });
     toast(`${t.name} removed`);
@@ -1413,7 +1790,7 @@ async function loadState() {
   renderFeed();
   renderTasks();
   renderApprovals();
-  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules()]);
+  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools()]);
 }
 
 let events = null;
@@ -1428,6 +1805,10 @@ function connectEvents() {
     else if (msg.type === "audit") loadAudit().catch((err) => toast(err.message, "error"));
     else if (msg.type === "runs") loadRuns().catch((err) => toast(err.message, "error"));
     else if (msg.type === "schedules") loadSchedules().catch((err) => toast(err.message, "error"));
+    else if (msg.type === "tools") {
+      loadTools().catch((err) => toast(err.message, "error"));
+      loadSkills().catch(() => {});
+    }
     else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
     else if (msg.type === "approvals") {
       const before = state.approvals?.length ?? 0;
@@ -1502,9 +1883,6 @@ function init() {
   // Monitors run in the background: refresh the health panel now and then.
   setInterval(() => { if (!document.hidden) loadOps().catch(() => {}); }, 20000);
   $("#run-close").addEventListener("click", () => $("#run-dialog").close());
-  $("#run-dialog").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) $("#run-dialog").close();
-  });
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
   $("#squad-dialog").addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
@@ -1512,17 +1890,44 @@ function init() {
       $("#squad-dialog").close();
     }
   });
-  $("#squad-dialog").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) $("#squad-dialog").close();
-  });
   $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
   $("#squad-form").addEventListener("submit", submitSquad);
-  $("#schedule-open").addEventListener("click", openScheduleDialog);
+  $("#schedule-open").addEventListener("click", () => openScheduleDialog());
   $("#schedule-cancel").addEventListener("click", () => $("#schedule-dialog").close());
   $("#schedule-form").addEventListener("submit", submitSchedule);
-  $("#schedule-dialog").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) $("#schedule-dialog").close();
+  $("#when-repeat").addEventListener("change", syncWhenPicker);
+  for (const id of ["#when-time", "#when-every", "#when-unit", "#when-custom"]) $(id).addEventListener("input", previewWhen);
+  $("#when-days").addEventListener("change", previewWhen);
+  $("#confirm-cancel").addEventListener("click", () => $("#confirm-dialog").close(""));
+  $("#tools-open").addEventListener("click", () => openTools());
+  $("#plan-expand").addEventListener("click", openPlanEditor);
+  $("#plan-editor-close").addEventListener("click", () => $("#plan-editor").close());
+  $("#plan-editor-text").addEventListener("input", onPlanEditorInput);
+  $("#plan-editor-text").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      $("#plan-editor-run").click();
+    }
   });
+  const editorToComposer = () => { $("#composer-input").value = $("#plan-editor-text").value; };
+  // However the editor closes, the plan goes back to the composer.
+  $("#plan-editor").addEventListener("close", () => {
+    editorToComposer();
+    renderPlanExplain();
+    schedulePlanCheck();
+  });
+  $("#plan-editor-run").addEventListener("click", () => {
+    editorToComposer();
+    $("#plan-editor").close();
+    submitComposer();
+  });
+  $("#plan-editor-schedule").addEventListener("click", () => {
+    editorToComposer();
+    $("#plan-editor").close();
+    openScheduleDialog();
+  });
+  for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
+    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", renderMcpOptions);
@@ -1530,15 +1935,12 @@ function init() {
   $("#copy-ticket").addEventListener("click", () => state.me && copy(state.me.ticket, "Ticket"));
   $("#add-peer-btn").addEventListener("click", openAddDialog);
   $("#add-cancel").addEventListener("click", () => $("#add-dialog").close());
-  // Not every browser closes a modal <dialog> on Escape; also close on a backdrop click.
+  // Not every browser closes a modal <dialog> on Escape.
   $("#add-dialog").addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       e.preventDefault();
       $("#add-dialog").close();
     }
-  });
-  $("#add-dialog").addEventListener("click", (e) => {
-    if (e.target === e.currentTarget) $("#add-dialog").close();
   });
   $("#add-dialog").addEventListener("close", () => $("#add-peer-btn").focus());
   $("#add-form").addEventListener("submit", submitAdd);

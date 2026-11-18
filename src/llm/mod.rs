@@ -260,8 +260,18 @@ impl Executor for SdkExecutor {
         }
         let mut task = with_role(self.role.as_deref(), task);
         if !ctx.mcp.is_empty() {
+            // MCP results reach the model as external content: the rule always leads.
             let names: Vec<String> = ctx.mcp.keys().cloned().collect();
-            task.prompt = crate::mcp::prompt_note(&names) + &task.prompt;
+            let body = task
+                .prompt
+                .strip_prefix(crate::boundary::DIRECTIVE)
+                .unwrap_or(&task.prompt)
+                .to_owned();
+            task.prompt = format!(
+                "{}{}{body}",
+                crate::boundary::DIRECTIVE,
+                crate::mcp::prompt_note(&names)
+            );
         }
         let task = &task;
         let run = async {
