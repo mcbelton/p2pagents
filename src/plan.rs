@@ -18,8 +18,9 @@
 //! folder) and `using <provider>` a provider (default: copilot). Options before the
 //! prompt: `verify=a,b` asks the peer's runtime to run those owner-defined checks
 //! after the model (as signed evidence), `attempts=N` retries with the failures,
-//! `claims=C-1` says which claims the step proves and `apply=step` applies that
-//! prerequisite's commit first. `approve @person` (or `@me`) asks a team member to
+//! `claims=C-1` says which claims the step proves, `apply=step` applies that
+//! prerequisite's commit first and `mcp=a,b` lets the model use those MCP servers
+//! of the folder. `approve @person` (or `@me`) asks a team member to
 //! sign off instead of running a model. See [`crate::runs`] for the verdicts.
 
 use std::collections::{BTreeMap, HashMap};
@@ -150,6 +151,9 @@ pub struct Step {
     /// Skills (instructions) put in the prompt (`skill=a,b`).
     #[serde(default)]
     pub skills: Vec<String>,
+    /// MCP servers of the peer's folder the model may use (`mcp=a,b`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
 }
 
 /// A statement the plan must prove with evidence (`claim: ID text`).
@@ -420,7 +424,7 @@ fn parse_step(line: &str) -> Result<Step> {
     };
     let mut provider = Provider::Copilot;
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
-    let (mut context, mut save, mut skills) = (Vec::new(), None, Vec::new());
+    let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     loop {
         match words.peek().copied() {
             Some("using") => {
@@ -449,6 +453,12 @@ fn parse_step(line: &str) -> Result<Step> {
                     "apply" => apply = Some(value.to_owned()).filter(|v| !v.is_empty()),
                     "context" => context = list(value),
                     "skill" | "skills" => skills = list(value),
+                    "mcp" => {
+                        mcp = list(value);
+                        if let Some(bad) = mcp.iter().find(|m| validate_name(m).is_err()) {
+                            bail!("mcp= needs MCP server names, got {bad:?}");
+                        }
+                    }
                     "save" => {
                         validate_name(value)
                             .map_err(|_| anyhow!("save= needs a topic name, got {value:?}"))?;
@@ -480,6 +490,7 @@ fn parse_step(line: &str) -> Result<Step> {
         context,
         save,
         skills,
+        mcp,
     })
 }
 
@@ -617,6 +628,27 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
             "apply= needs edit access in a folder shared with --worktrees; '{folder}' on {} isn't",
             peer.name
         ));
+    }
+    let missing: Vec<&str> = step
+        .mcp
+        .iter()
+        .filter(|m| !share.mcp.contains(m))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "folder '{folder}' on {} offers you no MCP server {} (you may use: {}); its owner adds servers with mcp add",
+            peer.name,
+            missing.join(", "),
+            if share.mcp.is_empty() {
+                "none".into()
+            } else {
+                share.mcp.join(", ")
+            }
+        ));
+    }
+    if !step.mcp.is_empty() && step.provider == Provider::Codex {
+        return Some("mcp= needs copilot or claude; Codex tasks can't use MCP servers".into());
     }
     None
 }
@@ -774,9 +806,11 @@ pub fn choose_peer(
 }
 
 /// The prompt a step runs with: the results of its prerequisites, then its task.
+/// Those results (and any knowledge) are external content: other peers or models
+/// wrote them, so they are wrapped and the prompt starts with the rule for them.
 pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
     if deps.is_empty() {
-        return step.prompt.clone();
+        return crate::boundary::guard(&step.prompt);
     }
     let mut prompt = String::from("Results of the earlier steps this task builds on:\n");
     for (id, peer, output) in deps {
@@ -784,10 +818,13 @@ pub fn step_prompt(step: &Step, deps: &[(&str, &str, &str)]) -> String {
         if output.chars().count() > MAX_DEP_CHARS {
             text += "\n[... truncated]";
         }
-        prompt += &format!("\n### Step {id} (done by {peer})\n{text}\n");
+        prompt += &format!(
+            "\n### Step {id} (done by {peer})\n{}\n",
+            crate::boundary::wrap(&format!("step:{id} peer:{peer}"), &text)
+        );
     }
     prompt += &format!("\n---\nYour task:\n{}", step.prompt);
-    prompt
+    crate::boundary::guard(&prompt)
 }
 
 /// The steps `id` waits for, directly or through others.
@@ -804,6 +841,47 @@ fn ancestors(plan: &Plan, id: &str) -> std::collections::BTreeSet<String> {
         }
     }
     found
+}
+
+/// Checks, runs and records plan `text` as `profile`'s agent, as `/plan` and the web
+/// UI do: preflight, skills and knowledge, the run, its saved evidence record and
+/// the knowledge its verified steps produced. Returns the saved run.
+pub async fn execute(
+    agent: &Agent,
+    profile: &crate::profile::Profile,
+    text: &str,
+    on_update: impl FnMut(&str, &StepState),
+) -> Result<crate::runs::RunRecord> {
+    let plan = Plan::parse(text)?;
+    let kb = profile.knowledge();
+    let skills = profile.skills();
+    let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
+    let errors: Vec<String> = preflight(&plan, &agent.peers(), &squads, &kb, &skills)
+        .into_iter()
+        .filter(|p| p.error)
+        .map(|p| match p.step {
+            Some(step) => format!("step {step}: {}", p.message),
+            None => p.message,
+        })
+        .collect();
+    if !errors.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
+    let ready = plan.prepare(&kb, &skills)?;
+    let started = crate::runs::unix_now();
+    let states = run_plan(agent, &squads, &ready, on_update).await;
+    let mut run = crate::runs::RunRecord::new(
+        agent.name(),
+        &agent.id().to_string(),
+        text,
+        &plan,
+        &states,
+        started,
+    );
+    run.peer_ids = crate::runs::peer_ids(agent);
+    run.save(&profile.runs_dir())?;
+    save_knowledge(&kb, &plan, &states, &run.id);
+    Ok(run)
 }
 
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
@@ -892,6 +970,7 @@ pub async fn run_plan(
                     choose_peer(step, &agent.peers(), squads, &busy).map(|peer| {
                         let mut task = LlmTask::new(step.provider, prompt.clone())
                             .with_checks(step.checks.clone(), step.attempts);
+                        task.mcp = step.mcp.clone();
                         if let Some(share) = &step.share {
                             task = task.in_share(share.clone());
                         }
@@ -943,8 +1022,12 @@ pub async fn run_plan(
                     let result = match (peer_id, task) {
                         (Some(peer), Some(task)) => agent.delegate_verified(peer, task).await,
                         (approver, _) => {
+                            // A person reads it: the rule for models is left out.
+                            let text = prompt
+                                .strip_prefix(crate::boundary::DIRECTIVE)
+                                .unwrap_or(&prompt);
                             agent
-                                .request_approval_with(approver, &title, &prompt, preview)
+                                .request_approval_with(approver, &title, text, preview)
                                 .await
                         }
                     };
@@ -1112,10 +1195,17 @@ mod tests {
         .unwrap();
         let ready = plan.with_knowledge(&kb).unwrap();
         assert!(
-            ready.steps[0]
-                .prompt
-                .contains("### Knowledge: architecture\nThree services.")
+            ready.steps[0].prompt.contains(
+                "### Knowledge: architecture\n<external_content source=\"knowledge:architecture\">\nThree services.\n</external_content>"
+            ),
+            "knowledge is external content: {}",
+            ready.steps[0].prompt
         );
+        assert!(
+            step_prompt(&ready.steps[0], &[]).starts_with(crate::boundary::DIRECTIVE),
+            "and the step runs with the rule for it"
+        );
+        assert_eq!(step_prompt(&ready.steps[1], &[]), "Do it");
         assert!(ready.steps[0].prompt.ends_with("---\nDesign it"));
         assert_eq!(ready.steps[1].prompt, "Do it");
         let missing = Plan::parse("a @x context=nope do").unwrap();
@@ -1209,11 +1299,16 @@ mod tests {
             access,
             checks: checks.iter().map(|c| (*c).to_owned()).collect(),
             worktrees,
+            mcp: if worktrees {
+                vec!["browser".into()]
+            } else {
+                vec![]
+            },
         };
         let peer = |name: &str, shares: Vec<ShareInfo>| PeerInfo {
             name: name.into(),
             id: iroh::SecretKey::generate().public(),
-            capabilities: vec![Provider::Copilot],
+            capabilities: vec![Provider::Copilot, Provider::Codex],
             shares,
             owner: None,
             role: None,
@@ -1242,7 +1337,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let good = "claim: C-1 tests pass\nfix @alice:app verify=test skill=implement-change claims=C-1 Fix it\nok after fix approve @me claims=C-1 Approve";
+        let good = "claim: C-1 tests pass\nfix @alice:app verify=test skill=implement-change claims=C-1 Fix it\nok after fix approve @me claims=C-1 Approve\nlook @alice:app mcp=browser Open the app";
         assert!(check(good).is_empty(), "{:?}", check(good));
         let spec_on_bob = "s @bob:app verify=spec:spec,spec:trace skill=write-spec Write the spec";
         assert!(
@@ -1253,7 +1348,8 @@ mod tests {
 
         let bad = check(
             "a @zed do\nb @alice:web do\nc @alice:app verify=lint do\nd @bob:app verify=test do\n\
-             e after c #qa:app apply=c do\nf #ops do\ng @me do\nh @alice:app skill=nope context=gone do",
+             e after c #qa:app apply=c do\nf #ops do\ng @me do\nh @alice:app skill=nope context=gone do\n\
+             i @bob:app mcp=browser do\nj @alice:app using codex mcp=browser do",
         );
         let expect = [
             "E a: zed is not connected",
@@ -1265,6 +1361,8 @@ mod tests {
             "E g: @me can only approve",
             "E h: there is no skill 'nope'",
             "E h: the knowledge base has no topic 'gone'",
+            "E i: folder 'app' on bob offers you no MCP server browser (you may use: none)",
+            "E j: mcp= needs copilot or claude",
         ];
         for e in expect {
             assert!(

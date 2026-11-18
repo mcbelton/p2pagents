@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,14 +9,15 @@ use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::SandboxConfig;
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::types::{
-    MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId, SessionConfig,
-    SessionId,
+    McpHttpServerConfig, McpServerConfig, McpStdioServerConfig, MessageOptions,
+    PermissionRequestData, PermissionRequestKind, RequestId, SessionConfig, SessionId,
 };
 use github_copilot_sdk::{Client, ClientOptions};
 use serde_json::{Value, json};
 
 use super::policy::{Workspace, home_secret_paths};
 use super::{Access, LlmTask};
+use crate::mcp::McpServer;
 use crate::profile::{
     CopilotCredentials, DEFAULT_GITHUB_HOST, INHERITED_CREDENTIAL_VARS, github_login,
 };
@@ -175,8 +177,15 @@ impl CopilotBackend {
         let _ = self.client.stop().await;
     }
 
-    /// Runs `task` in `workspace` with `access` (tools, permissions and sandbox follow it).
-    pub async fn run(&self, task: &LlmTask, access: Access, workspace: &Path) -> Result<String> {
+    /// Runs `task` in `workspace` with `access` (tools, permissions and sandbox follow
+    /// it) and the MCP servers `mcp`.
+    pub async fn run(
+        &self,
+        task: &LlmTask,
+        access: Access,
+        workspace: &Path,
+        mcp: &BTreeMap<String, McpServer>,
+    ) -> Result<String> {
         let access = match (&self.sandbox, access) {
             (SandboxSupport::Unsupported(reason), Access::Full) => {
                 eprintln!(
@@ -190,11 +199,20 @@ impl CopilotBackend {
             access,
             workspace: Workspace::new(workspace)
                 .with_context(|| format!("opening workspace {}", workspace.display()))?,
+            mcp: mcp.clone(),
         };
+        let mut tools: Vec<String> = available_tools(access)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        tools.extend(mcp_tool_allowlist(mcp));
         let mut config = SessionConfig::default()
             .with_working_directory(workspace.to_path_buf())
-            .with_available_tools(available_tools(access))
+            .with_available_tools(tools)
             .with_permission_handler(Arc::new(policy));
+        if !mcp.is_empty() {
+            config = config.with_mcp_servers(mcp_servers(mcp));
+        }
         if access == Access::Full {
             config = config.with_sandbox_config(sandbox_config(self.sandbox.denied_paths()));
         }
@@ -260,9 +278,95 @@ pub fn find_copilot_cli() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("Copilot CLI not found; install it or set COPILOT_CLI_PATH"))
 }
 
+/// Copilot's name for the task's MCP server `name`. Copilot names MCP tools
+/// `<server>-<tool>` and a bare server name in the tool allowlist offers all of its
+/// tools, so the prefix keeps a server from ever being taken for a built-in tool.
+fn session_server(name: &str) -> String {
+    format!("mcp-{name}")
+}
+
+/// The task's MCP tools for Copilot's tool allowlist: each allowed tool, or the
+/// whole server when the owner allows all of its tools.
+pub(crate) fn mcp_tool_allowlist(mcp: &BTreeMap<String, McpServer>) -> Vec<String> {
+    mcp.iter()
+        .flat_map(|(name, s)| {
+            let server = session_server(name);
+            if s.tools.is_empty() {
+                vec![server]
+            } else {
+                s.tools.iter().map(|t| format!("{server}-{t}")).collect()
+            }
+        })
+        .collect()
+}
+
+/// The task's MCP servers in the Copilot SDK's form; each exposes only its allowed tools.
+pub(crate) fn mcp_servers(
+    mcp: &BTreeMap<String, McpServer>,
+) -> github_copilot_sdk::IndexMap<String, McpServerConfig> {
+    mcp.iter()
+        .filter_map(|(name, s)| {
+            let tools = Some(if s.tools.is_empty() {
+                vec!["*".to_owned()]
+            } else {
+                s.tools.clone()
+            });
+            let config = match (&s.command, &s.url) {
+                (Some(command), _) => McpServerConfig::Stdio(McpStdioServerConfig {
+                    tools,
+                    command: command.clone(),
+                    args: s.args.clone(),
+                    env: s.env.clone().into_iter().collect(),
+                    ..Default::default()
+                }),
+                (_, Some(url)) => {
+                    let http = McpHttpServerConfig {
+                        tools,
+                        url: url.clone(),
+                        headers: s.headers.clone().into_iter().collect(),
+                        ..Default::default()
+                    };
+                    if s.sse {
+                        McpServerConfig::Sse(http)
+                    } else {
+                        McpServerConfig::Http(http)
+                    }
+                }
+                _ => return None,
+            };
+            Some((session_server(name), config))
+        })
+        .collect()
+}
+
 struct AccessPolicy {
     access: Access,
     workspace: Workspace,
+    mcp: BTreeMap<String, McpServer>,
+}
+
+/// Why Copilot's MCP tool call `req` is refused, or `None` to approve: only the
+/// task's servers, and only the tools the owner allows on each.
+pub(crate) fn mcp_refusal(mcp: &BTreeMap<String, McpServer>, req: &Value) -> Option<String> {
+    if mcp.is_empty() {
+        return Some("MCP tools are disabled for tasks".into());
+    }
+    let session_name = req["serverName"].as_str().unwrap_or_default();
+    let name = req["toolName"].as_str().unwrap_or_default();
+    let tool = name
+        .strip_prefix(session_name)
+        .and_then(|t| t.strip_prefix('-'))
+        .unwrap_or(name);
+    let server = session_name.strip_prefix("mcp-").unwrap_or_default();
+    match mcp.get(server) {
+        None => Some(format!(
+            "{session_name:?} is not an MCP server this task may use"
+        )),
+        Some(s) if !s.allows_tool(tool) => Some(format!(
+            "{tool:?} is not one of the tools the owner allows on MCP server {server}"
+        )),
+        Some(_) => None,
+    }
 }
 
 /// String values of `key` in a permission request (string, array or map values).
@@ -366,6 +470,8 @@ impl PermissionHandler for AccessPolicy {
         }
         let reason = if data.managed_approval_required == Some(true) {
             Some("managed policy requires a human decision".into())
+        } else if data.kind == Some(PermissionRequestKind::Mcp) {
+            mcp_refusal(&self.mcp, &req)
         } else {
             refusal(self.access, &self.workspace, data.kind.as_ref(), &req)
         };
@@ -484,6 +590,43 @@ mod tests {
             assert!(refusal(Access::Full, &ws, Some(&kind), &json!({})).is_some());
         }
         assert!(refusal(Access::Full, &ws, None, &json!({})).is_some());
+    }
+
+    #[test]
+    fn mcp_calls_only_reach_the_tasks_servers_and_allowed_tools() {
+        let mut browser = McpServer::local("npx", vec!["@playwright/mcp".into()]);
+        browser.tools = vec!["browser_snapshot".into()];
+        browser.env.insert("TOKEN".into(), "t".into());
+        let docs = McpServer::remote("https://docs.example.com/mcp", true);
+        let mcp = BTreeMap::from([("browser".to_owned(), browser), ("docs".to_owned(), docs)]);
+        // As Copilot sends them: the session's server name and `<server>-<tool>`.
+        let call = |server: &str, tool: &str| json!({ "kind": "mcp", "serverName": format!("mcp-{server}"), "toolName": format!("mcp-{server}-{tool}"), "toolTitle": tool });
+        assert_eq!(
+            mcp_refusal(&mcp, &call("browser", "browser_snapshot")),
+            None
+        );
+        assert_eq!(mcp_refusal(&mcp, &call("docs", "search")), None);
+        assert!(mcp_refusal(&mcp, &call("browser", "browser_evaluate")).is_some());
+        assert!(mcp_refusal(&mcp, &call("github", "get_me")).is_some());
+        let unprefixed = json!({ "kind": "mcp", "serverName": "docs", "toolName": "docs-search" });
+        assert!(
+            mcp_refusal(&mcp, &unprefixed).is_some(),
+            "not a server of this task"
+        );
+        assert!(mcp_refusal(&mcp, &json!({ "kind": "mcp" })).is_some());
+        assert!(mcp_refusal(&BTreeMap::new(), &call("docs", "search")).is_some());
+
+        assert_eq!(
+            mcp_tool_allowlist(&mcp),
+            ["mcp-browser-browser_snapshot", "mcp-docs"],
+            "one tool, or all of a server's tools; never a built-in tool's name"
+        );
+        let config = serde_json::to_value(mcp_servers(&mcp)).unwrap();
+        assert_eq!(config["mcp-browser"]["type"], "stdio");
+        assert_eq!(config["mcp-browser"]["tools"], json!(["browser_snapshot"]));
+        assert_eq!(config["mcp-browser"]["env"]["TOKEN"], "t");
+        assert_eq!(config["mcp-docs"]["type"], "sse");
+        assert_eq!(config["mcp-docs"]["tools"], json!(["*"]));
     }
 
     #[test]

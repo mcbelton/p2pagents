@@ -116,6 +116,11 @@
               <span>Folder</span>
               <select id="share"></select>
             </label>
+            <div class="field-inline" id="mcp-field" role="group" aria-labelledby="mcp-label" hidden
+                 title="MCP servers the folder's owner lets your tasks use there; their results are treated as untrusted data">
+              <span id="mcp-label">MCP</span>
+              <span id="mcp-options" class="mcp-options"></span>
+            </div>
           </div>
           <div class="task-opts" id="playbook-opts" hidden>
             <label class="field-inline">
@@ -123,6 +128,8 @@
               <select id="playbook"><option value="">Write your own…</option></select>
             </label>
             <button type="button" class="btn small" id="playbook-use">Use</button>
+            <button type="button" class="btn small" id="schedule-open"
+                    title="Run this plan on its own at set times (e.g. weekdays 09:00)">Schedule…</button>
           </div>
         </div>
         <div id="plan-explain" class="plan-explain" role="region" aria-label="What this plan does" hidden></div>
@@ -173,6 +180,14 @@
           <p class="muted small">Instructions agents follow in plan steps (<span class="mono">skill=name</span>). Add or replace with <span class="mono">p2pagents skill add</span>.</p>
           <ul class="kb-list" id="skill-list"></ul>
         </details>
+      </section>
+      <section class="runs-panel" aria-labelledby="schedules-h">
+        <div class="card-head panel-head">
+          <h2 id="schedules-h">Schedules</h2>
+          <span class="count" id="schedules-count">0</span>
+        </div>
+        <p class="muted small">Plans this agent runs on its own at set times, while it runs. Each run is an evidence run; a run never overlaps the previous one.</p>
+        <ol class="task-list" id="schedule-list"></ol>
       </section>
       <section class="runs-panel" aria-labelledby="runs-h">
         <div class="card-head panel-head">
@@ -231,6 +246,33 @@
       <div class="dialog-actions">
         <button type="button" class="btn" id="add-cancel">Cancel</button>
         <button type="submit" class="btn primary" id="add-submit">Add peer</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="schedule-dialog" aria-labelledby="schedule-h">
+    <form method="dialog" id="schedule-form" novalidate>
+      <h2 id="schedule-h">Schedule this plan</h2>
+      <p class="muted small">This agent runs the plan in the editor on its own at these times, while it runs. Each run is saved under Evidence runs.</p>
+      <label class="field">
+        <span>Name</span>
+        <input id="schedule-name" type="text" maxlength="64" spellcheck="false" placeholder="e.g. nightly-learn">
+      </label>
+      <label class="field">
+        <span>When (local time)</span>
+        <input id="schedule-when" type="text" list="schedule-when-examples" spellcheck="false" placeholder="e.g. weekdays 09:00">
+        <span class="muted small">every 30m · every 2h · daily 09:00 · weekdays 08:30 · mon,fri 17:00</span>
+      </label>
+      <datalist id="schedule-when-examples">
+        <option value="every 1h"></option>
+        <option value="daily 09:00"></option>
+        <option value="weekdays 08:30"></option>
+        <option value="mon,wed,fri 17:00"></option>
+      </datalist>
+      <p class="form-error" id="schedule-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="schedule-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Schedule</button>
       </div>
     </form>
   </dialog>

@@ -436,7 +436,9 @@ async fn ui_runs_plans_and_shows_squads() {
     assert_eq!(step("sum")["after"][0], "find");
     let sum = step("sum")["output"].as_str().unwrap().to_owned();
     assert!(
-        sum.contains("### Step find (done by worker)\necho: find the facts"),
+        sum.contains(
+            "### Step find (done by worker)\n<external_content source=\"step:find peer:worker\">\necho: find the facts\n</external_content>"
+        ),
         "{sum}"
     );
     assert_eq!(step("find")["evidence"], "verified", "signed by the worker");
@@ -531,6 +533,64 @@ async fn ui_runs_plans_and_shows_squads() {
     );
     let missing = request(port, "GET", "/api/runs/nope", &host, Some(token), None).await;
     assert_eq!(missing.status, 404);
+
+    // Scheduled plans: added here, run on request as evidence runs, paused, deleted.
+    let schedule = |when: &str| {
+        serde_json::json!({ "name": "nightly", "when": when, "plan": "find @worker find the facts" })
+            .to_string()
+    };
+    let too_often = post("/api/schedules", schedule("every 1m")).await;
+    assert_eq!(too_often.status, 400, "{}", too_often.body);
+    let added = post("/api/schedules", schedule("daily 02:00")).await;
+    assert_eq!(added.status, 200, "{}", added.body);
+    let added = added.json();
+    assert_eq!(added["schedules"][0]["enabled"], true);
+    assert!(added["schedules"][0]["next_unix"].as_i64().is_some());
+    let ran = post("/api/schedules/nightly/run", String::new()).await;
+    assert_eq!(ran.status, 200, "{}", ran.body);
+    let last = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let listed = request(port, "GET", "/api/schedules", &host, Some(token), None)
+                .await
+                .json();
+            let last = listed["schedules"][0]["last_result"].clone();
+            if last.as_str().is_some_and(|l| l != "running") {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("scheduled run finished");
+    assert!(last.as_str().unwrap().contains("1/1 steps done"), "{last}");
+    assert_eq!(
+        runs().await.len(),
+        3,
+        "the scheduled run is an evidence run"
+    );
+    let paused = request(
+        port,
+        "PATCH",
+        "/api/schedules/nightly",
+        &host,
+        Some(token),
+        Some(r#"{"enabled":false}"#),
+    )
+    .await
+    .json();
+    assert_eq!(paused["schedules"][0]["enabled"], false);
+    assert!(paused["schedules"][0]["next_unix"].is_null());
+    let deleted = request(
+        port,
+        "DELETE",
+        "/api/schedules/nightly",
+        &host,
+        Some(token),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(deleted["schedules"], serde_json::json!([]));
 
     let removed = request(port, "DELETE", "/api/squads/qa", &host, Some(token), None).await;
     assert_eq!(removed.status, 200);
@@ -652,7 +712,8 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             "learn",
             "spec",
             "design",
-            "implement-spec"
+            "implement-spec",
+            "rehearse"
         ]
     );
     let discover = &books["playbooks"][1]["outline"];
@@ -781,6 +842,11 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
             false,
         )
         .unwrap();
+    let mut browser = p2pagents::mcp::McpServer::local("npx", vec!["@playwright/mcp".into()]);
+    browser
+        .env
+        .insert("API_TOKEN".into(), "mcp-secret-6620".into());
+    shares.add_mcp("app", "browser", browser).unwrap();
     let mut config = AgentConfig::new("solo", SecretKey::generate());
     config.network = Network::Local;
     config.bind = Some("127.0.0.1:0".parse().unwrap());
@@ -812,6 +878,9 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
     let state = request(port, "GET", "/api/state", &host, Some(token), None)
         .await
         .json();
+    // The owner's UI lists the folder's MCP servers, never their secret values.
+    assert_eq!(state["me"]["shares"][1]["mcp"][0]["name"], "browser");
+    assert!(!state.to_string().contains("mcp-secret-6620"));
     let marked: Vec<(String, Value)> = state["me"]["shares"]
         .as_array()
         .unwrap()

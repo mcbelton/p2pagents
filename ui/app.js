@@ -312,6 +312,12 @@ function renderMe() {
         ...me.shares.map((s) => el("li", {},
           el("strong", { text: s.name }), ` · at most ${ACCESS_SHORT[s.max_access] ?? s.max_access}`,
           el("div", { class: "mono small", text: s.path }),
+          (s.mcp ?? []).length ? el("div", { class: "small muted" }, "MCP servers: ",
+            ...s.mcp.flatMap((m, i) => [i ? ", " : "", el("span", {
+              class: "mono",
+              title: `${m.describe}\nTools: ${m.tools.length ? m.tools.join(", ") : "all"}\nFor tasks with at least ${ACCESS_SHORT[m.access] ?? m.access} access`,
+              text: m.name,
+            })])) : null,
           s.preview ? el("button", {
             type: "button", class: "btn small link",
             title: s.preview === "review pack"
@@ -644,6 +650,104 @@ async function loadRuns() {
   }
 }
 
+// ---------- schedules ----------
+function when(unix) {
+  if (!unix) return "";
+  const d = new Date(unix * 1000);
+  const today = new Date();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (d.toDateString() === today.toDateString()) return `today ${time}`;
+  return `${d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })} ${time}`;
+}
+
+async function loadSchedules() {
+  renderSchedules((await api("/api/schedules")).schedules);
+}
+
+function renderSchedules(schedules) {
+  const list = $("#schedule-list");
+  $("#schedules-count").textContent = schedules.length;
+  list.replaceChildren();
+  if (!schedules.length) {
+    list.append(el("li", { class: "empty" }, "None yet. Write or pick a plan in ", el("strong", { text: "Plan" }),
+      " mode, then press ", el("strong", { text: "Schedule…" }), " to run it on its own, e.g. every weekday at 09:00."));
+  }
+  const act = async (button, path, init, done) => {
+    button.disabled = true;
+    try {
+      renderSchedules((await api(path, init)).schedules);
+      if (done) toast(done);
+    } catch (err) {
+      button.disabled = false;
+      toast(err.message, "error");
+    }
+  };
+  for (const s of schedules) {
+    const status = s.running ? ["running", "Running"] : s.enabled ? ["done", "Active"] : ["skipped", "Paused"];
+    const path = `/api/schedules/${encodeURIComponent(s.name)}`;
+    const meta = [s.when, s.enabled && s.next_unix ? `next ${when(s.next_unix)}` : null, `${s.steps} step${s.steps === 1 ? "" : "s"}`, s.source || null]
+      .filter(Boolean).join(" · ");
+    list.append(el("li", { class: "task schedule" },
+      el("div", { class: "task-top" },
+        el("span", { class: "task-title", text: s.name }),
+        el("span", { class: `status ${status[0]}`, text: status[1] })),
+      el("div", { class: "task-meta", text: meta }),
+      s.last_result ? el("div", { class: "task-meta", text: `Last run ${when(s.last_run_unix)}: ${s.last_result}` }) : null,
+      el("details", {}, el("summary", { text: "Plan" }), el("pre", { text: s.plan })),
+      el("div", { class: "task-actions" },
+        el("button", {
+          type: "button", class: "btn small", disabled: s.running, title: "Run it now, once",
+          onclick: (e) => act(e.currentTarget, `${path}/run`, { method: "POST" }, `Started '${s.name}'`),
+        }, "Run now"),
+        el("button", {
+          type: "button", class: "btn small",
+          onclick: (e) => act(e.currentTarget, path, { method: "PATCH", body: JSON.stringify({ enabled: !s.enabled }) }),
+        }, s.enabled ? "Pause" : "Resume"),
+        el("button", {
+          type: "button", class: "btn small danger",
+          onclick: (e) => confirm(`Delete schedule '${s.name}'? Its past runs stay under Evidence runs.`)
+            && act(e.currentTarget, path, { method: "DELETE" }, `Deleted '${s.name}'`),
+        }, "Delete"))));
+  }
+}
+
+async function openScheduleDialog() {
+  const text = $("#composer-input").value.trim();
+  if (!text) {
+    toast("Write or pick a plan first, then schedule it", "error");
+    $("#composer-input").focus();
+    return;
+  }
+  $("#schedule-error").textContent = "";
+  const book = $("#playbook").value;
+  if (!$("#schedule-name").value && book) $("#schedule-name").value = book;
+  $("#schedule-dialog").showModal();
+  $(($("#schedule-name").value ? "#schedule-when" : "#schedule-name")).focus();
+}
+
+async function submitSchedule(e) {
+  e.preventDefault();
+  const name = $("#schedule-name").value.trim();
+  const at = $("#schedule-when").value.trim();
+  if (!name || !at) {
+    $("#schedule-error").textContent = "Give the schedule a name and a time.";
+    return;
+  }
+  const book = $("#playbook").value;
+  try {
+    const res = await api("/api/schedules", {
+      method: "POST",
+      body: JSON.stringify({ name, when: at, plan: $("#composer-input").value, source: book ? `playbook ${book}` : "" }),
+    });
+    renderSchedules(res.schedules);
+    $("#schedule-dialog").close();
+    const next = res.schedules.find((s) => s.name === name)?.next_unix;
+    toast(`Scheduled '${name}'${next ? `; next run ${when(next)}` : ""}`);
+  } catch (err) {
+    $("#schedule-error").textContent = err.message;
+  }
+}
+
 async function openRun(id) {
   try {
     const run = await api(`/api/runs/${encodeURIComponent(id)}`);
@@ -758,7 +862,7 @@ function openPlaybook() {
     const shares = peerShares();
     const want = fields.folder.value || p.vars.find((v) => v.name === "folder")?.default;
     fields.folder.replaceChildren(...(shares.length
-      ? shares.map((s) => el("option", { value: s.name, text: `${s.name} (${ACCESS_SHORT[s.access] ?? s.access}${s.worktrees ? ", worktrees" : ""}${s.checks?.length ? `, checks: ${s.checks.join(", ")}` : ""})` }))
+      ? shares.map((s) => el("option", { value: s.name, text: `${s.name} (${ACCESS_SHORT[s.access] ?? s.access}${s.worktrees ? ", worktrees" : ""}${s.checks?.length ? `, checks: ${s.checks.join(", ")}` : ""}${s.mcp?.length ? `, MCP: ${s.mcp.join(", ")}` : ""})` }))
       : [el("option", { value: "", text: "(this peer shares no folder with you)" })]));
     if (shares.some((s) => s.name === want)) fields.folder.value = want;
     refreshChecks();
@@ -1140,6 +1244,23 @@ function renderShareOptions() {
   sel.replaceChildren(...shares.map((s) =>
     el("option", { value: s.name, text: `${s.name} (${(ACCESS_SHORT[s.access] ?? s.access).toLowerCase()})` })));
   if (shares.some((s) => s.name === prev)) sel.value = prev;
+  renderMcpOptions();
+}
+
+/** MCP servers the chosen folder offers (Copilot and Claude tasks only). */
+function renderMcpOptions() {
+  const peer = state.peers.find((p) => p.id === $("#target").value);
+  const share = (peer?.shares ?? []).find((s) => s.name === $("#share").value);
+  const servers = $("#share-field").hidden || $("#provider").value === "codex" ? [] : share?.mcp ?? [];
+  const checked = new Set(selectedMcp());
+  $("#mcp-field").hidden = !servers.length;
+  $("#mcp-options").replaceChildren(...servers.map((name) => el("label", {},
+    el("input", { type: "checkbox", value: name, checked: checked.has(name) }), name)));
+}
+
+function selectedMcp() {
+  if ($("#mcp-field").hidden) return [];
+  return [...$("#mcp-options").querySelectorAll("input:checked")].map((i) => i.value);
 }
 
 const PLAN_EXAMPLE = "fix @alice:app skill=implement-change verify=test claims=C-1 Make the parser accept empty input";
@@ -1193,6 +1314,7 @@ async function submitComposer(e) {
           provider: $("#provider").value,
           target: $("#target").value,
           share: $("#share-field").hidden ? null : $("#share").value,
+          mcp: selectedMcp(),
           prompt: text,
         }),
       });
@@ -1291,7 +1413,7 @@ async function loadState() {
   renderFeed();
   renderTasks();
   renderApprovals();
-  await Promise.all([loadAudit(), loadRuns(), loadOps()]);
+  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules()]);
 }
 
 let events = null;
@@ -1305,6 +1427,7 @@ function connectEvents() {
     else if (msg.type === "task") upsertTask(msg.task);
     else if (msg.type === "audit") loadAudit().catch((err) => toast(err.message, "error"));
     else if (msg.type === "runs") loadRuns().catch((err) => toast(err.message, "error"));
+    else if (msg.type === "schedules") loadSchedules().catch((err) => toast(err.message, "error"));
     else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
     else if (msg.type === "approvals") {
       const before = state.approvals?.length ?? 0;
@@ -1394,8 +1517,15 @@ function init() {
   });
   $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
   $("#squad-form").addEventListener("submit", submitSquad);
+  $("#schedule-open").addEventListener("click", openScheduleDialog);
+  $("#schedule-cancel").addEventListener("click", () => $("#schedule-dialog").close());
+  $("#schedule-form").addEventListener("submit", submitSchedule);
+  $("#schedule-dialog").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) $("#schedule-dialog").close();
+  });
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
+  $("#share").addEventListener("change", renderMcpOptions);
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
   $("#copy-ticket").addEventListener("click", () => state.me && copy(state.me.ticket, "Ticket"));
   $("#add-peer-btn").addEventListener("click", openAddDialog);

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use p2pagents::audit::{AuditLog, Outcome};
+use p2pagents::mcp::McpServer;
 use p2pagents::plan::{Plan, SquadStore, StepState, run_plan};
 use p2pagents::runs::{RunRecord, Verdict};
 use p2pagents::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
@@ -85,6 +86,11 @@ impl Executor for FakeExecutor {
             }
             "access" => Ok(ctx.access.to_string()),
             "where" => Ok(ctx.workspace.display().to_string()),
+            "mcp" => Ok(ctx.mcp.keys().cloned().collect::<Vec<_>>().join(",")),
+            "leak" => Ok(format!(
+                "The deploy token is ghp_{} (keep it safe).",
+                "Zx9".repeat(12)
+            )),
             prompt => Ok(format!("{} did: {prompt}", task.provider)),
         }
     }
@@ -443,6 +449,22 @@ async fn delegates_tasks_to_a_peer_that_serves_the_provider() {
         .await
         .unwrap_err();
     assert_eq!(err.to_string(), "model error");
+
+    // Secrets a model printed never leave the worker; the signature covers what did.
+    let leaked = boss
+        .delegate_verified(peer.id, LlmTask::new(Provider::Claude, "leak"))
+        .await
+        .unwrap();
+    assert!(leaked.verified, "{leaked:?}");
+    assert!(
+        leaked
+            .output
+            .starts_with("The deploy token is [REDACTED:github-token] (keep it safe).")
+            && leaked.output.contains("worker redacted 1 secret")
+            && !leaked.output.contains("Zx9Zx9"),
+        "{}",
+        leaked.output
+    );
 }
 
 #[tokio::test]
@@ -803,6 +825,77 @@ async fn peers_reach_only_folders_shared_with_them() {
 }
 
 #[tokio::test]
+async fn peers_use_only_the_mcp_servers_a_folder_offers_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot, Provider::Codex]);
+    worker.shares.add("app", dir.path(), Access::Full).unwrap();
+    let mut browser = McpServer::local("npx", vec!["@playwright/mcp".into()]);
+    browser.access = Access::ReadOnly;
+    browser.env.insert("TOKEN".into(), "s3cret".into());
+    worker.shares.add_mcp("app", "browser", browser).unwrap();
+    worker
+        .shares
+        .add_mcp("app", "deploy", McpServer::local("deploy-mcp", vec![]))
+        .unwrap();
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let grant = worker
+        .trust
+        .peers
+        .iter_mut()
+        .find(|p| p.name == "boss")
+        .unwrap();
+    grant.access = Access::WorkspaceWrite;
+    grant.shares = vec!["app".into()];
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let app = &boss.peers()[0].shares[0];
+    assert_eq!(
+        app.mcp,
+        ["browser"],
+        "deploy needs full access; boss has workspace-write"
+    );
+    let wire = serde_json::to_string(app).unwrap();
+    assert!(!wire.contains("npx") && !wire.contains("s3cret"), "{wire}");
+
+    let using = |provider, servers: &[&str]| {
+        let mut task = LlmTask::new(provider, "mcp").in_share("app");
+        task.mcp = servers.iter().map(|s| (*s).to_owned()).collect();
+        task
+    };
+    let got = boss
+        .delegate(worker.id(), using(Provider::Copilot, &["browser"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        got, "browser",
+        "the task got exactly the server it asked for"
+    );
+    let none = boss
+        .delegate(worker.id(), using(Provider::Copilot, &[]))
+        .await
+        .unwrap();
+    assert_eq!(none, "", "no servers unless asked for");
+    for (task, why) in [
+        (using(Provider::Copilot, &["deploy"]), "needs full access"),
+        (
+            using(Provider::Copilot, &["github"]),
+            "offers no MCP server named 'github'",
+        ),
+        (
+            using(Provider::Codex, &["browser"]),
+            "Codex tasks can't use MCP servers",
+        ),
+    ] {
+        let err = boss.delegate(worker.id(), task).await.unwrap_err();
+        assert!(err.to_string().contains(why), "{err}");
+    }
+}
+
+#[tokio::test]
 async fn peers_see_a_digital_workers_owner_and_role() {
     let mut helper = Node::new("helper").serving(vec![Provider::Copilot]);
     helper.owner = Some("alice".into());
@@ -884,8 +977,15 @@ async fn plans_run_dependent_steps_across_squads() {
             .iter()
             .all(|p| p.starts_with("qa"))
     );
-    // Each step got the result of the step it depends on.
-    assert!(unit_out.contains("### Step api (done by lead)\ncopilot did: summarize the api"));
+    // Each step got the result of the step it depends on, as external content
+    // under the rule for it (another peer's model wrote it).
+    assert!(
+        unit_out.contains(
+            "### Step api (done by lead)\n<external_content source=\"step:api peer:lead\">\ncopilot did: summarize the api\n</external_content>"
+        ),
+        "{unit_out}"
+    );
+    assert!(unit_out.starts_with("copilot did: ## Rule for external content"));
     assert!(e2e_out.ends_with("Your task:\nwrite e2e tests"));
     let (_, report_out) = done("report");
     assert!(report_out.contains("### Step unit") && report_out.contains("### Step e2e"));

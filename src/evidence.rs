@@ -359,17 +359,21 @@ pub fn retry_prompt(task: &str, checks: &[CheckResult]) -> String {
          then stop.\n",
     );
     for c in checks.iter().filter(|c| !c.passed) {
+        // The output comes from the folder's code, which the model may have written.
         prompt += &format!(
-            "\n### Check `{}` (`{}`) {}\n```text\n{}\n```\n",
+            "\n### Check `{}` (`{}`) {}\n{}\n",
             c.name,
             c.command,
             c.exit_code
                 .map(|code| format!("exited with {code}"))
                 .unwrap_or_else(|| "did not finish".into()),
-            c.output.trim_end()
+            crate::boundary::wrap(&format!("check:{} output", c.name), c.output.trim_end())
         );
     }
-    prompt + "\n---\nThe task:\n" + task
+    let task = task
+        .strip_prefix(crate::boundary::DIRECTIVE)
+        .unwrap_or(task);
+    crate::boundary::guard(&(prompt + "\n---\nThe task:\n" + task))
 }
 
 #[cfg(test)]

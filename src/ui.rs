@@ -8,9 +8,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -102,6 +102,7 @@ struct Shared {
     squads: Mutex<SquadStore>,
     tx: broadcast::Sender<String>,
     previews: crate::preview::Previews,
+    scheduler: std::sync::OnceLock<crate::schedule::Scheduler>,
 }
 
 type AppState = Arc<Shared>;
@@ -252,6 +253,19 @@ impl Shared {
                 } else {
                     Value::Null
                 };
+                // The owner's UI shows MCP servers without their secret values.
+                v["mcp"] = json!(
+                    share
+                        .mcp
+                        .iter()
+                        .map(|(name, s)| json!({
+                            "name": name,
+                            "access": s.access,
+                            "tools": s.tools,
+                            "describe": s.describe(),
+                        }))
+                        .collect::<Vec<_>>()
+                );
                 v
             })
             .collect();
@@ -313,7 +327,9 @@ pub async fn start(
         next_task_id: AtomicU64::new(1),
         tx,
         previews: crate::preview::Previews::default(),
+        scheduler: std::sync::OnceLock::new(),
     });
+    start_scheduler(&shared);
 
     let pump = shared.clone();
     tokio::spawn(async move {
@@ -391,6 +407,12 @@ pub async fn start(
         .route("/api/tasks/{id}", delete(cancel_task))
         .route("/api/audit", get(audit))
         .route("/api/plans", post(create_plan))
+        .route("/api/schedules", get(list_schedules).post(add_schedule))
+        .route(
+            "/api/schedules/{name}",
+            delete(remove_schedule).patch(toggle_schedule),
+        )
+        .route("/api/schedules/{name}/run", post(run_schedule))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/previews", post(create_preview))
@@ -664,6 +686,9 @@ struct TaskBody {
     target: String,
     /// For peers: the shared folder to run in (default: their `data` folder).
     share: Option<String>,
+    /// For peers: MCP servers of that folder the model may use.
+    #[serde(default)]
+    mcp: Vec<String>,
 }
 
 async fn create_task(
@@ -675,6 +700,9 @@ async fn create_task(
         return Err(bad_request("prompt is empty"));
     }
     let mut task = LlmTask::new(body.provider, prompt.clone());
+    if body.target != "local" {
+        task.mcp = body.mcp;
+    }
     if let Some(share) = body
         .share
         .filter(|s| !s.is_empty() && body.target != "local")
@@ -741,10 +769,7 @@ async fn create_task(
         let mut evidence = None;
         let result = match route {
             Route::Local(executor) => {
-                let ctx = TaskContext {
-                    access: shared.info.access,
-                    workspace: shared.info.workspace.clone(),
-                };
+                let ctx = TaskContext::new(shared.info.access, shared.info.workspace.clone());
                 executor.execute(&task, &ctx).await
             }
             Route::Peer(peer, _) => match shared.agent.delegate_verified(peer, task).await {
@@ -840,7 +865,22 @@ async fn create_plan(
     State(s): State<AppState>,
     Json(body): Json<PlanBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let plan = Plan::parse(&body.text).map_err(|e| bad_request(format!("{e:#}")))?;
+    let started = start_plan(&s, body.text).map_err(bad_request)?;
+    Ok(Json(
+        json!({ "plan": started.plan, "steps": started.steps }),
+    ))
+}
+
+/// A plan started by [`start_plan`].
+struct StartedPlan {
+    plan: u64,
+    steps: HashMap<String, u64>,
+    /// The saved run's verdict line, when the plan ends.
+    done: tokio::task::JoinHandle<String>,
+}
+
+fn start_plan(s: &AppState, text: String) -> Result<StartedPlan, String> {
+    let plan = Plan::parse(&text).map_err(|e| format!("{e:#}"))?;
     let kb = s.info.profile.knowledge();
     let skills = s.info.profile.skills();
     let squads_now = s.squads.lock().unwrap().clone();
@@ -854,14 +894,9 @@ async fn create_plan(
             })
             .collect();
     if !errors.is_empty() {
-        return Err(bad_request(format!(
-            "the plan was not started:\n{}",
-            errors.join("\n")
-        )));
+        return Err(format!("the plan was not started:\n{}", errors.join("\n")));
     }
-    let ready = plan
-        .prepare(&kb, &skills)
-        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let ready = plan.prepare(&kb, &skills).map_err(|e| format!("{e:#}"))?;
     let plan_id = s.next_task_id.fetch_add(1, Ordering::Relaxed);
     let mut ids = HashMap::new();
     for step in &plan.steps {
@@ -897,7 +932,6 @@ async fn create_plan(
     let squads = s.squads.lock().unwrap().clone();
     let shared = s.clone();
     let step_ids = ids.clone();
-    let text = body.text.clone();
     let handle = tokio::spawn(async move {
         let started = crate::runs::unix_now();
         let states = run_plan(&shared.agent.clone(), &squads, &ready, |step, state| {
@@ -978,6 +1012,7 @@ async fn create_plan(
         }
         shared.send(json!({ "type": "runs" }));
         shared.send(json!({ "type": "ops" }));
+        run.verdict_line()
     });
     {
         let mut running = s.running.lock().unwrap();
@@ -989,7 +1024,178 @@ async fn create_plan(
         }
     }
     s.system("task", format!("Plan started: {} steps", ids.len()));
-    Ok(Json(json!({ "plan": plan_id, "steps": ids })))
+    Ok(StartedPlan {
+        plan: plan_id,
+        steps: ids,
+        done: handle,
+    })
+}
+
+/// Runs the profile's scheduled plans like plans started here, so their steps show
+/// up as tasks. Checks every 30 seconds (`P2PAGENTS_SCHEDULE_TICK_SECS` overrides it).
+fn start_scheduler(shared: &AppState) {
+    use crate::schedule::{Launch, Schedule, Scheduler};
+    let weak = Arc::downgrade(shared);
+    let launch: Launch = Arc::new(move |schedule: Schedule| {
+        let weak = weak.clone();
+        Box::pin(async move {
+            let s = weak.upgrade().context("the agent stopped")?;
+            s.system(
+                "task",
+                format!(
+                    "Scheduled plan '{}' started ({})",
+                    schedule.name, schedule.when
+                ),
+            );
+            let started = start_plan(&s, schedule.plan.clone()).map_err(|e| anyhow!(e))?;
+            s.send(json!({ "type": "schedules" }));
+            drop(s);
+            let verdict = started
+                .done
+                .await
+                .unwrap_or_else(|_| "cancelled".to_owned());
+            if let Some(s) = weak.upgrade() {
+                s.send(json!({ "type": "schedules" }));
+            }
+            Ok(verdict)
+        })
+    });
+    let scheduler = Scheduler::new(shared.info.profile.schedules_path(), launch);
+    let tick = std::env::var("P2PAGENTS_SCHEDULE_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    scheduler.spawn(Duration::from_secs(tick));
+    let _ = shared.scheduler.set(scheduler);
+}
+
+fn schedules_json(s: &Shared) -> Result<Value, ApiError> {
+    let store = crate::schedule::ScheduleStore::load(&s.info.profile.schedules_path())
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let running = |name: &str| s.scheduler.get().is_some_and(|x| x.is_running(name));
+    Ok(json!(
+        store
+            .schedules
+            .iter()
+            .map(|sch| json!({
+                "name": sch.name,
+                "when": sch.when,
+                "source": sch.source,
+                "enabled": sch.enabled,
+                "running": running(&sch.name),
+                "steps": crate::plan::Plan::parse(&sch.plan).map(|p| p.steps.len()).unwrap_or(0),
+                "plan": sch.plan,
+                "next_unix": sch.next_run().map(|t| t.timestamp()),
+                "last_run_unix": sch.last_run_unix,
+                "last_result": sch.last_result,
+            }))
+            .collect::<Vec<_>>()
+    ))
+}
+
+async fn list_schedules(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "schedules": schedules_json(&s)? })))
+}
+
+#[derive(Deserialize)]
+struct ScheduleBody {
+    name: String,
+    when: String,
+    plan: String,
+    #[serde(default)]
+    source: String,
+}
+
+async fn add_schedule(
+    State(s): State<AppState>,
+    Json(body): Json<ScheduleBody>,
+) -> Result<Json<Value>, ApiError> {
+    let source = if body.source.trim().is_empty() {
+        "web UI".to_owned()
+    } else {
+        body.source
+    };
+    let schedule = crate::schedule::Schedule::new(&body.name, &body.when, &body.plan, &source)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let path = s.info.profile.schedules_path();
+    let mut store =
+        crate::schedule::ScheduleStore::load(&path).map_err(|e| bad_request(format!("{e:#}")))?;
+    let next = schedule.next_run();
+    store.add(schedule);
+    store
+        .save(&path)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.system(
+        "info",
+        format!(
+            "Scheduled plan '{}' ({}); next run {}",
+            body.name,
+            body.when.trim(),
+            next.map(|t| t.format("%a %Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default()
+        ),
+    );
+    s.send(json!({ "type": "schedules" }));
+    Ok(Json(json!({ "schedules": schedules_json(&s)? })))
+}
+
+#[derive(Deserialize)]
+struct ToggleBody {
+    enabled: bool,
+}
+
+async fn toggle_schedule(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<ToggleBody>,
+) -> Result<Json<Value>, ApiError> {
+    let path = s.info.profile.schedules_path();
+    let mut store =
+        crate::schedule::ScheduleStore::load(&path).map_err(|e| bad_request(format!("{e:#}")))?;
+    let schedule = store
+        .get_mut(&name)
+        .ok_or_else(|| bad_request(format!("no schedule named '{name}'")))?;
+    schedule.enabled = body.enabled;
+    if body.enabled {
+        // Resuming starts the clock again instead of catching up on paused runs.
+        schedule.last_run_unix = Some(chrono::Local::now().timestamp());
+    }
+    store
+        .save(&path)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.send(json!({ "type": "schedules" }));
+    Ok(Json(json!({ "schedules": schedules_json(&s)? })))
+}
+
+async fn run_schedule(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let scheduler = s
+        .scheduler
+        .get()
+        .ok_or_else(|| bad_request("schedules are not running"))?;
+    scheduler
+        .trigger(&name)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({ "schedules": schedules_json(&s)? })))
+}
+
+async fn remove_schedule(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let path = s.info.profile.schedules_path();
+    let mut store =
+        crate::schedule::ScheduleStore::load(&path).map_err(|e| bad_request(format!("{e:#}")))?;
+    if !store.remove(&name) {
+        return Err(bad_request(format!("no schedule named '{name}'")));
+    }
+    store
+        .save(&path)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.send(json!({ "type": "schedules" }));
+    Ok(Json(json!({ "schedules": schedules_json(&s)? })))
 }
 
 #[derive(Deserialize)]

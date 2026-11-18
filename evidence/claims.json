@@ -166,7 +166,7 @@
     {
       "id": "SEC-3",
       "area": "security",
-      "claim": "Only the tools of the granted access level are offered; web, MCP, memory and sub-agents are never available to tasks.",
+      "claim": "Only the tools of the granted access level are offered; web, memory and sub-agents are never available to tasks, and MCP tools only from servers the folder's owner offers (MCP-1, MCP-2).",
       "tests": [
         "lib::llm::copilot::tools_grow_with_access",
         "lib::llm::copilot::network_mcp_and_other_tools_are_always_refused"
@@ -543,6 +543,75 @@
         "lib::preview::review_packs_render_decks_documents_and_the_prototype"
       ],
       "live": ["design render wrote the review pack as HTML slide shows and pages"]
+    },
+    {
+      "id": "SEC-5",
+      "area": "security",
+      "claim": "Content from outside a task (earlier steps' results, knowledge topics, check output, incident text, MCP tool results) reaches the model inside an external-content envelope it can't close or reopen, with a standing rule to treat it as data, never as instructions (prompt-injection spotlighting); people see approval requests without the rule.",
+      "tests": [
+        "lib::boundary::external_content_cannot_close_or_reopen_its_envelope",
+        "lib::plan::steps_use_and_grow_the_knowledge_base",
+        "agents::plans_run_dependent_steps_across_squads",
+        "ui::ui_runs_plans_and_shows_squads"
+      ],
+      "live": ["boss's plan ran a dependent step with its prerequisite's result"]
+    },
+    {
+      "id": "SEC-6",
+      "area": "security",
+      "claim": "Results, failing check output, error messages, knowledge topics and incident alerts leave the machine with known secret formats redacted (private keys, GitHub, AWS, Slack, OpenAI, Anthropic, Google and npm tokens, JWTs, connection strings, signed URLs, bearer tokens, passwords), with a note of how many; the evidence is signed for the redacted output.",
+      "tests": [
+        "lib::redact::known_secret_formats_are_redacted_and_ordinary_text_is_not",
+        "agents::delegates_tasks_to_a_peer_that_serves_the_provider"
+      ]
+    },
+    {
+      "id": "MCP-1",
+      "area": "shared folders",
+      "claim": "A shared folder's owner offers MCP servers to peers' tasks (a local command or an https URL, the tools tasks may call, the least access needed); peers learn only the names they may use, never commands, variables, headers or URLs, and the owner's web UI shows them without their secrets. A task gets only the servers it asks for (mcp= in a plan step, or picked in the web UI) that its folder offers at its access; Codex tasks can't use them, and plans are checked before they run.",
+      "tests": [
+        "lib::mcp::servers_are_validated_and_secrets_never_listed",
+        "lib::shares::mcp_servers_are_offered_by_name_only_at_enough_access",
+        "agents::peers_use_only_the_mcp_servers_a_folder_offers_them",
+        "lib::plan::preflight_finds_what_would_fail_before_anything_runs",
+        "ui::ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability"
+      ],
+      "live": ["a Copilot task on worker2 used the MCP server its owner offered"]
+    },
+    {
+      "id": "MCP-2",
+      "area": "security",
+      "claim": "A task's model can call only the allowed tools of its own MCP servers: Copilot gets them in its tool allowlist (under names no built-in tool can have) and its permission handler approves only those servers and tools; Claude gets them as pre-approved tools and its tool hook refuses any other.",
+      "tests": [
+        "lib::llm::copilot::mcp_calls_only_reach_the_tasks_servers_and_allowed_tools",
+        "bridge::claude_tool_policy_confines_paths_and_tools"
+      ],
+      "live": ["the MCP server ran only the tool its owner allowed"]
+    },
+    {
+      "id": "SCH-1",
+      "area": "squads",
+      "claim": "Plans and playbooks run on their own at set times (every N minutes, hours or days, daily, on weekdays or given days, in local time) while the agent runs: due schedules start without overlapping themselves, a run missed while the agent was off runs once when it starts, and each run is a saved evidence run whose verdict is recorded; schedules are managed from the CLI and the web UI (add, pause, resume, run now, delete).",
+      "tests": [
+        "lib::schedule::when_reads_intervals_times_and_days",
+        "lib::schedule::next_run_follows_the_last_run",
+        "lib::schedule::the_scheduler_runs_due_schedules_once_at_a_time_and_records_verdicts",
+        "ui::ui_runs_plans_and_shows_squads"
+      ],
+      "live": ["boss ran a missed scheduled plan on its own as an evidence run"]
+    },
+    {
+      "id": "RHS-1",
+      "area": "design",
+      "claim": "The rehearse playbook rehearses a feature's reviews before they happen: agents on a squad play the tech lead, the security and privacy champions, the product owner, leadership and a customer in parallel (stakeholder-simulation skill), and a synthesis (feedback-synthesis skill) writes the rehearsal, proven by review:rehearsal (readiness, each audience's likely verdict, a severity and an action for every concern, at least 3 prepared answers), before the owner decides what to fix. spec check runs review:rehearsal once a rehearsal exists.",
+      "tests": [
+        "lib::design::rehearsal_check_needs_every_audience_an_action_per_concern_and_answers",
+        "lib::design::a_complete_design_package_passes_every_check",
+        "lib::playbooks::every_playbook_renders_to_a_valid_plan_with_claims",
+        "lib::playbooks::outlines_say_what_a_playbook_does_before_it_is_filled_in",
+        "bin::all_checks_include_the_rehearsal_only_once_there_is_one"
+      ],
+      "live": ["design init scaffolds a design package and review pack that pass every check"]
     },
     {
       "id": "BRG-1",

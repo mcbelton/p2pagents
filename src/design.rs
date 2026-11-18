@@ -17,7 +17,9 @@
 //!
 //! Diagrams are Mermaid (they render on GitHub and in VS Code). The review pack, in
 //! `review/`: Marp decks for the technical, product and leadership reviews, and a
-//! customer feedback document (`review:decks`).
+//! customer feedback document (`review:decks`); and the rehearsal of the reviews,
+//! `rehearsal.md`, with each audience's likely verdict, the actions their concerns
+//! lead to and prepared answers (`review:rehearsal`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -36,6 +38,7 @@ pub fn run(name: &str, dir: &Path) -> Report {
         "design:tests" => check_tests(dir),
         "design:ops" => check_ops(dir),
         "review:decks" => check_review(dir),
+        "review:rehearsal" => check_rehearsal(dir),
         _ => Report {
             problems: vec![format!("unknown built-in check {name}")],
             notes: vec![],
@@ -1422,6 +1425,133 @@ pub fn check_review(dir: &Path) -> Report {
     r
 }
 
+// ---------- review:rehearsal ----------
+
+/// The audiences a review rehearsal must cover: (name, title words).
+const REHEARSAL_AUDIENCES: &[(&str, &[&str])] = &[
+    ("Technical", &["technical", "tech", "engineering"]),
+    ("Security", &["security"]),
+    ("Privacy", &["privacy"]),
+    ("Product", &["product"]),
+    ("Leadership", &["leadership", "leaders", "executive"]),
+    ("Customer", &["customer", "customers"]),
+];
+const SEVERITIES: &[&str] = &["blocker", "major", "minor"];
+
+/// `review/rehearsal.md`: what simulated reviewers would say before the real reviews.
+pub fn check_rehearsal(dir: &Path) -> Report {
+    const FILE: &str = "review/rehearsal.md";
+    let mut r = Report::default();
+    let Some(text) = read(dir, FILE, &mut r) else {
+        return r;
+    };
+    let doc = parse_doc(&text);
+    doc.require_sections(
+        FILE,
+        &[
+            ("Readiness", &["readiness", "ready"]),
+            ("By audience", &["audience"]),
+            ("Actions", &["action"]),
+            ("Prepared answers", &["prepared answers", "answers", "faq"]),
+        ],
+        &mut r,
+    );
+    let readiness = doc.section("readiness").map(normalize).unwrap_or_default();
+    if doc.has_section(&["readiness"]) && !readiness.contains("ready") {
+        r.problems.push(format!(
+            "{FILE}: say under Readiness whether the feature is ready, ready with changes or not ready"
+        ));
+    }
+    let mut verdicts = Vec::new();
+    for (audience, words) in REHEARSAL_AUDIENCES {
+        let section = doc
+            .sections
+            .iter()
+            .find(|(level, title, _)| *level >= 3 && title_is(title, words));
+        match section {
+            None => r.problems.push(format!(
+                "{FILE} has no '### {audience}' section under By audience"
+            )),
+            Some((_, _, body)) => {
+                let body = normalize(body);
+                if body.contains("reject") {
+                    verdicts.push(format!("{audience}: reject"));
+                } else if body.contains("approve") {
+                    verdicts.push(format!(
+                        "{audience}: approve{}",
+                        if body.contains("with changes") || body.contains("with conditions") {
+                            " with changes"
+                        } else {
+                            ""
+                        }
+                    ));
+                } else {
+                    r.problems.push(format!(
+                        "{FILE}: the {audience} section has no likely verdict (approve, approve with changes or reject)"
+                    ));
+                }
+            }
+        }
+    }
+    let columns: &[(&str, &[&str])] = &[
+        ("Concern", &["concern", "issue", "question"]),
+        ("Audience", &["audience", "reviewer", "who"]),
+        ("Severity", &["severity"]),
+        ("Action", &["action", "fix", "response"]),
+    ];
+    let mut actions = 0;
+    match doc.table(columns) {
+        Err(missing) => r.problems.push(format!(
+            "{FILE}: the Actions table needs the columns {}",
+            missing.join(", ")
+        )),
+        Ok((table, cols)) => {
+            for (i, row) in table.rows.iter().enumerate() {
+                let n = i + 1;
+                if blank(cell(row, cols[0])) {
+                    continue;
+                }
+                actions += 1;
+                let severity = first_word(cell(row, cols[2]));
+                if !SEVERITIES.contains(&severity.as_str()) {
+                    r.problems.push(format!(
+                        "{FILE}: action {n} has severity '{}': use blocker, major or minor",
+                        cell(row, cols[2])
+                    ));
+                }
+                if blank(cell(row, cols[3])) {
+                    r.problems.push(format!(
+                        "{FILE}: action {n} ({}) has no action: say what will change or how it will be answered",
+                        cell(row, cols[0])
+                    ));
+                }
+            }
+            if actions == 0 {
+                r.problems
+                    .push(format!("{FILE}: the Actions table is empty"));
+            }
+        }
+    }
+    let answers = doc
+        .sections
+        .iter()
+        .filter(|s| s.0 >= 2 && (s.1.contains("answer") || s.1.contains("faq")))
+        .flat_map(|s| s.2.lines())
+        .filter(|l| l.trim().trim_end_matches(['*', '_']).ends_with('?'))
+        .count();
+    if answers < 3 {
+        r.problems.push(format!(
+            "{FILE} prepares {answers} answers: prepare at least 3 for the hardest questions"
+        ));
+    }
+    r.notes.push(format!(
+        "{} audiences ({}), {actions} actions, {answers} prepared answers",
+        verdicts.len(),
+        verdicts.join(", ")
+    ));
+    r
+}
+
 // ---------- starter ----------
 
 const STARTER: &[(&str, &str)] = &[
@@ -1472,6 +1602,10 @@ const STARTER: &[(&str, &str)] = &[
     (
         "review/customer-feedback.md",
         include_str!("../design-starter/review/customer-feedback.md"),
+    ),
+    (
+        "review/rehearsal.md",
+        include_str!("../design-starter/review/rehearsal.md"),
     ),
 ];
 
@@ -1711,5 +1845,43 @@ mod tests {
         let r = check_review(p);
         has(&r, "review/leadership.md isn't a Marp deck");
         has(&r, "review/technical.md is missing");
+    }
+
+    #[test]
+    fn rehearsal_check_needs_every_audience_an_action_per_concern_and_answers() {
+        let dir = package();
+        let p = dir.path();
+        let file = "review/rehearsal.md";
+        let ok = check_rehearsal(p);
+        assert!(ok.passed(), "{}", ok.text());
+        assert!(ok.text().contains("6 audiences"), "{}", ok.text());
+        edit(p, file, "### Privacy", "### Legal");
+        edit(p, file, "Likely verdict: approve. Customers", "Customers");
+        edit(p, file, "| Security | Major |", "| Security | High |");
+        edit(
+            p,
+            file,
+            "| Name the metric and its dashboard in the product deck |",
+            "| TBD |",
+        );
+        edit(
+            p,
+            file,
+            "Can we switch it off quickly?",
+            "Switching it off.",
+        );
+        edit(p, file, "Ready with changes:", "Mostly fine:");
+        let r = check_rehearsal(p);
+        has(&r, "has no '### Privacy' section");
+        has(&r, "the Customer section has no likely verdict");
+        has(&r, "action 1 has severity 'High'");
+        has(
+            &r,
+            "action 3 (How the 60% first-week goal is measured) has no action",
+        );
+        has(&r, "prepares 2 answers");
+        has(&r, "say under Readiness");
+        std::fs::remove_file(p.join(file)).unwrap();
+        has(&check_rehearsal(p), "review/rehearsal.md is missing");
     }
 }

@@ -1,7 +1,8 @@
 // Bridge between p2pagents (Rust) and the official Claude Agent SDK and OpenAI Codex SDK.
 //
 // Protocol: one JSON object per line.
-//   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null}
+//   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null,
+//            "mcp":{"name":{"type":"stdio","command":"...","args":[],"env":{},"tools":[]}}}  (mcp optional)
 //   stdout: {"id":1,"ok":true,"text":"..."} or {"id":1,"ok":false,"error":"..."}
 // stdout is reserved for protocol lines; all logging goes to stderr.
 import { existsSync, realpathSync } from "node:fs";
@@ -107,8 +108,9 @@ export function commandRefusal(cwd, text) {
   return null;
 }
 
-/** Why Claude may not run `tool` with `input` at `access`, or null. */
-export function toolRefusal(cwd, access, tool, input = {}) {
+/** Why Claude may not run `tool` with `input` at `access`, or null. `mcp`: the task's MCP servers. */
+export function toolRefusal(cwd, access, tool, input = {}, mcp = {}) {
+  if (typeof tool === "string" && tool.startsWith("mcp__")) return mcpRefusal(mcp, tool);
   if (!CLAUDE_TOOLS[access]?.includes(tool)) return `${tool} is not allowed with ${access} access`;
   switch (tool) {
     case "Read":
@@ -139,6 +141,35 @@ const HOME_SECRETS = [
   ".config/gh", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
 ];
 
+/** How Claude names MCP servers and tools in `mcp__<server>__<tool>`. */
+const mcpName = (name) => String(name).replace(/[^a-zA-Z0-9_-]/g, "_");
+
+/** Why Claude may not call MCP tool `tool` (`mcp__<server>__<tool>`), or null. */
+export function mcpRefusal(mcp, tool) {
+  for (const [name, server] of Object.entries(mcp ?? {})) {
+    const prefix = `mcp__${mcpName(name)}__`;
+    if (!tool.startsWith(prefix)) continue;
+    const allowed = server.tools ?? [];
+    if (allowed.length === 0 || allowed.some((t) => prefix + mcpName(t) === tool)) return null;
+    return `${tool} is not one of the tools the owner allows on MCP server ${name}`;
+  }
+  return `${tool} is not from an MCP server this task may use`;
+}
+
+/** The task's MCP servers in the Claude Agent SDK's form, and the tools to pre-approve. */
+export function claudeMcp(mcp) {
+  const servers = {};
+  const allowed = [];
+  for (const [name, server] of Object.entries(mcp ?? {})) {
+    const { tools = [], ...config } = server;
+    // Tool search isn't pre-approved, so the server's tools must be loaded up front.
+    servers[name] = { ...config, alwaysLoad: true };
+    if (tools.length === 0) allowed.push(`mcp__${mcpName(name)}`);
+    else allowed.push(...tools.map((t) => `mcp__${mcpName(name)}__${mcpName(t)}`));
+  }
+  return { servers, allowed };
+}
+
 /**
  * Claude's OS sandbox for Bash at full access: no network, no unsandboxed escape,
  * credential folders unreadable, and the task fails if the sandbox can't start.
@@ -160,10 +191,11 @@ export function claudeSandbox(access) {
   };
 }
 
-async function runClaude({ prompt, cwd, model, access }, abortController) {
+async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
   const { query } = await import("@anthropic-ai/claude-agent-sdk");
+  const servers = claudeMcp(mcp);
   const guard = async (input) => {
-    const reason = toolRefusal(cwd, access, input.tool_name, input.tool_input);
+    const reason = toolRefusal(cwd, access, input.tool_name, input.tool_input, mcp);
     if (!reason) return {};
     console.error(`  claude: denied ${input.tool_name} (${reason})`);
     return {
@@ -182,9 +214,12 @@ async function runClaude({ prompt, cwd, model, access }, abortController) {
       model: model ?? undefined,
       // Deny anything not pre-approved; no user/project settings can widen it.
       permissionMode: "dontAsk",
-      allowedTools: CLAUDE_TOOLS[access],
+      allowedTools: [...CLAUDE_TOOLS[access], ...servers.allowed],
       disallowedTools: ["WebFetch", "WebSearch", "Task"],
       settingSources: [],
+      // Only the owner's servers for this task; never a project's .mcp.json.
+      mcpServers: servers.servers,
+      strictMcpConfig: true,
       sandbox: claudeSandbox(access),
       abortController,
       // Checks every tool call's paths, including pre-approved tools.
@@ -202,7 +237,8 @@ async function runClaude({ prompt, cwd, model, access }, abortController) {
 }
 
 let codex;
-async function runCodex({ prompt, cwd, model, access }, abortController) {
+async function runCodex({ prompt, cwd, model, access, mcp }, abortController) {
+  if (Object.keys(mcp ?? {}).length > 0) throw new Error("Codex tasks can't use MCP servers here");
   const { Codex } = await import("@openai/codex-sdk");
   codex ??= new Codex({
     // Credentials live in this agent's own CODEX_HOME (set by p2pagents), never the OS keyring.

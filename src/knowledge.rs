@@ -144,12 +144,14 @@ impl KnowledgeBase {
         std::fs::read_to_string(&path).with_context(|| format!("there is no topic '{topic}'"))
     }
 
-    /// Writes `topic`, with a note of where the knowledge came from.
+    /// Writes `topic`, with a note of where the knowledge came from. Secrets are
+    /// redacted: knowledge goes into prompts that other peers' models read.
     pub fn write(&self, topic: &str, text: &str, source: &str) -> Result<()> {
         let path = self.path(topic)?;
         std::fs::create_dir_all(&self.dir)?;
+        let (text, _) = crate::redact::redact(text);
         let text = if text.starts_with("---") || source.is_empty() {
-            text.to_owned()
+            text
         } else {
             format!(
                 "<!-- source: {} -->\n{}",
@@ -237,7 +239,10 @@ impl KnowledgeBase {
         let mut text = String::new();
         for name in &names {
             let body = self.read(name)?;
-            let section = format!("\n### Knowledge: {name}\n{}\n", body.trim());
+            let section = format!(
+                "\n### Knowledge: {name}\n{}\n",
+                crate::boundary::wrap(&format!("knowledge:{name}"), body.trim())
+            );
             if text.chars().count() + section.chars().count() > MAX_CONTEXT_CHARS {
                 text += &format!("\n[... knowledge from '{name}' on left out: too long]\n");
                 break;
@@ -291,7 +296,9 @@ mod tests {
         assert!(kb.search("postgres sku").is_empty());
 
         let ctx = kb.context(&["glossary".into()]).unwrap();
-        assert!(ctx.contains("### Knowledge: glossary\nSKU"));
+        assert!(ctx.contains(
+            "### Knowledge: glossary\n<external_content source=\"knowledge:glossary\">\nSKU"
+        ));
         assert!(!ctx.contains("Postgres"));
         assert!(kb.context(&["all".into()]).unwrap().contains("Postgres"));
         assert!(kb.context(&["missing".into()]).is_err());

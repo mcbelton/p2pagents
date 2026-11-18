@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::llm::Access;
+use crate::mcp::McpServer;
 use crate::profile::validate_name;
 
 /// Name of the built-in share (the profile's `.p2pdata` folder).
@@ -31,10 +32,14 @@ pub struct Share {
     /// Run each editing task in its own git worktree and branch, and commit its work.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktrees: bool,
+    /// Owner-defined MCP servers tasks here may use (see [`crate::mcp`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServer>,
 }
 
 /// What a peer learns about a share: its name, the access it would get and the
-/// names of its checks. Local paths and commands are never sent.
+/// names of its checks and of the MCP servers it may use. Local paths, commands
+/// and server definitions are never sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareInfo {
     pub name: String,
@@ -43,6 +48,8 @@ pub struct ShareInfo {
     pub checks: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktrees: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
 }
 
 /// Parses `name=command` check definitions.
@@ -83,6 +90,7 @@ impl ShareStore {
                 max_access: Access::ReadOnly,
                 checks: BTreeMap::new(),
                 worktrees: false,
+                mcp: BTreeMap::new(),
             }],
         }
     }
@@ -119,7 +127,8 @@ impl ShareStore {
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Shares `path` (an existing folder) as `name`, replacing a share of that name.
+    /// Shares `path` (an existing folder) as `name`, replacing a share of that name
+    /// (its MCP servers are kept).
     pub fn add(&mut self, name: &str, path: &Path, max_access: Access) -> Result<&Share> {
         self.add_with(name, path, max_access, BTreeMap::new(), false)
     }
@@ -149,6 +158,7 @@ impl ShareStore {
                 path.display()
             );
         }
+        let mcp = self.get(name).map(|s| s.mcp.clone()).unwrap_or_default();
         self.shares.retain(|s| s.name != name);
         self.shares.push(Share {
             name: name.to_owned(),
@@ -156,8 +166,35 @@ impl ShareStore {
             max_access,
             checks,
             worktrees,
+            mcp,
         });
         Ok(self.shares.last().expect("just pushed"))
+    }
+
+    /// Offers MCP server `server` as `name` to tasks in share `share`, replacing a
+    /// server of that name.
+    pub fn add_mcp(&mut self, share: &str, name: &str, server: McpServer) -> Result<()> {
+        if share == DATA_SHARE {
+            bail!("the built-in '{DATA_SHARE}' share can't offer MCP servers; share a folder");
+        }
+        server.validate(name)?;
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == share)
+            .with_context(|| format!("no share named '{share}'"))?;
+        share.mcp.insert(name.to_owned(), server);
+        Ok(())
+    }
+
+    /// Stops offering MCP server `name` in share `share`; whether it was offered.
+    pub fn remove_mcp(&mut self, share: &str, name: &str) -> Result<bool> {
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == share)
+            .with_context(|| format!("no share named '{share}'"))?;
+        Ok(share.mcp.remove(name).is_some())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<bool> {
@@ -178,11 +215,20 @@ impl ShareStore {
         self.shares
             .iter()
             .filter(|s| granted.contains(&s.name))
-            .map(|s| ShareInfo {
-                name: s.name.clone(),
-                access: effective_access(grant, s.max_access),
-                checks: s.checks.keys().cloned().collect(),
-                worktrees: s.worktrees,
+            .map(|s| {
+                let access = effective_access(grant, s.max_access);
+                ShareInfo {
+                    name: s.name.clone(),
+                    access,
+                    checks: s.checks.keys().cloned().collect(),
+                    worktrees: s.worktrees,
+                    mcp: s
+                        .mcp
+                        .iter()
+                        .filter(|(_, server)| server.allows(access))
+                        .map(|(name, _)| name.clone())
+                        .collect(),
+                }
             })
             .collect()
     }
@@ -299,5 +345,62 @@ mod tests {
             store.visible(&["repo".to_owned()], Access::ReadOnly)[0].access == Access::ReadOnly
         );
         assert!(store.visible(&[], Access::Full).is_empty());
+    }
+
+    #[test]
+    fn mcp_servers_are_offered_by_name_only_at_enough_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ShareStore::with_data(dir.path().join("data"));
+        store.add("repo", dir.path(), Access::Full).unwrap();
+        let mut browser = McpServer::local("npx", vec!["@playwright/mcp".into()]);
+        browser.access = Access::ReadOnly;
+        store.add_mcp("repo", "browser", browser).unwrap();
+        store
+            .add_mcp(
+                "repo",
+                "tickets",
+                McpServer::remote("https://t.example/mcp", false),
+            )
+            .unwrap();
+        assert!(
+            store
+                .add_mcp(DATA_SHARE, "browser", McpServer::local("x", vec![]))
+                .is_err()
+        );
+        assert!(
+            store
+                .add_mcp("gone", "browser", McpServer::local("x", vec![]))
+                .is_err()
+        );
+        assert!(
+            store
+                .add_mcp("repo", "bad", McpServer::local("", vec![]))
+                .is_err()
+        );
+
+        let granted = ["repo".to_owned()];
+        assert_eq!(
+            store.visible(&granted, Access::Full)[0].mcp,
+            ["browser", "tickets"]
+        );
+        assert_eq!(
+            store.visible(&granted, Access::ReadOnly)[0].mcp,
+            ["browser"]
+        );
+
+        // Re-sharing the folder (e.g. to change its checks) keeps its servers.
+        store
+            .add("repo", dir.path(), Access::WorkspaceWrite)
+            .unwrap();
+        assert_eq!(store.get("repo").unwrap().mcp.len(), 2);
+        assert!(store.remove_mcp("repo", "tickets").unwrap());
+        assert!(!store.remove_mcp("repo", "tickets").unwrap());
+        let file = dir.path().join("shares.json");
+        store.save(&file).unwrap();
+        let loaded = ShareStore::load(&file, dir.path().join("data")).unwrap();
+        assert_eq!(
+            loaded.get("repo").unwrap().mcp,
+            store.get("repo").unwrap().mcp
+        );
     }
 }

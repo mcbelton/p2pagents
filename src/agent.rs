@@ -1060,6 +1060,28 @@ impl Inner {
                 self.name
             );
         }
+        let mut mcp = BTreeMap::new();
+        for server in &task.mcp {
+            let Some(def) = share.mcp.get(server) else {
+                bail!(
+                    "folder '{}' on {} offers no MCP server named '{server}'",
+                    share.name,
+                    self.name
+                );
+            };
+            if !def.allows(access) {
+                bail!(
+                    "MCP server '{server}' in '{}' on {} needs {} access; {name} has {access}",
+                    share.name,
+                    self.name,
+                    def.access
+                );
+            }
+            mcp.insert(server.clone(), def.clone());
+        }
+        if !mcp.is_empty() && task.provider == Provider::Codex {
+            bail!("Codex tasks can't use MCP servers; ask for copilot or claude");
+        }
         let now = Instant::now();
         let mut log = self.task_log.lock().unwrap();
         let recent = log.entry(*id).or_default();
@@ -1076,10 +1098,8 @@ impl Inner {
             );
         }
         recent.push_back(now);
-        let ctx = TaskContext {
-            access,
-            workspace: share.path.clone(),
-        };
+        let mut ctx = TaskContext::new(access, share.path.clone());
+        ctx.mcp = mcp;
         Ok((ctx, share))
     }
 
@@ -1247,6 +1267,11 @@ impl Inner {
                 break;
             }
             prompt.prompt = retry_prompt(&task.prompt, &results);
+        }
+        // Results leave this machine: secrets the model or a check printed stay here.
+        output = crate::redact::redact_with_note(&output, &self.name);
+        for r in &mut results {
+            r.output = crate::redact::redact(&r.output).0;
         }
         let mut evidence = Evidence::new(
             EvidenceKind::Task,
@@ -1444,7 +1469,7 @@ async fn run_connection(
                             Err(e) => Message::TaskResult {
                                 task_id,
                                 ok: false,
-                                output: format!("{e:#}"),
+                                output: crate::redact::redact(&format!("{e:#}")).0,
                                 evidence: None,
                                 patch: None,
                             },

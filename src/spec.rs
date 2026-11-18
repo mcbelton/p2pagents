@@ -39,6 +39,7 @@ pub const BUILT_IN_CHECKS: &[&str] = &[
     "design:tests",
     "design:ops",
     "review:decks",
+    "review:rehearsal",
 ];
 
 pub fn is_built_in(check: &str) -> bool {

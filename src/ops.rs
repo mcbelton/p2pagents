@@ -492,12 +492,20 @@ impl Ops {
         text: String,
         checks: Vec<CheckResult>,
     ) {
+        // Alerts go to peers by chat: secrets in check output stay here.
+        let checks = checks
+            .into_iter()
+            .map(|mut c| {
+                c.output = crate::redact::redact(&c.output).0;
+                c
+            })
+            .collect();
         let event = IncidentEvent {
             ts: unix_now(),
             incident,
             monitor: monitor.to_owned(),
             kind,
-            text,
+            text: crate::redact::redact(&text).0,
             checks,
         };
         if let Err(e) = self.store.record_incident(&event) {
@@ -652,9 +660,9 @@ impl Ops {
             .iter()
             .map(|(name, cmd)| format!("- `{name}`: `{cmd}`"))
             .collect();
-        let prompt = format!(
+        let prompt = crate::boundary::guard(&format!(
             "You are the debugging agent of a running service.\n{skill}\n---\nMonitor `{}` (check `{}`) is failing.\n\
-             Its latest output:\n```text\n{}\n```\n\
+             Its latest output:\n{}\n\
              Knowledge about this system:\n{}\n\n\
              Investigate (read-only: inspect files and logs in this folder; change nothing). \
              Explain the most likely root cause with evidence. The folder owner allows only these \
@@ -662,18 +670,18 @@ impl Ops {
              End with exactly two lines:\nConfidence: <0-100>%\nFix: <one command name from the list, or none>",
             m.name,
             m.check,
-            clip(failure.output.trim(), OUTPUT_CHARS),
+            crate::boundary::wrap(
+                &format!("check:{} output", m.check),
+                &clip(failure.output.trim(), OUTPUT_CHARS)
+            ),
             if knowledge.is_empty() {
                 "(none yet)".to_owned()
             } else {
                 knowledge
             },
             checks.join("\n")
-        );
-        let ctx = TaskContext {
-            access: Access::ReadOnly,
-            workspace: share.path.clone(),
-        };
+        ));
+        let ctx = TaskContext::new(Access::ReadOnly, share.path.clone());
         let diagnosis = match executor
             .execute(&LlmTask::new(provider, prompt), &ctx)
             .await

@@ -422,6 +422,11 @@ impl Profile {
         self.dir.join("monitors.json")
     }
 
+    /// Plans this profile's agent runs on its own at set times (see [`crate::schedule`]).
+    pub fn schedules_path(&self) -> PathBuf {
+        self.dir.join("schedules.json")
+    }
+
     /// Where this profile's linked repositories are cloned: next to the data folder,
     /// outside the profiles folder, like task worktrees.
     pub fn repos_dir(&self) -> PathBuf {

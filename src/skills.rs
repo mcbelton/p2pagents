@@ -99,6 +99,14 @@ const BUILT_IN: &[(&str, &str)] = &[
         "review-customer",
         include_str!("../skills/review-customer.md"),
     ),
+    (
+        "stakeholder-simulation",
+        include_str!("../skills/stakeholder-simulation.md"),
+    ),
+    (
+        "feedback-synthesis",
+        include_str!("../skills/feedback-synthesis.md"),
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

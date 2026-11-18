@@ -6,6 +6,7 @@ pub mod changes;
 pub mod copilot;
 pub mod policy;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ pub use bridge::Bridge;
 pub use copilot::CopilotBackend;
 
 use crate::auth::ProviderTools;
+use crate::mcp::McpServer;
 use crate::profile::Profile;
 
 #[derive(
@@ -110,6 +112,9 @@ pub struct LlmTask {
     /// before the model starts, so the work can be checked independently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch: Option<String>,
+    /// Names of the folder's owner-defined MCP servers the model may use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
 }
 
 impl LlmTask {
@@ -122,6 +127,7 @@ impl LlmTask {
             checks: Vec::new(),
             attempts: None,
             patch: None,
+            mcp: Vec::new(),
         }
     }
 
@@ -138,11 +144,23 @@ impl LlmTask {
 }
 
 /// Where and with what access a task runs. Decided by the agent that runs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskContext {
     pub access: Access,
     /// Folder the task works in: a shared folder for peers' tasks, `--workspace` for local ones.
     pub workspace: PathBuf,
+    /// The MCP servers the task may use, already checked against its folder and access.
+    pub mcp: BTreeMap<String, McpServer>,
+}
+
+impl TaskContext {
+    pub fn new(access: Access, workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            access,
+            workspace: workspace.into(),
+            mcp: BTreeMap::new(),
+        }
+    }
 }
 
 /// Runs [`LlmTask`]s. Implemented by [`SdkExecutor`]; tests can supply fakes.
@@ -237,21 +255,29 @@ impl Executor for SdkExecutor {
         if !ctx.workspace.is_dir() {
             bail!("folder {} does not exist", ctx.workspace.display());
         }
-        let task = &with_role(self.role.as_deref(), task);
+        if !ctx.mcp.is_empty() && task.provider == Provider::Codex {
+            bail!("Codex tasks can't use MCP servers here; use Copilot or Claude");
+        }
+        let mut task = with_role(self.role.as_deref(), task);
+        if !ctx.mcp.is_empty() {
+            let names: Vec<String> = ctx.mcp.keys().cloned().collect();
+            task.prompt = crate::mcp::prompt_note(&names) + &task.prompt;
+        }
+        let task = &task;
         let run = async {
             match task.provider {
                 Provider::Copilot => {
                     self.copilot
                         .as_ref()
                         .expect("enabled")
-                        .run(task, ctx.access, &ctx.workspace)
+                        .run(task, ctx.access, &ctx.workspace, &ctx.mcp)
                         .await
                 }
                 Provider::Claude | Provider::Codex => {
                     self.bridge
                         .as_ref()
                         .expect("enabled")
-                        .run(task, &ctx.workspace, ctx.access)
+                        .run_with(task, &ctx.workspace, ctx.access, &ctx.mcp)
                         .await
                 }
             }

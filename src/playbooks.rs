@@ -12,7 +12,9 @@
 //!   prototype, proven by built-in checks and accepted before any code;
 //! - `design`: the feature's SDLC design artifacts and a review pack (a deck per
 //!   audience and a customer feedback document), reviewed by each audience;
-//! - `implement-spec`: the feature built from its accepted spec, a test per criterion.
+//! - `implement-spec`: the feature built from its accepted spec, a test per criterion;
+//! - `rehearse`: the feature's reviews rehearsed before they happen: agents play each
+//!   stakeholder in parallel, then a synthesis of actions and prepared answers.
 
 use std::collections::BTreeMap;
 
@@ -53,6 +55,11 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
         "implement-spec",
         "Implement a feature from its accepted spec package, with a test proving each acceptance criterion",
         include_str!("../playbooks/implement-spec.plan"),
+    ),
+    (
+        "rehearse",
+        "Rehearse a feature's reviews: agents play each stakeholder in parallel, then actions and prepared answers",
+        include_str!("../playbooks/rehearse.plan"),
     ),
 ];
 
@@ -462,6 +469,24 @@ mod tests {
         assert!(
             lt.starts_with("**lt-review** (after tech-review, security-review, privacy-review, product-review): you sign off"),
             "{lt}"
+        );
+        let rehearse = outline("rehearse").unwrap();
+        let parallel = rehearse
+            .steps
+            .iter()
+            .filter(|s| {
+                s.contains("a member of squad #qa") && s.contains("stakeholder-simulation skill")
+            })
+            .count();
+        assert_eq!(parallel, 6, "one stakeholder per step, all at once");
+        let synthesis = rehearse
+            .steps
+            .iter()
+            .find(|s| s.starts_with("**synthesis**"))
+            .unwrap();
+        assert!(
+            synthesis.contains("the built-in `review:rehearsal` check must pass"),
+            "{synthesis}"
         );
         assert!(!design.needs.iter().any(|n| n.contains("Full access")));
         assert!(

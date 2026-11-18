@@ -530,6 +530,37 @@ report after api,tests @helper Write a one-paragraph status report
 Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. Each step appears as a task
 that waits, runs, finishes or is skipped, and cancelling any step cancels the whole plan.
 
+### Scheduled plans
+
+An agent can run a plan or a playbook **on its own at set times**: a nightly `learn`, a
+weekday-morning review of what changed, an hourly end-to-end check through a peer. Each
+run is an ordinary [evidence run](#evidence-driven-development-with-agents).
+
+```powershell
+p2pagents schedule add nightly-learn --when "daily 02:00" --playbook learn --set peer=alice --profile boss
+p2pagents schedule add smoke --when "every 1h" --plan smoke.plan --profile boss
+p2pagents schedule list --profile boss          # next run and the last verdict
+p2pagents schedule pause smoke --profile boss   # resume / remove
+```
+
+| `--when` (local time) | Runs |
+| --- | --- |
+| `every 30m`, `every 2h`, `every 1d` | that long after the last run (at most every 5 minutes) |
+| `daily 09:00` or `every day at 09:00` | every day at that time |
+| `weekdays 08:30`, `weekends 10:00` | Monday to Friday, or Saturday and Sunday |
+| `mon,wed,fri 17:00` | on those days |
+
+- Schedules run while the profile's agent runs, with or without the web UI. Changes made
+  with the CLI are picked up within 30 seconds, without a restart.
+- A schedule never overlaps itself: if a run is still going when the next one is due, the
+  next one is skipped. A run missed while the agent was off runs **once** when it starts.
+- The plan is checked like any other before it runs. If a peer it needs is offline, the
+  run is recorded as not run, with the reason.
+- In the web UI, **Plan** mode has **Schedule…** to schedule the plan in the editor. The
+  **Schedules** panel shows each schedule's next run and last verdict, with
+  **Run now**, **Pause**/**Resume** and **Delete**. Steps of scheduled runs appear as
+  tasks, like any plan.
+
 ### Evidence-driven development with agents
 
 Plans can do evidence-driven development (EDD) across a team: you write down what must be
@@ -564,6 +595,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
+| `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
 
 **3. Agents do the work, and each result comes back with signed evidence.**
@@ -648,6 +680,7 @@ In the web UI: **Plan** mode, pick a playbook, then **Use**.
 | `spec` | Spec-driven: a feature's spec (user stories, testable acceptance criteria, security and privacy), its REST API contract with examples, a clickable UX prototype and a claim per criterion. Each is proven by built-in checks, then the product owner (who clicks through the prototype) and the tech lead accept it. See [Spec-driven development](#spec-driven-development) |
 | `design` | The SDLC design of an accepted spec: architecture with context, component, UML and workflow diagrams, ADRs, data dictionary and data flows, threat model, test and operations plans, then a review pack with a deck per audience and a customer feedback document. Each is proven by built-in checks, then the tech lead, security and privacy champions, product owner and leadership review it. See [Design and reviews](#design-and-reviews) |
 | `implement-spec` | The accepted spec (and design) built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
+| `rehearse` | The feature's reviews rehearsed before they happen: agents play the tech lead, security and privacy champions, product owner, leadership and a customer in parallel, then a synthesis (`review:rehearsal`) of actions and prepared answers, and your decision. See [Rehearse the reviews first](#rehearse-the-reviews-first) |
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
 your folder's checks (`share add --check ...`); rename them with `--set test=unit` etc.
@@ -892,6 +925,34 @@ It is served in the same sandbox as prototypes. Decks and documents are rendered
 without their raw HTML, so a model's or a peer's Markdown can't run script. Shared
 folders with `design/` or `review/` offer **Preview review pack** too.
 
+#### Rehearse the reviews first
+
+The `rehearse` playbook runs a dry run of the reviews before you book them:
+
+1. Six agents on a squad of reviewers each play one stakeholder, all at the same time:
+   the tech lead, the security champion, the privacy champion, the product owner,
+   leadership and a customer. Each reads the review pack and answers in role, following
+   the `stakeholder-simulation` skill: likely verdict, hardest questions, concerns with a
+   severity, and what would convince them.
+2. A peer merges their feedback into `review/rehearsal.md`, following the
+   `feedback-synthesis` skill. The rehearsed reviews reach it as external content, never
+   as instructions.
+3. You decide what to fix before the real reviews.
+
+The built-in check `review:rehearsal` proves the rehearsal is usable:
+
+- readiness (ready, ready with changes or not ready);
+- a section for each of the six audiences, with its likely verdict;
+- an actions table where every concern has a severity (blocker, major, minor) and an
+  action;
+- at least three prepared answers to the hardest questions.
+
+`spec check` runs it once a rehearsal exists, and `design init` includes an example.
+
+```powershell
+p2pagents playbook show rehearse --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > rehearse.plan
+```
+
 ### Options
 
 | Option | Default | Description |
@@ -911,11 +972,12 @@ folders with `design/` or `review/` offer **Preview review pack** too.
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
-`p2pagents share add|list|remove`, `p2pagents worker create|list`,
+`p2pagents share add|list|remove`, `p2pagents mcp add|list|remove`, `p2pagents worker create|list`,
 `p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
-`p2pagents playbook list|show`, `p2pagents skill list|show|add|remove`, `p2pagents github login|status|logout`,
+`p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|remove`, `p2pagents github login|status|logout`,
 `p2pagents repo link|list|sync|branches|pr|unlink`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
-(and uses a separate credential store namespace).
+(and uses a separate credential store namespace). `P2PAGENTS_SCHEDULE_TICK_SECS` sets how
+often an agent looks for due schedules (default 30).
 
 ## Web UI
 
@@ -936,11 +998,15 @@ p2pagents --name me --providers copilot --serve --ui
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections,
   tasks peers delegate to you.
 - **Run task**: pick a provider and where to run it (*This agent*, a named peer, or *Any peer*
-  when several serve it).
+  when several serve it), and the peer's folder. If that folder offers MCP servers, tick
+  the ones the task may use.
   The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
   results and errors, and has a **Cancel** button on running tasks.
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
   Ctrl+Enter runs it). Steps show which steps they wait for, and skipped steps are flagged.
+  **Schedule…** runs the plan on its own at set times ([scheduled plans](#scheduled-plans)).
+- **Schedules**: each schedule's next run and last verdict, with Run now, Pause/Resume and
+  Delete.
 - **Squads**: create, view (members, who is online, running tasks) and remove squads.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
@@ -1026,8 +1092,22 @@ Always enforced, at every level and for local tasks too:
   `.p2pagents`, `.copilot`.
 - **No writes that would run code later**: `.git/` (hooks, config), `.vscode/`, `.idea/`,
   `.claude/`, `.codex/`, `.copilot/`, `.cursor/`, `.github/hooks/`, `.mcp.json`, `.gitmodules`.
-- **No web, MCP, memory or sub-agents**: web fetch/search, MCP servers (including GitHub's),
-  Copilot memory, sub-agents/skills are not offered to the model at all.
+- **No web, memory or sub-agents**: web fetch/search, Copilot memory, sub-agents and skills
+  are not offered to the model at all. MCP servers are offered only when the folder's owner
+  defines them (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)); a
+  project's own `.mcp.json` and the built-in GitHub server are never used.
+- **External content is data, not instructions.** Earlier steps' results, knowledge topics,
+  check output, incident text and MCP tool results reach the model inside an
+  `<external_content source="...">` envelope, with a standing rule to never follow
+  instructions found inside it (prompt-injection *spotlighting*). The envelope can't be
+  closed or reopened from inside: forged tags are escaped.
+- **Secrets are redacted before results leave the machine.** Results, failing check
+  output, error messages, knowledge topics and incident alerts are scanned for known
+  secret formats before they are sent or saved, and each match is replaced with
+  `[REDACTED:<kind>]`, with a note saying how many. The formats: private keys, GitHub,
+  AWS, Slack, OpenAI, Anthropic, Google and npm tokens, JWTs, connection-string keys,
+  signed URLs, bearer tokens and `password=` values. The worker signs the evidence for the
+  redacted output. This is a safety net; the credential-file rules above still apply.
 
 Per provider:
 
@@ -1036,6 +1116,42 @@ Per provider:
 | Copilot | only tools `view`, `glob`, `grep`; every read request is path-checked | adds `create`, `edit` (path-checked) | adds the shell tool (`powershell`/`bash`), run in the Copilot CLI's OS sandbox |
 | Claude | `dontAsk` mode, tools `Read`, `Glob`, `Grep`, a PreToolUse hook path-checks every call; user/project settings not loaded | adds `Edit`, `Write`, `NotebookEdit` | adds `Bash`, run in Claude's OS sandbox |
 | Codex | sandbox `read-only`, approvals `never`, no network or web search | sandbox `workspace-write` | same as `workspace-write` (never `danger-full-access`) |
+
+### MCP servers: owner-controlled tools for peers' tasks
+
+A folder's owner can let peers' tasks use **MCP servers**: a browser (e.g. Playwright) to
+check a web app, a docs or ticket system, an internal API. The owner defines each server
+on a shared folder, like its checks:
+
+```powershell
+# a local server (stdio): only two of its tools, for any peer with access to 'app'
+p2pagents mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot `
+  --profile alice -- npx @playwright/mcp@latest --headless
+# a remote server (https): all its tools, for peers with full access; the header stays on this machine
+p2pagents mcp add app docs --url https://docs.example.com/mcp --header "Authorization=Bearer <token>" --profile alice
+p2pagents mcp list --profile alice     # values of variables and headers are hidden
+p2pagents mcp remove app docs --profile alice
+```
+
+A plan step asks for servers by name with `mcp=` (or ticks them under **MCP** when
+running a task in the web UI):
+
+```text
+look @alice:app mcp=browser Open http://localhost:3000 and report what the home page shows
+```
+
+| | |
+| --- | --- |
+| What peers learn | Only the **names** of the servers they may use, per folder (`/peers`, the web UI). Never commands, URLs, environment variables or headers. |
+| Who can use a server | Peers whose access in that folder is at least the server's `--access` (default `full`: a server runs with your rights and may reach the network). |
+| What a task gets | Only the servers it asks for, and only their allowed tools (`--tool`, default all). A name the folder doesn't offer, or doesn't offer at the peer's access, is refused before the model starts. |
+| Copilot | The servers are added to the task's session and their allowed tools to its tool allowlist, under the names `mcp-<server>-<tool>`, so no server can pass for a built-in tool. The permission handler approves only those servers and tools. |
+| Claude | The servers are passed with `strictMcpConfig` (no other MCP configuration is loaded), their tools are pre-approved as `mcp__<server>__<tool>`, and the tool hook refuses any other. |
+| Codex | Can't use MCP servers here; such tasks are refused. |
+| Results | MCP tool results are external content: the model is told to treat them as data, never as instructions. |
+
+Servers run on your machine with your rights, outside the shell sandbox, so offer only
+servers you trust. Remote URLs must be `https://`, except `http://` on this machine.
 
 ### The shell sandbox (`full`)
 
@@ -1172,15 +1288,19 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
-- [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access)
+- [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access, their checks and MCP servers)
+- [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config)
+- [src/boundary.rs](src/boundary.rs): the external-content envelope and standing rule against prompt injection
+- [src/redact.rs](src/redact.rs): secret redaction of results, check output, knowledge and alerts
+- [src/schedule.rs](src/schedule.rs): scheduled plans (`--when` parsing, `schedules.json`, the scheduler)
 - [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation (claims, checks, approvals), and the dependency-ordered plan runner
 - [src/evidence.rs](src/evidence.rs): signed evidence records, owner-defined checks (run with a timeout, process tree killed) and retry prompts
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
-- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec and implement-spec plan templates
+- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec and rehearse plan templates
 - [src/spec.rs](src/spec.rs) and [spec-starter/](spec-starter): the built-in spec checks (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) and the `spec init` starter package
-- [src/design.rs](src/design.rs) and [design-starter/](design-starter): the design and review checks (`design:arch`, `design:data`, `design:threats`, `design:tests`, `design:ops`, `review:decks`) and the `design init` starter
+- [src/design.rs](src/design.rs) and [design-starter/](design-starter): the design and review checks (`design:arch`, `design:data`, `design:threats`, `design:tests`, `design:ops`, `review:decks`, `review:rehearsal`) and the `design init` starter
 - [src/render.rs](src/render.rs): Markdown to self-contained HTML: Marp decks as slide shows, documents as pages, without raw HTML
 - [src/preview.rs](src/preview.rs): sandboxed previews of UX prototypes and review packs (from a step's patch, a shared folder or an approval request)
 - [src/ops.rs](src/ops.rs): monitors, metrics, incidents, TSG auto-fix, the debugging agent and ops reports
@@ -1194,7 +1314,7 @@ Workflow for a change:
 - [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
-- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests
+- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server for the live test
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 
 ## License

@@ -17,7 +17,9 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(REPO, "target", "debug", "p2pagents.exe" if os.name == "nt" else "p2pagents")
 HOME = tempfile.mkdtemp(prefix="p2p-live-home-")
-ENV = {**os.environ, "P2PAGENTS_HOME": HOME}
+# Schedules are checked every 2 seconds (default 30) so a due one runs right away.
+ENV = {**os.environ, "P2PAGENTS_HOME": HOME, "P2PAGENTS_SCHEDULE_TICK_SECS": "2"}
+MCP_LOG = os.path.join(HOME, "echo-mcp.log")
 results = []
 
 
@@ -115,6 +117,11 @@ try:
     _, out1 = cli("share", "add", "repo", REPO, "--profile", "worker1")
     _, out2 = cli("share", "add", "code", ws, "--access", "workspace-write", "--profile", "worker2")
     print(f"  {out1.strip()}\n  {out2.strip()}")
+    # An MCP server worker2's owner offers in 'code': only its secret_word tool, to any access.
+    _, out = cli("mcp", "add", "code", "echo", "--access", "read-only", "--tool", "secret_word",
+                 "--env", f"ECHO_MCP_LOG={MCP_LOG}", "--profile", "worker2", "--",
+                 sys.executable, os.path.join(REPO, "tests", "fixtures", "echo_mcp.py"), "MCP-LIVE-8842")
+    print(f"  {out.strip()}")
     code, out = cli("spec", "init", "Todo done", "--dir", ws)
     check_code, check_out = cli("spec", "check", "--dir", ws)
     print(f"  {check_out.strip()}")
@@ -125,7 +132,7 @@ try:
     print(f"  {check_out.strip()}")
     check("design init scaffolds a design package and review pack that pass every check",
           code == 0 and check_code == 0 and "design:threats: passed" in check_out
-          and "review:decks: passed" in check_out, out + check_out)
+          and "review:decks: passed" in check_out and "review:rehearsal: passed" in check_out, out + check_out)
     site = os.path.join(HOME, "review-site")
     code, out = cli("design", "render", "--dir", ws, "--out", site)
     print(f"  {out.strip()}")
@@ -180,14 +187,15 @@ try:
     if acct1[1] == "github.com":
         _, out = cli("github", "login", "--gh-user", acct1[0], "--host", acct1[1], "--profile", "worker1")
         print(f"  {out.strip()}")
-        code, out = cli("repo", "link", "mcbelton/p2pagents", "--as", "p2pclone", "--profile", "worker1")
+        # A small public repository that stays public, so the check doesn't depend on this one's visibility.
+        code, out = cli("repo", "link", "octocat/Hello-World", "--as", "p2pclone", "--profile", "worker1")
         print(f"  {out.strip()}")
         clone = os.path.join(HOME, ".p2prepos", "worker1", "p2pclone")
         config = open(os.path.join(clone, ".git", "config")).read() if os.path.isdir(clone) else ""
         sync_code, sync_out = cli("repo", "sync", "p2pclone", "--profile", "worker1")
         print(f"  {sync_out.strip()}")
         check("linked a GitHub repository with the profile's GitHub sign-in",
-              code == 0 and os.path.isfile(os.path.join(clone, "Cargo.toml"))
+              code == 0 and os.path.isfile(os.path.join(clone, "README"))
               and "AUTHORIZATION" not in config.upper() and sync_code == 0,
               out.strip())
     else:
@@ -402,6 +410,38 @@ try:
           any("comes with a UX prototype" in l for l in w1.lines[w1.cursor:]), w1.lines[w1.cursor:][-12:])
     check("boss's spec-driven run proved its claims", finished and "PASS: 2/2 claims proven" in finished, finished)
     shutil.rmtree(app, ignore_errors=True)
+
+    print("== MCP: a step uses the MCP server worker2's owner offers in 'code' (boss knows only its name)")
+    with open(plan_file, "w") as f:
+        f.write("word @worker2:code mcp=echo Call the secret_word tool of the echo MCP server and reply with "
+                "only the secret word it returns.\n")
+    boss.cursor = len(boss.lines)
+    boss.send(f"/plan {plan_file}")
+    boss.wait_for(r"=== plan finished", 400)
+    text = "\n".join(boss.lines[boss.cursor:])
+    check("a Copilot task on worker2 used the MCP server its owner offered", "MCP-LIVE-8842" in text, text[-1200:])
+    calls = open(MCP_LOG, encoding="utf-8").read().split() if os.path.exists(MCP_LOG) else []
+    check("the MCP server ran only the tool its owner allowed", calls and set(calls) == {"secret_word"}, calls)
+
+    print("== schedules: a plan boss scheduled, missed while it was off, runs once on its own")
+    sched_plan = os.path.join(HOME, "ping.plan")
+    with open(sched_plan, "w") as f:
+        f.write("ping @worker1 Reply with only the word PONG.\n")
+    code, out = cli("schedule", "add", "ping", "--when", "every 30m", "--plan", sched_plan, "--profile", "boss")
+    print(f"  {out.strip()}")
+    sched_path = os.path.join(HOME, "profiles", "boss", "schedules.json")
+    with open(sched_path, encoding="utf-8") as f:
+        store = json.load(f)
+    store["schedules"][0]["created_unix"] -= 3600  # due since half an hour ago
+    with open(sched_path, "w", encoding="utf-8") as f:
+        json.dump(store, f)
+    boss.cursor = len(boss.lines)
+    finished = boss.wait_for(r"=== scheduled plan 'ping' finished: ", 300)
+    _, listing = cli("schedule", "list", "--profile", "boss")
+    print("\n".join("  " + l for l in listing.splitlines()))
+    check("boss ran a missed scheduled plan on its own as an evidence run",
+          code == 0 and finished and "1/1 steps done" in finished and "runs show " in finished
+          and "last: NO CLAIMS: 1/1 steps done" in listing, finished)
 
     print("== ops: incidents on worker2's monitors")
     check("a troubleshooting guide fixed the incident without the model",

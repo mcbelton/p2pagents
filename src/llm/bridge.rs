@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
@@ -12,6 +12,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{Access, LlmTask, Provider};
+use crate::mcp::McpServer;
 use crate::profile::INHERITED_CREDENTIAL_VARS;
 
 type Pending = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<Result<String, String>>>>>>;
@@ -24,6 +25,9 @@ struct Request<'a> {
     cwd: &'a Path,
     access: Access,
     model: Option<&'a str>,
+    /// MCP servers by name, as `{type, command|url, ..., tools}`.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    mcp: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +130,17 @@ impl Bridge {
     }
 
     pub async fn run(&self, task: &LlmTask, cwd: &Path, access: Access) -> Result<String> {
+        self.run_with(task, cwd, access, &BTreeMap::new()).await
+    }
+
+    /// [`Bridge::run`] with the MCP servers the model may use.
+    pub async fn run_with(
+        &self,
+        task: &LlmTask,
+        cwd: &Path,
+        access: Access,
+        mcp: &BTreeMap<String, McpServer>,
+    ) -> Result<String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -142,6 +157,10 @@ impl Bridge {
             cwd,
             access,
             model: task.model.as_deref(),
+            mcp: mcp
+                .iter()
+                .map(|(name, server)| (name.clone(), server.to_json()))
+                .collect(),
         };
         let mut line = serde_json::to_vec(&request)?;
         line.push(b'\n');

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { pathRefusal, toolRefusal, claudeSandbox } = await import("../../bridge/index.mjs");
+const { pathRefusal, toolRefusal, claudeSandbox, claudeMcp } = await import("../../bridge/index.mjs");
 
 assert.equal(claudeSandbox("read-only"), undefined);
 assert.equal(claudeSandbox("workspace-write"), undefined);
@@ -58,5 +58,21 @@ for (const bad of [
   assert.ok(toolRefusal(ws, "full", "Bash", { command: bad }), bad);
 }
 assert.match(toolRefusal(ws, "full", "WebFetch", { url: "https://x" }), /not allowed/);
+
+// MCP: only the task's servers, and only the tools the owner allows on each.
+const mcp = {
+  "web.browser": { type: "stdio", command: "npx", args: ["@playwright/mcp"], env: {}, tools: ["browser_snapshot"] },
+  docs: { type: "http", url: "https://docs.example.com/mcp", headers: { Authorization: "x" }, tools: [] },
+};
+const { servers, allowed } = claudeMcp(mcp);
+assert.deepEqual(allowed, ["mcp__web_browser__browser_snapshot", "mcp__docs"]);
+assert.equal(servers["web.browser"].tools, undefined);
+assert.equal(servers["web.browser"].alwaysLoad, true);
+assert.equal(servers.docs.url, "https://docs.example.com/mcp");
+assert.equal(toolRefusal(ws, "read-only", "mcp__web_browser__browser_snapshot", {}, mcp), null);
+assert.equal(toolRefusal(ws, "read-only", "mcp__docs__search", {}, mcp), null);
+assert.match(toolRefusal(ws, "full", "mcp__web_browser__browser_evaluate", {}, mcp), /not one of the tools/);
+assert.match(toolRefusal(ws, "full", "mcp__other__x", {}, mcp), /not from an MCP server/);
+assert.match(toolRefusal(ws, "full", "mcp__docs__search"), /not from an MCP server/);
 
 console.error("bridge policy ok");

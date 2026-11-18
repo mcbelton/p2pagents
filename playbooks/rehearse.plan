@@ -1,0 +1,21 @@
+// Rehearse the reviews of a feature before they happen. Agents on a squad of
+// reviewers each play one stakeholder (the tech lead, the security and privacy
+// champions, the product owner, leadership and a customer), read the review pack and
+// raise what that person would raise, all at the same time. A peer then merges their
+// feedback into review/rehearsal.md: readiness, each audience's likely verdict, an
+// action for every concern and prepared answers, proven by the built-in
+// review:rehearsal check. You decide what to fix before the real reviews.
+// Run it after the design playbook, on the folder with the review pack (review/,
+// design/, spec/): shared with the squad's members (read access is enough) and with
+// the peer (edit access).
+// Vars: peer, folder, change (the feature), reviewers (a squad), approver
+claim: RHS-1 Every audience's likely verdict and concerns are known before the real reviews, and every serious concern has an action or a prepared answer
+claim: RHS-2 The feature's owner decided what to fix before the real reviews
+technical #{{reviewers}}:{{folder}} skill=stakeholder-simulation Rehearse the technical review of: {{change}}. Play the tech lead. Read review/technical.md, design/ and spec/.
+security #{{reviewers}}:{{folder}} skill=stakeholder-simulation Rehearse the security review of: {{change}}. Play the security champion. Read design/threat-model.md, design/dataflow.md and review/technical.md.
+privacy #{{reviewers}}:{{folder}} skill=stakeholder-simulation Rehearse the privacy review of: {{change}}. Play the privacy champion. Read design/data-dictionary.md, design/dataflow.md and spec/SPEC.md.
+product #{{reviewers}}:{{folder}} skill=stakeholder-simulation Rehearse the product review of: {{change}}. Play the product owner. Read review/product.md, spec/SPEC.md and prototype/.
+leadership #{{reviewers}}:{{folder}} skill=stakeholder-simulation Rehearse the leadership review of: {{change}}. Play a member of the leadership team. Read review/leadership.md.
+customer #{{reviewers}}:{{folder}} skill=stakeholder-simulation Rehearse a customer's reaction to: {{change}}. Play a customer who would use it. Read only review/customer-feedback.md and answer in plain words.
+synthesis after technical,security,privacy,product,leadership,customer @{{peer}}:{{folder}} skill=feedback-synthesis verify=review:rehearsal attempts=3 claims=RHS-1 Merge the rehearsed reviews of: {{change}} into review/rehearsal.md.
+accept after synthesis approve @{{approver}} claims=RHS-2 Decide what to fix before the real reviews of: {{change}}. Read review/rehearsal.md in the review pack.

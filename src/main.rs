@@ -58,6 +58,10 @@ enum Command {
     /// Manage the folders a profile shares with peers for their tasks.
     #[command(subcommand)]
     Share(ShareCommand),
+    /// MCP servers (e.g. a browser, a docs or ticket system) a shared folder offers
+    /// to peers' tasks: you define them, peers only learn their names.
+    #[command(subcommand)]
+    Mcp(McpCommand),
     /// Create digital workers: agents with their own peer identity that run on
     /// their owner's accounts.
     #[command(subcommand)]
@@ -71,7 +75,7 @@ enum Command {
     /// The knowledge base: what agents learned about your systems (topics, TSGs).
     #[command(subcommand)]
     Kb(KbCommand),
-    /// Ready-made plans: bootstrap, discover, sdlc, learn, spec, design, implement-spec.
+    /// Ready-made plans: bootstrap, discover, sdlc, learn, spec, design, implement-spec, rehearse.
     #[command(subcommand)]
     Playbook(PlaybookCommand),
     /// Skills: instructions agents follow in plan steps (skill=name). Built-in ones
@@ -98,6 +102,10 @@ enum Command {
     /// TSGs or the debugging agent try to fix.
     #[command(subcommand)]
     Monitor(MonitorCommand),
+    /// Scheduled plans: plans or playbooks the agent runs on its own at set times
+    /// (each run is an evidence run).
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
     /// Operations: health report and incidents.
     #[command(subcommand)]
     Ops(OpsCommand),
@@ -365,7 +373,7 @@ checks:
   spec:spec spec:api spec:ux spec:trace              the spec package (spec/, prototype/, evidence/claims.json)
   design:arch design:data design:threats             the design package (design/)
   design:tests design:ops
-  review:decks                                       the review pack (review/)
+  review:decks review:rehearsal                      the review pack (review/) and its rehearsal
 'all' (the default) runs the spec checks, and the design and review checks when
 design/ and review/ exist; name a check or a group (spec, design, review) to run it
 anyway. Short names work too: api, threats, decks.
@@ -458,6 +466,59 @@ Then run it in an agent with /plan <file>, or pick the playbook in the web UI's 
         /// A value for a placeholder: NAME=VALUE (repeatable).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         set: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    /// Run a plan file or a playbook at set times (replaces a schedule of that name).
+    #[command(after_help = "\
+when (local time): 'every 30m', 'every 2h', 'daily 09:00', 'weekdays 08:30', 'mon,fri 17:00'
+examples:
+  p2pagents schedule add nightly-learn --when \"daily 02:00\" --playbook learn --set peer=alice --set folder=app --profile boss
+  p2pagents schedule add smoke --when \"every 1h\" --plan smoke.plan --profile boss
+Schedules run while the profile's agent runs (with or without --ui), never overlap
+themselves, and each run is saved as an evidence run. A run missed while the agent
+was off runs once when it starts again.")]
+    Add {
+        name: String,
+        /// When to run, e.g. "weekdays 09:00" or "every 2h".
+        #[arg(long)]
+        when: String,
+        /// A plan file to run.
+        #[arg(long, conflicts_with = "playbook")]
+        plan: Option<PathBuf>,
+        /// A playbook to run, filled in with --set values.
+        #[arg(long)]
+        playbook: Option<String>,
+        /// A value for a playbook placeholder: NAME=VALUE (repeatable).
+        #[arg(long = "set", value_name = "NAME=VALUE", requires = "playbook")]
+        set: Vec<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// List a profile's schedules, their next run and last verdict.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Stop running a schedule until resumed.
+    Pause {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Run a paused schedule again (its next run counts from now).
+    Resume {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Delete a schedule.
+    Remove {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
     },
 }
 
@@ -583,6 +644,61 @@ rights, so only peers with full access may request them.")]
     },
     /// Stop sharing a folder.
     Remove {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Offer an MCP server to peers' tasks in a shared folder (they ask for it with
+    /// mcp=NAME in a plan step).
+    #[command(after_help = "\
+examples:
+  p2pagents mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot -- npx @playwright/mcp@latest --headless
+  p2pagents mcp add app docs --url https://docs.example.com/mcp --header \"Authorization=Bearer <token>\"
+  plan step:  check @alice:app mcp=browser Open http://localhost:3000 and report what the home page shows
+The server runs on this machine with your rights; commands, variables, headers and
+URLs stay here (peers learn only the names they may use). Tasks call only the tools
+you list (default: all), and tool results are treated as untrusted data.")]
+    Add {
+        /// The shared folder whose tasks may use the server.
+        share: String,
+        /// Name tasks use for the server.
+        name: String,
+        /// A remote server's URL (https://, or http:// on this machine).
+        #[arg(long)]
+        url: Option<String>,
+        /// A header for the remote server: NAME=VALUE (repeatable).
+        #[arg(long = "header", value_name = "NAME=VALUE", requires = "url")]
+        headers: Vec<String>,
+        /// The remote server uses Server-Sent Events.
+        #[arg(long, requires = "url")]
+        sse: bool,
+        /// An environment variable for a local server: NAME=VALUE (repeatable).
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+        /// A tool tasks may call (repeatable; default: all of the server's tools).
+        #[arg(long = "tool", value_name = "TOOL")]
+        tools: Vec<String>,
+        /// The least access a peer's task needs to use the server.
+        #[arg(long, value_enum, default_value_t = Access::Full)]
+        access: Access,
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// A local server: its command and arguments, after `--`.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// List the MCP servers a profile's shared folders offer (secrets hidden).
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Stop offering an MCP server.
+    Remove {
+        share: String,
         name: String,
         #[command(flatten)]
         profile: ProfileArg,
@@ -787,6 +903,7 @@ async fn main() -> Result<()> {
         Some(Command::Auth(command)) => run_auth(command).await,
         Some(Command::Peers(command)) => run_peers(command),
         Some(Command::Share(command)) => run_share(command),
+        Some(Command::Mcp(command)) => run_mcp(command),
         Some(Command::Worker(command)) => run_worker(command),
         Some(Command::Squad(command)) => run_squad(command),
         Some(Command::Runs(command)) => run_runs(command),
@@ -798,6 +915,7 @@ async fn main() -> Result<()> {
         Some(Command::Github(command)) => run_github(command),
         Some(Command::Repo(command)) => run_repo(command).await,
         Some(Command::Monitor(command)) => run_monitor(command),
+        Some(Command::Schedule(command)) => run_schedule(command),
         Some(Command::Ops(command)) => run_ops(command),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
@@ -965,7 +1083,60 @@ fn share_extras(share: &p2pagents::shares::Share) -> String {
     if share.worktrees {
         extras += "; a git worktree per editing task";
     }
+    if !share.mcp.is_empty() {
+        extras += &format!(
+            "; MCP servers: {}",
+            share.mcp.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
     extras
+}
+
+/// Runs the profile's scheduled plans in the background while the agent runs (the
+/// web UI runs its own, so their steps show up there).
+fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
+    use p2pagents::schedule::{Launch, Schedule, ScheduleStore, Scheduler};
+    let store = ScheduleStore::load(&profile.schedules_path())?;
+    if !store.schedules.is_empty() {
+        println!(
+            "schedules: {}",
+            store
+                .schedules
+                .iter()
+                .map(|s| format!(
+                    "{} ({}{})",
+                    s.name,
+                    s.when,
+                    if s.enabled { "" } else { ", paused" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let (agent, owner) = (agent.clone(), profile.clone());
+    let launch: Launch = Arc::new(move |s: Schedule| {
+        let (agent, profile) = (agent.clone(), owner.clone());
+        Box::pin(async move {
+            println!("=== scheduled plan '{}' started ({}) ===", s.name, s.when);
+            let run = p2pagents::plan::execute(&agent, &profile, &s.plan, print_step).await;
+            match &run {
+                Ok(run) => println!(
+                    "=== scheduled plan '{}' finished: {} (runs show {}) ===",
+                    s.name,
+                    run.verdict_line(),
+                    run.id
+                ),
+                Err(e) => eprintln!("scheduled plan '{}' did not run: {e:#}", s.name),
+            }
+            Ok(run?.verdict_line())
+        })
+    });
+    let tick = std::env::var("P2PAGENTS_SCHEDULE_TICK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    Scheduler::new(profile.schedules_path(), launch).spawn(Duration::from_secs(tick));
+    Ok(())
 }
 
 /// Runs the profile's monitors in the background (if any). Incidents are printed and
@@ -1309,6 +1480,10 @@ fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
                     println!("{folder}/: not started (p2pagents design init writes a starter)");
                 }
             }
+            // A rehearsal is optional: the rehearse playbook writes it.
+            if !dir.join("review").join("rehearsal.md").exists() {
+                names.retain(|n| *n != "review:rehearsal");
+            }
             names
         }
         "design" | "review" => group(&format!("{part}:")),
@@ -1487,16 +1662,115 @@ fn run_playbook(command: PlaybookCommand) -> Result<()> {
             );
         }
         PlaybookCommand::Show { name, set } => {
-            let mut vars = std::collections::BTreeMap::new();
-            for pair in set {
-                let (k, v) = pair
-                    .split_once('=')
-                    .with_context(|| format!("--set {pair:?} must look like NAME=VALUE"))?;
-                vars.insert(k.trim().to_owned(), v.to_owned());
-            }
-            print!("{}", playbooks::render(&name, &vars)?);
+            print!("{}", playbooks::render(&name, &set_vars(&set)?)?);
         }
     }
+    Ok(())
+}
+
+/// `--set NAME=VALUE` playbook values.
+fn set_vars(set: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut vars = std::collections::BTreeMap::new();
+    for pair in set {
+        let (k, v) = pair
+            .split_once('=')
+            .with_context(|| format!("--set {pair:?} must look like NAME=VALUE"))?;
+        vars.insert(k.trim().to_owned(), v.to_owned());
+    }
+    Ok(vars)
+}
+
+fn run_schedule(command: ScheduleCommand) -> Result<()> {
+    use p2pagents::schedule::{Schedule, ScheduleStore};
+    let when = |s: &Schedule| {
+        s.next_run()
+            .map(|t| t.format("%a %Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "paused".into())
+    };
+    match command {
+        ScheduleCommand::Add {
+            name,
+            when: at,
+            plan,
+            playbook,
+            set,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let (text, source) = match (plan, playbook) {
+                (Some(file), None) => (
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("reading plan file {}", file.display()))?,
+                    file.display().to_string(),
+                ),
+                (None, Some(book)) => (
+                    p2pagents::playbooks::render(&book, &set_vars(&set)?)?,
+                    format!("playbook {book}"),
+                ),
+                _ => bail!("give the plan to run: --plan FILE or --playbook NAME (with --set)"),
+            };
+            let schedule = Schedule::new(&name, &at, &text, &source)?;
+            let path = profile.schedules_path();
+            let mut store = ScheduleStore::load(&path)?;
+            let next = when(&schedule);
+            store.add(schedule);
+            store.save(&path)?;
+            println!(
+                "profile '{}': scheduled '{name}' ({at}; next run {next}). It runs while this profile's agent runs; each run is an evidence run.",
+                profile.name
+            );
+        }
+        ScheduleCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            for s in ScheduleStore::load(&profile.schedules_path())?.schedules {
+                println!(
+                    "  {:<14} {:<20} next: {:<22} {}{}",
+                    s.name,
+                    s.when,
+                    when(&s),
+                    s.source,
+                    s.last_result
+                        .as_deref()
+                        .map(|r| format!("\n  {:<14} last: {r}", ""))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        ScheduleCommand::Remove { name, profile } => {
+            let profile = Profile::open(&profile.name)?;
+            let path = profile.schedules_path();
+            let mut store = ScheduleStore::load(&path)?;
+            if !store.remove(&name) {
+                bail!("profile '{}' has no schedule named '{name}'", profile.name);
+            }
+            store.save(&path)?;
+            println!("profile '{}': removed schedule '{name}'", profile.name);
+        }
+        ScheduleCommand::Pause { name, profile } => set_enabled(&name, &profile.name, false)?,
+        ScheduleCommand::Resume { name, profile } => set_enabled(&name, &profile.name, true)?,
+    }
+    Ok(())
+}
+
+fn set_enabled(name: &str, profile: &str, enabled: bool) -> Result<()> {
+    use p2pagents::schedule::ScheduleStore;
+    let profile = Profile::open(profile)?;
+    let path = profile.schedules_path();
+    let mut store = ScheduleStore::load(&path)?;
+    let schedule = store
+        .get_mut(name)
+        .with_context(|| format!("profile '{}' has no schedule named '{name}'", profile.name))?;
+    schedule.enabled = enabled;
+    if enabled {
+        // Resuming starts the clock again instead of catching up on paused runs.
+        schedule.last_run_unix = Some(chrono::Local::now().timestamp());
+    }
+    store.save(&path)?;
+    println!(
+        "profile '{}': schedule '{name}' {}",
+        profile.name,
+        if enabled { "resumed" } else { "paused" }
+    );
     Ok(())
 }
 
@@ -1736,6 +2010,86 @@ fn run_share(command: ShareCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_mcp(command: McpCommand) -> Result<()> {
+    use p2pagents::mcp::{McpServer, parse_pairs};
+    match command {
+        McpCommand::Add {
+            share,
+            name,
+            url,
+            headers,
+            sse,
+            env,
+            tools,
+            access,
+            profile,
+            command,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut shares = profile.shares()?;
+            let mut server = match (url, command.split_first()) {
+                (Some(url), None) => McpServer::remote(url, sse),
+                (None, Some((cmd, args))) => McpServer::local(cmd.clone(), args.to_vec()),
+                (Some(_), Some(_)) => bail!("give either --url or a command after --, not both"),
+                (None, None) => {
+                    bail!("give the server's command after -- (local) or its --url (remote)")
+                }
+            };
+            server.env = parse_pairs(&env, "variable")?;
+            server.headers = parse_pairs(&headers, "header")?;
+            server.tools = tools;
+            server.access = access;
+            shares.add_mcp(&share, &name, server.clone())?;
+            shares.save(&profile.shares_path())?;
+            println!(
+                "profile '{}': tasks in '{share}' with at least {access} access may use MCP server '{name}' ({}); tools: {}. Peers ask for it with mcp={name} in a plan step.",
+                profile.name,
+                server.describe(),
+                if server.tools.is_empty() {
+                    "all".to_owned()
+                } else {
+                    server.tools.join(", ")
+                }
+            );
+        }
+        McpCommand::List { profile } => {
+            let profile = Profile::open(&profile.name)?;
+            for share in profile.shares()?.shares {
+                for (name, server) in &share.mcp {
+                    println!(
+                        "  {:<20} {}+ access, tools: {}  {}",
+                        format!("{}/{name}", share.name),
+                        server.access,
+                        if server.tools.is_empty() {
+                            "all".to_owned()
+                        } else {
+                            server.tools.join(",")
+                        },
+                        server.describe()
+                    );
+                }
+            }
+        }
+        McpCommand::Remove {
+            share,
+            name,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut shares = profile.shares()?;
+            if !shares.remove_mcp(&share, &name)? {
+                bail!("folder '{share}' offers no MCP server named '{name}'");
+            }
+            shares.save(&profile.shares_path())?;
+            println!(
+                "profile '{}': '{share}' no longer offers MCP server '{name}'",
+                profile.name
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_peers(command: PeersCommand) -> Result<()> {
     match command {
         PeersCommand::Id { profile } => {
@@ -1943,10 +2297,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             .await?,
         )
     };
-    let local = TaskContext {
-        access: args.access,
-        workspace: std::path::absolute(&args.workspace)?,
-    };
+    let local = TaskContext::new(args.access, std::path::absolute(&args.workspace)?);
     let shares = profile.shares()?;
 
     let (agent, mut events) = {
@@ -2075,6 +2426,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         agent.shutdown().await;
         return Ok(());
     }
+    start_schedules(&profile, &agent)?;
 
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -2157,7 +2509,18 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     let shares: Vec<String> = peer
                         .shares
                         .iter()
-                        .map(|s| format!("{} ({})", s.name, s.access))
+                        .map(|s| {
+                            format!(
+                                "{} ({}{})",
+                                s.name,
+                                s.access,
+                                if s.mcp.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("; MCP: {}", s.mcp.join(", "))
+                                }
+                            )
+                        })
                         .collect();
                     println!(
                         "  {} ({}){} serves {:?}{}",
@@ -2546,6 +2909,26 @@ mod tests {
         ]));
         assert!(!parse(&["runs", "verify", "20261115-1"]));
         assert!(!parse(&["runs", "verify"]));
+    }
+
+    #[test]
+    fn all_checks_include_the_rehearsal_only_once_there_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["design", "review"] {
+            std::fs::create_dir(dir.path().join(folder)).unwrap();
+        }
+        let all = spec_checks("all", dir.path()).unwrap();
+        assert!(all.contains(&"review:decks") && !all.contains(&"review:rehearsal"));
+        std::fs::write(dir.path().join("review/rehearsal.md"), "# Rehearsal\n").unwrap();
+        assert!(
+            spec_checks("all", dir.path())
+                .unwrap()
+                .contains(&"review:rehearsal")
+        );
+        assert_eq!(
+            spec_checks("rehearsal", dir.path()).unwrap(),
+            ["review:rehearsal"]
+        );
     }
 
     #[test]
