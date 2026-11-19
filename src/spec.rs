@@ -46,6 +46,28 @@ pub fn is_built_in(check: &str) -> bool {
     BUILT_IN_CHECKS.contains(&check)
 }
 
+/// What built-in check `check` proves, in a line (for the plan builder).
+pub fn about(check: &str) -> &'static str {
+    match check {
+        "spec:spec" => "spec/SPEC.md has user stories with testable acceptance criteria",
+        "spec:api" => {
+            "spec/openapi.json is a REST API contract serving the acceptance criteria, with examples"
+        }
+        "spec:ux" => "prototype/index.html is a clickable prototype of the stories",
+        "spec:trace" => "evidence/claims.json has a claim for every acceptance criterion",
+        "design:arch" => "design/ has the architecture, workflows and ADRs, traced to the spec",
+        "design:data" => "design/ has the data dictionary and data flows with their protection",
+        "design:threats" => "design/threat-model.md has STRIDE threats with mitigations",
+        "design:tests" => {
+            "design/test-plan.md tests every acceptance criterion and high-risk threat"
+        }
+        "design:ops" => "design/operations.md has rollout, rollback, SLOs, alerts and runbooks",
+        "review:decks" => "review/ has a document for each review audience in its own form",
+        "review:rehearsal" => "review/rehearsal.md has each audience's likely verdict and answers",
+        _ => "",
+    }
+}
+
 /// The outcome of a check: what is wrong (nothing if it passes) and what was seen.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {

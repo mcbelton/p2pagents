@@ -1277,34 +1277,47 @@ async function submitPlaybook(e) {
   }
 }
 
+/// A button that makes one of the plan check's fixes in the plan `input` (the composer
+/// or the plan editor), then checks the plan again into `box`.
+function fixButton(f, input, box) {
+  return el("button", {
+    type: "button", class: "btn small", title: "Change the plan this way",
+    onclick: () => {
+      input.value = planText.applyFix(input.value, f.edits);
+      const building = input.id === "plan-editor-text" && planBuilder.active();
+      if (building) planBuilder.load(input.value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      if (!building) input.focus();
+      checkPlan(input.value, box, input).catch(() => {});
+    },
+  }, f.label);
+}
+
 /// Checks the plan against connected peers, folders, checks, squads, knowledge and
 /// skills; shows the problems in `box` (under the plan's `input`), with buttons for
-/// the fixes the check offers; true if it can run.
+/// the fixes the check offers (in the plan builder, on the cards); true if it can run.
 async function checkPlan(text, box = $("#plan-problems"), input = $("#composer-input")) {
+  const building = input.id === "plan-editor-text" && planBuilder.active();
   if (!text.trim()) {
     box.hidden = true;
+    if (building) planBuilder.checked(null);
     return false;
   }
   const res = await api("/api/plans/check", { method: "POST", body: JSON.stringify({ text }) });
+  if (building) {
+    planBuilder.checked(res);
+    return res.ok;
+  }
   box.hidden = false;
   if (!res.problems.length) {
     box.replaceChildren(el("p", { class: "ok", text: `✓ Ready to run: ${nOf(res.steps, "step")}, ${nOf(res.claims, "claim")}` }));
     return true;
   }
-  const fix = (f) => el("button", {
-    type: "button", class: "btn small", title: "Change the plan this way",
-    onclick: () => {
-      input.value = planText.applyFix(input.value, f.edits);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.focus();
-      checkPlan(input.value, box, input).catch(() => {});
-    },
-  }, f.label);
   box.replaceChildren(
     el("p", { class: res.ok ? "warn" : "bad", text: res.ok ? "Ready to run, with warnings:" : "Can't run yet:" }),
     el("ul", {}, ...res.problems.map((p) => el("li", { class: p.error ? "bad" : "warn" },
       el("strong", { text: `${p.error ? "Error" : "Warning"}${p.step ? ` (step ${p.step})` : ""}: ` }), p.message,
-      p.fixes?.length ? el("span", { class: "fixes" }, ...p.fixes.map(fix)) : null))));
+      p.fixes?.length ? el("span", { class: "fixes" }, ...p.fixes.map((f) => fixButton(f, input, box))) : null))));
   return res.ok;
 }
 
@@ -1316,14 +1329,14 @@ function schedulePlanCheck() {
 }
 
 // ---------- plan editor ----------
-/// Opens the plan in a large editor, with what can go into it beside it.
+/// Opens the plan in a large editor: as forms (the builder) or as text with what can go
+/// into it beside it, whichever was used last.
 function openPlanEditor() {
   const editor = $("#plan-editor-text");
   editor.value = $("#composer-input").value;
-  renderPalette();
+  planBuilder.reset();
   $("#plan-editor").showModal();
-  editor.focus();
-  checkPlan(editor.value, $("#plan-editor-check"), editor).catch(() => {});
+  planBuilder.setView(planBuilder.view());
 }
 
 /// Makes a palette change in the plan editor (see ui/plan-text.js) and selects what
@@ -1894,7 +1907,10 @@ async function removePeer(t) {
 // ---------- live updates ----------
 async function loadState() {
   const s = await api("/api/state");
-  Object.assign(state, { me: s.me, peers: s.peers, trusted: s.trusted, squads: s.squads, feed: s.feed, tasks: s.tasks, approvals: s.approvals });
+  Object.assign(state, {
+    me: s.me, peers: s.peers, trusted: s.trusted, squads: s.squads, feed: s.feed, tasks: s.tasks,
+    approvals: s.approvals, builtinChecks: s.builtin_checks ?? [],
+  });
   renderMe();
   renderPeers();
   renderFeed();
@@ -2031,11 +2047,13 @@ function init() {
     schedulePlanCheck();
   });
   $("#plan-editor-run").addEventListener("click", () => {
+    if (!planBuilder.ready()) return;
     editorToComposer();
     $("#plan-editor").close();
     submitComposer();
   });
   $("#plan-editor-schedule").addEventListener("click", () => {
+    if (!planBuilder.ready()) return;
     editorToComposer();
     $("#plan-editor").close();
     openScheduleDialog();

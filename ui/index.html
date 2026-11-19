@@ -10,6 +10,7 @@
   <script src="/plan-text.js" defer></script>
 <script src="/app.js" defer></script>
   <script src="/tools.js" defer></script>
+<script src="/plan-builder.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#composer-input">Skip to message box</a>
@@ -331,11 +332,16 @@
     <div class="editor-shell">
       <div class="editor-head">
         <h2 id="plan-editor-h">Plan editor</h2>
-        <span class="muted small">Claims first, then one step per line · Ctrl+Enter runs the plan</span>
+        <div class="segmented" id="plan-view" role="radiogroup" aria-label="Edit the plan as">
+          <button type="button" role="radio" data-view="builder" aria-checked="true">Builder</button>
+          <button type="button" role="radio" data-view="text" aria-checked="false" tabindex="-1">Text</button>
+        </div>
+        <span class="muted small" id="plan-editor-tip">Fill in the cards · the plan is checked as you go · Ctrl+Enter runs it</span>
         <button type="button" class="btn small" id="plan-editor-close">Done</button>
       </div>
-      <div class="editor-body">
+      <div class="editor-body" id="plan-editor-body" data-view="builder">
         <div class="editor-main">
+          <div id="plan-builder" class="plan-builder"></div>
           <label for="plan-editor-text" class="visually-hidden">Plan</label>
           <textarea id="plan-editor-text" class="mono" spellcheck="false" autocomplete="off"></textarea>
           <div id="plan-editor-check" class="plan-problems" role="status" aria-live="polite"></div>

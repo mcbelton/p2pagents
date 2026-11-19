@@ -246,5 +246,162 @@ const planText = (() => {
     return text;
   }
 
-  return { addPart, addLine, applyFix, stepIds, claimIds, parseStep, formatStep, ERRORS };
+  // ---------- the plan as a model, for the plan builder (ui/plan-builder.js) ----------
+  /// The palette's placeholders (the plan check refuses to run them as they are).
+  const TODO_CLAIM = "What must be true at the end";
+  const blank = (text, todo) => !text.trim() || text.trim() === todo;
+
+  /// The values of a step's option, by the option it sets ("skill", "claims", ...).
+  function valuesOf(step, option) {
+    const word = step.options.find((o) => optionOf(o) === option);
+    return word ? valueOf(word).split(",").filter(Boolean) : [];
+  }
+
+  /// Sets a step's option to `values` (a list or one value) where it stands; no value
+  /// removes it.
+  function setValues(step, option, values) {
+    const list = [].concat(values ?? []).map((v) => String(v).trim()).filter(Boolean);
+    const at = step.options.findIndex((o) => optionOf(o) === option);
+    if (!list.length) {
+      if (at >= 0) step.options.splice(at, 1);
+      return;
+    }
+    const word = `${at >= 0 ? keyOf(step.options[at]) : option}=${list.join(",")}`;
+    if (at >= 0) step.options[at] = word;
+    else step.options.push(word);
+  }
+
+  /// The plan as the builder edits it: notes (comments before the first claim or step,
+  /// and after the last), claims and steps, each with the comments just above it.
+  /// Lenient, like the palette: a half-written line is a step with parts missing.
+  function parsePlan(text) {
+    const plan = { notes: [], claims: [], steps: [] };
+    let comments = [];
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      const kind = kindOf(t);
+      if (kind === "empty") continue;
+      if (kind === "comment") {
+        comments.push(t.replace(/^\/\/ ?/, ""));
+        continue;
+      }
+      if (!plan.claims.length && !plan.steps.length) {
+        plan.notes.push(...comments);
+        comments = [];
+      }
+      if (kind === "claim") {
+        const [, id, rest] = t.match(/^claim:\s*(\S*)\s*(.*)$/);
+        const named = NAME.test(id);
+        plan.claims.push({ id: named ? id : null, text: named ? rest : `${id} ${rest}`.trim(), notes: comments });
+      } else {
+        plan.steps.push({ ...parseStep(t), notes: comments });
+      }
+      comments = [];
+    }
+    plan.notes.push(...comments);
+    for (const c of plan.claims) c.id ??= freeId(plan.claims.map((x) => x.id), (n) => `C-${n}`, 1);
+    for (const s of plan.steps) s.id ??= freeId(plan.steps.map((x) => x.id), (n) => `step${n}`, 1);
+    return plan;
+  }
+
+  /// The text of `plan` (notes, claims, then steps), and what each line is: {claim}
+  /// or {step} by id, so the plan check's "line N" points at a card.
+  function formatPlan(plan) {
+    const lines = [];
+    const items = [];
+    const add = (text, item = null) => {
+      lines.push(text);
+      items.push(item);
+    };
+    const note = (n, item) => add(`// ${n}`.trimEnd(), item);
+    const gap = () => lines.length && lines.at(-1) !== "" && add("");
+    plan.notes.forEach((n) => note(n));
+    if (plan.claims.length) gap();
+    for (const c of plan.claims) {
+      c.notes?.forEach((n) => note(n, { claim: c.id }));
+      add(`claim: ${c.id} ${c.text}`.trimEnd(), { claim: c.id });
+    }
+    if (plan.steps.length) gap();
+    for (const s of plan.steps) {
+      s.notes?.forEach((n) => note(n, { step: s.id }));
+      add(formatStep(s), { step: s.id });
+    }
+    return { text: lines.join("\n"), items };
+  }
+
+  /// Renames step `from`, and where other steps wait for it or apply its work.
+  function renameStep(plan, from, to) {
+    for (const s of plan.steps) {
+      if (s.id === from) s.id = to;
+      s.after = s.after.map((d) => (d === from ? to : d));
+      if (valuesOf(s, "apply")[0] === from) setValues(s, "apply", to);
+    }
+  }
+
+  /// Removes step `id`, and where other steps wait for it or apply its work.
+  function removeStep(plan, id) {
+    plan.steps = plan.steps.filter((s) => s.id !== id);
+    for (const s of plan.steps) {
+      s.after = s.after.filter((d) => d !== id);
+      if (valuesOf(s, "apply")[0] === id) setValues(s, "apply", null);
+    }
+  }
+
+  /// Renames claim `from`, and where steps prove it.
+  function renameClaim(plan, from, to) {
+    for (const c of plan.claims) if (c.id === from) c.id = to;
+    for (const s of plan.steps) setValues(s, "claims", valuesOf(s, "claims").map((c) => (c === from ? to : c)));
+  }
+
+  /// Removes claim `id`, and where steps prove it.
+  function removeClaim(plan, id) {
+    plan.claims = plan.claims.filter((c) => c.id !== id);
+    for (const s of plan.steps) setValues(s, "claims", valuesOf(s, "claims").filter((c) => c !== id));
+  }
+
+  /// The steps that wait for step `id`, directly or not: it can't wait for them.
+  function dependents(plan, id) {
+    const found = new Set();
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const s of plan.steps) {
+        if (!found.has(s.id) && s.id !== id && s.after.some((d) => d === id || found.has(d))) {
+          found.add(s.id);
+          grew = true;
+        }
+      }
+    }
+    return found;
+  }
+
+  /// What must be filled in or fixed before the plan can run, by card and field:
+  /// {kind: "claim" | "step", index, field, message}.
+  function needs(plan) {
+    const out = [];
+    const need = (kind, index, field, message) => out.push({ kind, index, field, message });
+    const badName = "Use letters, digits, '-', '_' or '.'";
+    plan.claims.forEach((c, i) => {
+      if (!NAME.test(c.id)) need("claim", i, "id", badName);
+      else if (plan.claims.findIndex((x) => x.id === c.id) < i) need("claim", i, "id", `Another claim is ${c.id}`);
+      if (blank(c.text, TODO_CLAIM)) need("claim", i, "text", "Say what must be true");
+    });
+    plan.steps.forEach((s, i) => {
+      if (!NAME.test(s.id) || KEYWORDS.has(s.id)) need("step", i, "id", badName);
+      else if (plan.steps.findIndex((x) => x.id === s.id) < i) need("step", i, "id", `Another step is called ${s.id}`);
+      if (!s.target) need("step", i, "target", s.approve ? "Choose who signs off" : "Choose who does it");
+      if (blank(s.todo, TODO)) {
+        need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");
+      }
+      if (!s.approve && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
+        need("step", i, "claims", "Without a check, this step can't prove a claim: pick a check, or let a sign-off prove it");
+      }
+    });
+    return out;
+  }
+
+  return {
+    addPart, addLine, applyFix, stepIds, claimIds, parseStep, formatStep, ERRORS,
+    parsePlan, formatPlan, valuesOf, setValues, renameStep, removeStep, renameClaim, removeClaim,
+    dependents, needs, isTodo: (text) => blank(text, TODO), isTodoClaim: (text) => blank(text, TODO_CLAIM),
+  };
 })();

@@ -618,6 +618,13 @@ impl StepState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Problem {
     pub step: Option<String>,
+    /// The claim it is about, if any (the plan builder shows it there).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
+    /// What kind of problem it is, for the plan builder, which says some of them on
+    /// the field itself: `todo-task`, `todo-claim`, `unchecked-claim`, `unproven-claim`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
     pub error: bool,
     pub message: String,
     /// Changes to the plan that resolve it, which the web UI offers as buttons.
@@ -846,23 +853,30 @@ pub fn preflight(
     kb: &KnowledgeBase,
     skills: &Skills,
 ) -> Vec<Problem> {
-    let mut problems = Vec::new();
+    let mut problems: Vec<Problem> = plan
+        .steps
+        .iter()
+        .filter(|step| step.prompt == TODO_TASK)
+        .map(|step| Problem {
+            step: Some(step.id.clone()),
+            claim: None,
+            code: Some("todo-task"),
+            error: true,
+            message: format!("the task is still \"{TODO_TASK}\": say what the step should do"),
+            fixes: Vec::new(),
+        })
+        .collect();
     let mut report = |step: Option<&Step>, error: bool, message: String| {
         problems.push(Problem {
             step: step.map(|s| s.id.clone()),
+            claim: None,
+            code: None,
             error,
             message,
             fixes: Vec::new(),
         })
     };
     for step in &plan.steps {
-        if step.prompt == TODO_TASK {
-            report(
-                Some(step),
-                true,
-                format!("the task is still \"{TODO_TASK}\": say what the step should do"),
-            );
-        }
         if let Some(word) = step.prompt.split_whitespace().find(|w| is_option(w)) {
             report(
                 Some(step),
@@ -925,17 +939,21 @@ pub fn preflight(
     }
     // Each claim needs a step that can prove it: one with checks, or a sign-off.
     for claim in &plan.claims {
-        let mut warn = |step: Option<&Step>, message: String, fixes: Vec<Fix>| {
-            problems.push(Problem {
-                step: step.map(|s| s.id.clone()),
-                error: false,
-                message,
-                fixes,
-            })
-        };
+        let mut warn =
+            |step: Option<&Step>, code: &'static str, message: String, fixes: Vec<Fix>| {
+                problems.push(Problem {
+                    step: step.map(|s| s.id.clone()),
+                    claim: Some(claim.id.clone()),
+                    code: Some(code),
+                    error: false,
+                    message,
+                    fixes,
+                })
+            };
         if claim.text == TODO_CLAIM {
             warn(
                 None,
+                "todo-claim",
                 format!(
                     "claim {} still says \"{TODO_CLAIM}\": say what must be true",
                     claim.id
@@ -951,6 +969,7 @@ pub fn preflight(
         if proving.is_empty() {
             warn(
                 None,
+                "unproven-claim",
                 format!(
                     "Nothing proves {0}, so it will end unverified. Give it to a sign-off or to a step with a check (claims={0} verify=...), or remove it.",
                     claim.id
@@ -969,6 +988,7 @@ pub fn preflight(
             };
             warn(
                 Some(step),
+                "unchecked-claim",
                 format!(
                     "{} claims {} but nothing checks its work, {outcome}. Only a check the peer runs (verify=) or a sign-off can prove a claim.",
                     step.id, claim.id
@@ -1797,6 +1817,25 @@ mod tests {
             [
                 "E a: the task is still \"What to do\": say what the step should do",
                 "W : claim C-1 still says \"What must be true at the end\": say what must be true",
+            ]
+        );
+        // Coded, for the plan builder to say on the field instead.
+        let coded = |text: &str| {
+            preflight(&Plan::parse(text).unwrap(), &peers, &squads, &kb, &skills)
+                .into_iter()
+                .map(|p| (p.code, p.step, p.claim))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            coded("claim: C-1 What must be true at the end\na @alice:app claims=C-1 What to do"),
+            [
+                (Some("todo-task"), Some("a".to_owned()), None),
+                (Some("todo-claim"), None, Some("C-1".to_owned())),
+                (
+                    Some("unchecked-claim"),
+                    Some("a".to_owned()),
+                    Some("C-1".to_owned())
+                ),
             ]
         );
     }

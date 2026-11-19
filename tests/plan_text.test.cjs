@@ -1,4 +1,5 @@
-// Cases for the plan editor's palette (ui/plan-text.js); tests/ui.rs runs this with node.
+// Cases for the plan editor (ui/plan-text.js): its palette, the plan check's fixes and the
+// builder's model. tests/ui.rs runs this with node.
 // "|" marks the cursor before a click; the result shows the selection in [brackets].
 const fs = require("node:fs");
 const path = require("node:path");
@@ -98,10 +99,61 @@ const cases = [
   ["the last line removed", fixed("a @x do\nclaim: C-2 y", [{ do: "remove_claim", claim: "C-2" }]), "a @x do"],
 ];
 
+// The plan builder's model: a plan's text comes back as it was; renames and removals
+// keep it consistent; and what still has to be filled in, by card and field.
+const playbook = [
+  "// Existing project: reverse-engineer it.",
+  "// Vars: peer, folder",
+  "",
+  "claim: KB-1 The architecture is documented",
+  "claim: KB-2 Build and test are documented",
+  "",
+  "architecture @worker:repo skill=reverse-engineer save=architecture Reverse-engineer this codebase.",
+  "build @worker:repo skill=build-run-discovery verify=test claims=KB-2 save=build-and-run Find out how to build it.",
+  "confirm after architecture,build approve @me claims=KB-1 Check the knowledge.",
+].join("\n");
+const model = () => planText.parsePlan(playbook);
+const text = (plan) => planText.formatPlan(plan).text;
+const step = (plan, id) => plan.steps.find((s) => s.id === id);
+const edit = (change) => {
+  const plan = model();
+  change(plan);
+  return text(plan);
+};
+const needs = (plan) => planText.needs(plan).map((n) => `${n.kind}${n.index}.${n.field}: ${n.message}`).join(" | ");
+const broken = planText.parsePlan("skill=adr skill=api-contract");
+const placeholders = planText.parsePlan(
+  "claim: C-1 What must be true at the end\nstep1 @worker:repo skill=adr claims=C-1 What to do\nok approve @me",
+);
+cases.push(
+  ["a plan comes back as it was", text(model()), playbook],
+  ["which line is which", JSON.stringify(planText.formatPlan(model()).items.slice(2, 5)),
+    JSON.stringify([null, { claim: "KB-1" }, { claim: "KB-2" }])],
+  ["a half-written line is a step with parts missing", text(broken), "step1 skill=adr,api-contract"],
+  ["what it still needs", needs(broken), "step0.target: Choose who does it | step0.todo: Say what this step should do"],
+  ["placeholders count as missing", needs(placeholders),
+    "claim0.text: Say what must be true | step0.todo: Say what this step should do"
+    + " | step0.claims: Without a check, this step can't prove a claim: pick a check, or let a sign-off prove it"
+    + " | step1.todo: Say what to check before signing off"],
+  ["a rename reaches the steps that wait for it", edit((p) => planText.renameStep(p, "build", "build-docs")).split("\n").at(-1),
+    "confirm after architecture,build-docs approve @me claims=KB-1 Check the knowledge."],
+  ["a removed step is no longer waited for", edit((p) => planText.removeStep(p, "architecture")).split("\n").at(-1),
+    "confirm after build approve @me claims=KB-1 Check the knowledge."],
+  ["a renamed claim is proven under its new id", edit((p) => planText.renameClaim(p, "KB-2", "KB-9")).split("\n").at(-2),
+    "build @worker:repo skill=build-run-discovery verify=test claims=KB-9 save=build-and-run Find out how to build it."],
+  ["a removed claim is proven by no step", edit((p) => planText.removeClaim(p, "KB-1")).split("\n").at(-1),
+    "confirm after architecture,build approve @me Check the knowledge."],
+  ["options change where they stand", edit((p) => planText.setValues(step(p, "build"), "skill", ["a", "b"])).split("\n").at(-2),
+    "build @worker:repo skill=a,b verify=test claims=KB-2 save=build-and-run Find out how to build it."],
+  ["an emptied option goes", edit((p) => planText.setValues(step(p, "build"), "verify", [])).split("\n").at(-2),
+    "build @worker:repo skill=build-run-discovery claims=KB-2 save=build-and-run Find out how to build it."],
+  ["no waiting in circles", [...planText.dependents(model(), "architecture")].join(","), "confirm"],
+);
+
 const failed = cases.filter(([, got, want]) => got !== want);
 for (const [name, got, want] of failed) console.error(`${name}\n  want: ${JSON.stringify(want)}\n  got:  ${JSON.stringify(got)}`);
 if (failed.length) {
-  console.error(`${failed.length} of ${cases.length} palette cases failed`);
+  console.error(`${failed.length} of ${cases.length} plan editor cases failed`);
   process.exit(1);
 }
-console.log(`ok: ${cases.length} palette cases`);
+console.log(`ok: ${cases.length} plan editor cases`);

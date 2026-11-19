@@ -703,10 +703,10 @@
     {
       "id": "UX-1",
       "area": "ui",
-      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; a plan builder edits the same plan as forms (claims, then a card per task or sign-off) that can't express the usual mistakes: tasks prove claims only with a check, no step can wait for one that waits for it, renames and removals carry through, what a field still needs is said on it, and Run goes to the first; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
       "tests": [
         "ui::the_page_follows_the_ux_guidelines",
-        "ui::the_plan_editor_puts_each_part_where_it_belongs",
+        "ui::the_plan_editor_keeps_plans_valid",
         "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
       ]
     },

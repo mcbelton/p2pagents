@@ -95,7 +95,12 @@ Every list and panel defines three states:
   playbooks), use a picker: radio cards with a one-line description, and the details of
   the picked one beside them.
 - Structured input first, free text as the advanced option (the schedule picker
-  offers Repeat, time and days; "Custom" accepts the text form).
+  offers Repeat, time and days; "Custom" accepts the text form; the plan editor's
+  Builder offers forms, its Text view the plan syntax, editing the same plan).
+- A builder can't express what would be refused: choices come from what exists (peers,
+  folders, checks, skills), options that don't apply yet are disabled with the reason,
+  and renames and removals carry through. What a field still needs shows once you've
+  been there, or on Run, which goes to the first.
 - Insert buttons for a text syntax (the plan editor's palette) never paste raw text at
   the cursor: each part goes where the syntax expects it, into the line the cursor is on
   (or a new line), and a placeholder to type over is selected. Errors about that syntax

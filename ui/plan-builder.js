@@ -1,0 +1,654 @@
+// The plan builder: a plan's claims and steps as forms, so a plan is written without
+// knowing its syntax and can't hold the usual mistakes: a step without a task or
+// someone to run it, a claim nothing can prove, a step waiting for itself. It edits
+// the plan text through ui/plan-text.js, so the editor's Text view shows the same plan.
+"use strict";
+
+const planBuilder = (() => {
+  const VIEW_KEY = "p2pagents-plan-view";
+  let plan = null;
+  /// What each line of the plan text is (planText.formatPlan), for "line N" messages.
+  let lines = [];
+  /// The plan check's last result.
+  let check = null;
+  /// Cards added here, with the fields you have been in: what they still need shows
+  /// once you have been there (or after Run); a plan you open shows it all at once.
+  let fresh = new WeakMap();
+  let showAll = false;
+  /// Open sections and filters, kept across re-renders.
+  const open = new Set();
+  const filters = new Map();
+  /// The field to focus after the next render (a card just added).
+  let focusNext = null;
+
+  const editor = () => $("#plan-editor-text");
+  const root = () => $("#plan-builder");
+  const active = () => $("#plan-editor-body").dataset.view === "builder";
+  const cardKey = (kind, i) => `${kind === "claim" ? "c" : "s"}${i}`;
+
+  // ---------- what peers offer ----------
+  const workers = () => state.peers.filter((p) => p.capabilities.length);
+
+  /// Who can do a step: each worker in its data folder and in the folders it shares
+  /// with you, and each squad.
+  function runners() {
+    const peers = workers().flatMap((p) => [
+      [`@${p.name}`, `${p.name}, in its data folder`],
+      ...(p.shares ?? []).filter((f) => f.name !== "data")
+        .map((f) => [`@${p.name}:${f.name}`, `${p.name}, in ${f.name} (${ACCESS_SHORT[f.access] ?? f.access})`]),
+    ]);
+    const squads = (state.squads ?? []).map((q) => [`#${q.name}`, `#${q.name}: any online member`]);
+    return { Peers: peers, Squads: squads };
+  }
+
+  /// Who can sign off: you, or a teammate on the allowlist.
+  function signers() {
+    return {
+      People: [["@me", "me (you, in this UI)"],
+        ...state.trusted.map((t) => [`@${t.name}`, `${t.name}${t.connected ? "" : " (not connected)"}`])],
+    };
+  }
+
+  /// The folder a step runs in, as its peer (or a squad's online members) share it:
+  /// checks, MCP servers, worktrees and access.
+  function folderOf(target) {
+    if (!target) return null;
+    const [who, name = "data"] = target.slice(1).split(":");
+    const peers = target.startsWith("#")
+      ? state.peers.filter((p) => (state.squads ?? []).find((q) => q.name === who)?.members.some((m) => m.name === p.name))
+      : state.peers.filter((p) => p.name === who);
+    const shares = peers.flatMap((p) => (p.shares ?? []).filter((f) => f.name === name));
+    if (!shares.length) return null;
+    return {
+      name,
+      checks: [...new Set(shares.flatMap((f) => f.checks ?? []))],
+      mcp: [...new Set(shares.flatMap((f) => f.mcp ?? []))],
+      about: Object.assign({}, ...shares.map((f) => f.mcp_about ?? {})),
+      worktrees: shares.some((f) => f.worktrees),
+    };
+  }
+
+  // ---------- building blocks ----------
+  /// A field: the label above the control, a hint and what it still needs below.
+  function field(key, label, control, hint) {
+    control.id = `pb-${key}`;
+    control.dataset.key = key;
+    const described = [hint ? `${control.id}-hint` : null, `${control.id}-need`].filter(Boolean).join(" ");
+    control.setAttribute("aria-describedby", described);
+    return el("div", { class: "pb-field" },
+      el("label", { for: control.id, text: label }),
+      control,
+      hint ? el("p", { class: "muted small pb-hint", id: `${control.id}-hint`, text: hint }) : null,
+      el("p", { class: "pb-need", id: `${control.id}-need`, "data-need": key, hidden: true }));
+  }
+
+  /// A group of checkboxes under a legend.
+  function group(key, legend, items, hint, ...after) {
+    return el("fieldset", { class: "pb-field pb-group", "data-group": key },
+      el("legend", { text: legend }),
+      hint ? el("p", { class: "muted small pb-hint", text: hint }) : null,
+      items.length ? el("div", { class: "pb-checks" }, ...items) : null,
+      ...after,
+      el("p", { class: "pb-need", "data-need": key, hidden: true }));
+  }
+
+  function checkbox(key, label, checked, onChange, { disabled = false, title } = {}) {
+    const box = el("input", { type: "checkbox", "data-key": key, checked, disabled });
+    box.addEventListener("change", () => onChange(box.checked));
+    return el("label", { class: "pb-check", title }, box, el("span", {}, label));
+  }
+
+  function select(groups, value, empty) {
+    const known = Object.values(groups).flat().map(([v]) => v);
+    const s = el("select", {},
+      el("option", { value: "", text: empty }),
+      ...Object.entries(groups).filter(([, opts]) => opts.length).map(([name, opts]) =>
+        el("optgroup", { label: name }, ...opts.map(([v, label]) => el("option", { value: v, text: label })))),
+      value && !known.includes(value) ? el("option", { value, text: `${value} (not available now)` }) : null);
+    s.value = value ?? "";
+    return s;
+  }
+
+  /// A <details> that stays open across re-renders.
+  function details(key, summary, children, startOpen = false) {
+    const d = el("details", { class: "pb-details", open: open.has(key) || startOpen }, el("summary", { text: summary }), ...children);
+    d.addEventListener("toggle", () => (d.open ? open.add(key) : open.delete(key)));
+    return d;
+  }
+
+  /// Toggles `value` in a step's list option.
+  const toggle = (s, option, value) => (on) => {
+    const now = planText.valuesOf(s, option);
+    planText.setValues(s, option, on ? [...now, value] : now.filter((v) => v !== value));
+  };
+
+  const removeButton = (label, onclick) =>
+    el("button", { type: "button", class: "icon-btn", title: label, "aria-label": label, onclick }, icon(ICONS.trash));
+
+  // ---------- claims ----------
+  function claimRow(c, i) {
+    const k = cardKey("claim", i);
+    const id = el("input", { type: "text", class: "mono pb-id", spellcheck: "false", autocomplete: "off" });
+    id.value = c.id;
+    id.addEventListener("change", () => rename("claim", c, id));
+    const text = el("input", { type: "text", spellcheck: "true", placeholder: "What must be true at the end, e.g. The login change has an approved API contract" });
+    text.value = planText.isTodoClaim(c.text) ? "" : c.text;
+    text.addEventListener("input", () => { c.text = text.value; changed(); });
+    const remove = removeButton(`Remove claim ${c.id}`, async () => {
+      const proving = plan.steps.filter((s) => planText.valuesOf(s, "claims").includes(c.id)).map((s) => s.id);
+      if (!planText.isTodoClaim(c.text) && !(await confirmDialog({
+        title: `Remove claim ${c.id}?`,
+        body: `Its statement goes${proving.length ? `, and ${proving.join(", ")} no longer ${proving.length === 1 ? "proves" : "prove"} it` : ""}.`,
+        confirm: "Remove claim", danger: true,
+      }))) return;
+      planText.removeClaim(plan, c.id);
+      changed(true);
+    });
+    return el("li", { class: "pb-claim", "data-card": k },
+      el("div", { class: "pb-claim-row" },
+        field(`${k}-id`, "Id", id),
+        field(`${k}-text`, "What must be true", text),
+        remove),
+      el("div", { class: "pb-marks", "data-marks": k }));
+  }
+
+  // ---------- steps ----------
+  function stepCard(s, i) {
+    const k = cardKey("step", i);
+    const name = el("input", { type: "text", class: "mono pb-id", spellcheck: "false", autocomplete: "off" });
+    name.value = s.id;
+    name.addEventListener("change", () => rename("step", s, name));
+    const kind = el("div", { class: "segmented pb-kind", role: "radiogroup", "aria-label": `Step ${s.id} is` },
+      ...[[false, "Agent task"], [true, "Sign-off"]].map(([approve, label]) => el("button", {
+        type: "button", role: "radio", "aria-checked": String(s.approve === approve),
+        tabindex: s.approve === approve ? "0" : "-1", "data-key": `${k}-kind-${approve ? "signoff" : "task"}`,
+      }, label)));
+    radioGroup(kind, (btn) => setKind(s, btn.dataset.key.endsWith("signoff")));
+    const remove = removeButton(`Remove step ${s.id}`, async () => {
+      if (!planText.isTodo(s.todo) && !(await confirmDialog({
+        title: `Remove step ${s.id}?`,
+        body: "What it does goes, and steps that wait for it no longer do.",
+        confirm: "Remove step", danger: true,
+      }))) return;
+      planText.removeStep(plan, s.id);
+      changed(true);
+    });
+    const head = el("div", { class: "pb-head" },
+      field(`${k}-id`, "Step", name), kind,
+      el("span", { class: "pb-badge", "data-badge": k, hidden: true, text: "Incomplete" }),
+      remove);
+
+    const who = select(s.approve ? signers() : runners(), s.target, s.approve ? "Choose who signs off…" : "Choose who does it…");
+    who.addEventListener("change", () => {
+      s.target = who.value || null;
+      if (s.approve) s.target = s.target?.split(":")[0] ?? null;
+      changed(true);
+    });
+    const todo = el("textarea", {
+      rows: 2, spellcheck: "true",
+      placeholder: s.approve ? "What the approver checks, e.g. The ADRs cover every decision and the contract has examples"
+        : "What the agent does, e.g. Write the ADRs for the login change, and its REST API contract",
+    });
+    todo.value = planText.isTodo(s.todo) ? "" : s.todo;
+    // A step is one line of the plan: Enter doesn't break it (Ctrl+Enter runs the plan).
+    todo.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.ctrlKey && !e.metaKey) e.preventDefault(); });
+    todo.addEventListener("input", () => { s.todo = todo.value.replace(/\s*\n\s*/g, " "); changed(); });
+
+    const body = s.approve
+      ? [field(`${k}-target`, "Who signs off", who, "Their answer is signed evidence"),
+        field(`${k}-todo`, "What to check", todo, "The approver sees this and the results of the steps it waits for"),
+        provesField(s, k, true), waitsField(s, k)]
+      : [field(`${k}-target`, "Who does it", who, "A peer and one of the folders it shares with you, or any member of a squad"),
+        field(`${k}-todo`, "What to do", todo),
+        skillsField(s, k), checksField(s, k), provesField(s, k, planText.valuesOf(s, "verify").length > 0),
+        waitsField(s, k), moreOptions(s, k)];
+    return el("li", { class: `pb-step${s.approve ? " signoff" : ""}`, "data-card": k }, head, ...body,
+      el("div", { class: "pb-marks", "data-marks": k }));
+  }
+
+  function skillsField(s, k) {
+    const chosen = planText.valuesOf(s, "skill");
+    const chips = chosen.map((name) => el("span", { class: "pb-chip" }, el("span", { class: "mono", text: name }),
+      el("button", {
+        type: "button", class: "pb-chip-x", "aria-label": `Remove skill ${name}`, title: `Remove skill ${name}`,
+        "data-key": `${k}-skill-x-${name}`, onclick: () => { toggle(s, "skill", name)(false); changed(true); },
+      }, "×")));
+    const filterKey = `${k}-skills`;
+    const filter = el("input", { type: "search", placeholder: "Filter skills…", "aria-label": "Filter skills", "data-key": `${k}-skill-filter` });
+    filter.value = filters.get(filterKey) ?? "";
+    const rows = (state.skills ?? []).map((sk) => {
+      const row = checkbox(`${k}-skill-${sk.name}`, [el("span", { class: "mono", text: sk.name }), " ", el("span", { class: "muted small", text: sk.description })],
+        chosen.includes(sk.name), (on) => { toggle(s, "skill", sk.name)(on); changed(true); });
+      row.dataset.find = `${sk.name} ${sk.description}`.toLowerCase();
+      return row;
+    });
+    const list = el("div", { class: "pb-pick" }, ...rows);
+    const apply = () => {
+      const q = filter.value.trim().toLowerCase();
+      filters.set(filterKey, filter.value);
+      for (const r of rows) r.hidden = Boolean(q) && !r.dataset.find.includes(q);
+    };
+    filter.addEventListener("input", apply);
+    apply();
+    return group(`${k}-skills`, "Skills", chips, "Instructions the agent follows, e.g. adr writes architecture decision records",
+      details(filterKey, chosen.length ? "Add or remove skills" : "Pick skills", [filter, list]));
+  }
+
+  function checksField(s, k) {
+    const folder = folderOf(s.target);
+    const chosen = planText.valuesOf(s, "verify");
+    const own = folder?.checks ?? [];
+    const builtins = state.builtinChecks ?? [];
+    const extra = chosen.filter((c) => !own.includes(c) && !builtins.some((b) => b.name === c));
+    const set = (name) => (on) => {
+      toggle(s, "verify", name)(on);
+      if (!planText.valuesOf(s, "verify").length) planText.setValues(s, "attempts", null);
+      changed(true);
+    };
+    const boxes = [...own, ...extra].map((c) => checkbox(`${k}-check-${c}`, el("span", { class: "mono", text: c }), chosen.includes(c), set(c)));
+    const hint = !s.target ? "Choose who does it to see the checks its folder offers."
+      : own.length ? "The peer runs them after the agent, and the step passes only if they pass: that is what proves claims."
+        : `${folder ? `The ${folder.name} folder` : "This folder"} has no checks of its own (its owner adds them with share add --check NAME=COMMAND).`;
+    const builtin = details(`${k}-builtin`, "Built-in checks for spec, design and review packages",
+      [el("p", { class: "muted small pb-hint", text: "They check the files the spec and design playbooks write; on other work they fail." }),
+        el("div", { class: "pb-checks column" }, ...builtins.map((b) => checkbox(`${k}-check-${b.name}`,
+          [el("span", { class: "mono", text: b.name }), " ", el("span", { class: "muted small", text: b.about })], chosen.includes(b.name), set(b.name))))],
+      chosen.some((c) => builtins.some((b) => b.name === c)));
+    return group(`${k}-checks`, "Checks after the task", boxes, hint, builtin);
+  }
+
+  function provesField(s, k, canProve) {
+    const chosen = planText.valuesOf(s, "claims");
+    if (!plan.claims.length) {
+      return group(`${k}-claims`, "Proves", [], "No claims yet: add what must be true above, then pick what this step proves.");
+    }
+    const boxes = plan.claims.map((c) => checkbox(`${k}-proves-${c.id}`,
+      [el("span", { class: "mono", text: c.id }), " ", planText.isTodoClaim(c.text) ? el("em", { class: "muted", text: "not written yet" }) : c.text],
+      chosen.includes(c.id), (on) => { toggle(s, "claims", c.id)(on); changed(true); },
+      { disabled: !canProve && !chosen.includes(c.id) }));
+    const hint = s.approve ? "Approving proves them." : canProve ? "Proven when its checks pass."
+      : "A task proves a claim only with a check: pick one above, or let a sign-off prove it.";
+    // A claim this task can't prove can move to a sign-off on it.
+    const signoff = !canProve && !s.approve && chosen.length
+      ? el("button", { type: "button", class: "btn small", "data-key": `${k}-add-signoff`, onclick: () => addSignoff(s) },
+        `Let a sign-off on ${s.id} prove ${chosen.join(", ")}`)
+      : null;
+    return group(`${k}-claims`, "Proves", boxes, hint, signoff);
+  }
+
+  function waitsField(s, k) {
+    const circular = planText.dependents(plan, s.id);
+    const ids = [...plan.steps.map((o) => o.id).filter((id) => id !== s.id && !circular.has(id)),
+      ...s.after.filter((d) => d === s.id || circular.has(d) || !plan.steps.some((o) => o.id === d))];
+    const boxes = [...new Set(ids)].map((id) => checkbox(`${k}-after-${id}`, el("span", { class: "mono", text: id }), s.after.includes(id), (on) => {
+      s.after = on ? [...s.after, id] : s.after.filter((d) => d !== id);
+      if (!on && planText.valuesOf(s, "apply")[0] === id) planText.setValues(s, "apply", null);
+      changed(true);
+    }));
+    const hint = boxes.length ? `It starts once these are done, and gets their results; without any, it starts right away.${circular.size ? " Steps that wait for it aren't listed." : ""}`
+      : "No other steps it could wait for.";
+    return group(`${k}-after`, "Waits for", boxes, hint);
+  }
+
+  function moreOptions(s, k) {
+    const folder = folderOf(s.target);
+    const items = [];
+    let set = 0;
+    if (planText.valuesOf(s, "verify").length) {
+      const tries = el("select", {}, ...[1, 2, 3, 4, 5].map((n) => el("option", { value: String(n), text: n === 1 ? "Once" : `Up to ${n} times, each told what failed` })));
+      tries.value = planText.valuesOf(s, "attempts")[0] ?? "1";
+      tries.addEventListener("change", () => { planText.setValues(s, "attempts", tries.value === "1" ? null : tries.value); changed(); });
+      items.push(field(`${k}-attempts`, "Tries while its checks fail", tries));
+      set += tries.value !== "1";
+    }
+    const provider = el("select", {}, ...["copilot", "claude", "codex"].map((p) => el("option", { value: p, text: providerLabel(p) })));
+    provider.value = s.using ?? "copilot";
+    provider.addEventListener("change", () => { s.using = provider.value === "copilot" ? null : provider.value; changed(); });
+    items.push(field(`${k}-using`, "Model", provider, "Which of the peer's providers runs it"));
+    set += Boolean(s.using);
+    const context = planText.valuesOf(s, "context");
+    const topics = [...new Set(["all", ...(state.knowledge ?? []).map((t) => t.name), ...context])];
+    if (topics.length > 1 || context.length) {
+      items.push(group(`${k}-context`, "Knowledge it gets", topics.map((t) => checkbox(`${k}-context-${t}`,
+        el("span", { class: "mono", text: t === "all" ? "all (every topic)" : t }), context.includes(t),
+        (on) => { toggle(s, "context", t)(on); changed(true); }))));
+      set += context.length > 0;
+    }
+    const save = el("input", { type: "text", class: "mono", spellcheck: "false", autocomplete: "off", placeholder: "e.g. architecture" });
+    save.value = planText.valuesOf(s, "save")[0] ?? "";
+    save.addEventListener("change", () => {
+      const topic = save.value.trim();
+      if (topic && !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(topic)) {
+        toast("A topic name uses letters, digits, '-', '_' or '.'", "error");
+        save.value = planText.valuesOf(s, "save")[0] ?? "";
+        return;
+      }
+      planText.setValues(s, "save", topic || null);
+      changed(true);
+    });
+    items.push(field(`${k}-save`, "Save its result as knowledge", save, "A topic later steps can get"));
+    set += Boolean(save.value);
+    const mcp = planText.valuesOf(s, "mcp");
+    const servers = [...new Set([...(folder?.mcp ?? []), ...mcp])];
+    if (servers.length) {
+      items.push(group(`${k}-mcp`, "MCP servers it may use", servers.map((m) => checkbox(`${k}-mcp-${m}`,
+        [el("span", { class: "mono", text: m }), folder?.about?.[m] ? el("span", { class: "muted small", text: ` ${folder.about[m]}` }) : null],
+        mcp.includes(m), (on) => { toggle(s, "mcp", m)(on); changed(true); }))));
+      set += mcp.length > 0;
+    }
+    const applied = planText.valuesOf(s, "apply")[0] ?? "";
+    if ((folder?.worktrees && s.after.length) || applied) {
+      const apply = el("select", {}, el("option", { value: "", text: "Nothing: start from the folder as it is" }),
+        ...s.after.map((d) => el("option", { value: d, text: `What ${d} changed (its commit)` })));
+      apply.value = applied;
+      apply.addEventListener("change", () => { planText.setValues(s, "apply", apply.value || null); changed(); });
+      items.push(field(`${k}-apply`, "Start from", apply, "Another peer checks that work independently, in its own worktree"));
+      set += Boolean(applied);
+    }
+    return details(`${k}-more`, `More options${set ? ` (${set} set)` : ""}`, items);
+  }
+
+  // ---------- changes ----------
+  /// Renames a claim or step from its id field: only to a free, valid name.
+  function rename(kind, item, input) {
+    const to = input.value.trim();
+    const list = kind === "claim" ? plan.claims : plan.steps;
+    if (to === item.id) return;
+    const why = !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(to) || (kind === "step" && ["after", "approve", "using"].includes(to))
+      ? "Use letters, digits, '-', '_' or '.'"
+      : list.some((x) => x !== item && x.id === to) ? `There is already a ${kind} called ${to}` : null;
+    if (why) {
+      toast(why, "error");
+      input.value = item.id;
+      return;
+    }
+    (kind === "claim" ? planText.renameClaim : planText.renameStep)(plan, item.id, to);
+    changed(true);
+  }
+
+  function setKind(s, approve) {
+    if (s.approve === approve) return;
+    s.approve = approve;
+    if (approve) {
+      // A person's decision: no folder, checks, retries, patch, saved result or tools.
+      s.target = "@me";
+      s.using = null;
+      for (const option of ["verify", "attempts", "apply", "save", "mcp"]) planText.setValues(s, option, null);
+    } else {
+      s.target = null;
+    }
+    changed(true);
+  }
+
+  /// The first of make(from), make(from + 1), ... that isn't taken.
+  function freeName(taken, make, from = 1) {
+    let n = from;
+    while (taken.includes(make(n))) n++;
+    return make(n);
+  }
+
+  function addClaim() {
+    const claim = { id: freeName(plan.claims.map((c) => c.id), (n) => `C-${n}`), text: "", notes: [] };
+    plan.claims.push(claim);
+    fresh.set(claim, new Set());
+    focusNext = `c${plan.claims.length - 1}-text`;
+    changed(true);
+  }
+
+  function addStep() {
+    const options = Object.values(runners()).flat();
+    const step = {
+      id: freeName(plan.steps.map((s) => s.id), (n) => `step${n}`), after: [], approve: false,
+      target: options.length === 1 ? options[0][0] : null, using: null, options: [], todo: "", notes: [],
+    };
+    plan.steps.push(step);
+    fresh.set(step, new Set());
+    const i = plan.steps.length - 1;
+    focusNext = step.target ? `s${i}-todo` : `s${i}-target`;
+    changed(true);
+  }
+
+  /// Adds a sign-off: on step `on` (which can't prove its claims, so they move to the
+  /// sign-off), or on the last task, proving the claims nothing proves yet.
+  function addSignoff(on = null) {
+    const ids = plan.steps.map((s) => s.id);
+    const last = on ?? plan.steps.filter((s) => !s.approve).at(-1);
+    const proven = new Set(plan.steps.flatMap((s) => planText.valuesOf(s, "claims")));
+    const claims = on ? planText.valuesOf(on, "claims") : plan.claims.map((c) => c.id).filter((c) => !proven.has(c));
+    if (on) planText.setValues(on, "claims", null);
+    const signoff = {
+      id: ids.includes("review") ? freeName(ids, (n) => `review-${n}`, 2) : "review",
+      after: last ? [last.id] : [], approve: true, target: "@me", using: null,
+      options: claims.length ? [`claims=${claims.join(",")}`] : [], todo: "", notes: [],
+    };
+    const at = on ? plan.steps.indexOf(on) + 1 : plan.steps.length;
+    plan.steps.splice(at, 0, signoff);
+    fresh.set(signoff, new Set());
+    focusNext = `s${at}-todo`;
+    changed(true);
+  }
+
+  /// After an edit: writes the plan text (the editor's check and Run use it) and, for
+  /// a change of structure, draws the builder again.
+  function changed(again = false) {
+    const out = planText.formatPlan(plan);
+    lines = out.items;
+    const text = editor();
+    text.value = out.text;
+    text.dispatchEvent(new Event("input", { bubbles: true }));
+    if (again) render();
+    else marks();
+  }
+
+  // ---------- drawing ----------
+  function render() {
+    if (!plan) return;
+    const was = document.activeElement;
+    const key = root().contains(was) ? was.dataset.key : null;
+    const sel = key && typeof was.selectionStart === "number" ? [was.selectionStart, was.selectionEnd] : null;
+    const notes = plan.notes.length ? el("section", { class: "pb-section" },
+      field("notes", "Notes", Object.assign(el("textarea", { rows: Math.min(plan.notes.length, 4), spellcheck: "true" }), { value: plan.notes.join("\n") }),
+        "Comments at the top of the plan; agents don't see them")) : null;
+    notes?.querySelector("textarea").addEventListener("input", (e) => { plan.notes = e.target.value.split("\n"); changed(); });
+    const empty = !plan.claims.length && !plan.steps.length;
+    root().replaceChildren(...[
+      empty ? el("p", { class: "pb-intro", text: "Start with a step: what an agent should do, and where. Then add what must be true, and a sign-off or checks that prove it." }) : null,
+      notes,
+      el("section", { class: "pb-section" },
+        el("h3", { class: "pb-h", text: "What must be true" }),
+        el("p", { class: "muted small", text: "Claims the run proves. Only a check a peer runs, or a sign-off, proves a claim." }),
+        plan.claims.length ? el("ul", { class: "pb-claims" }, ...plan.claims.map(claimRow)) : null,
+        el("button", { type: "button", class: "btn small", "data-key": "add-claim", onclick: addClaim }, "+ Add a claim")),
+      el("section", { class: "pb-section" },
+        el("h3", { class: "pb-h", text: "Steps" }),
+        el("p", { class: "muted small", text: "Each step is a task an agent does, or a sign-off by a person. Steps run at the same time unless one waits for another." }),
+        plan.steps.length ? el("ol", { class: "pb-steps" }, ...plan.steps.map(stepCard)) : null,
+        el("div", { class: "pb-add" },
+          el("button", { type: "button", class: "btn small", "data-key": "add-step", onclick: () => addStep() }, "+ Add a step"),
+          el("button", { type: "button", class: "btn small", "data-key": "add-signoff", onclick: () => addSignoff() }, "+ Add a sign-off"))),
+    ].filter(Boolean));
+    marks();
+    const target = focusNext ?? key;
+    focusNext = null;
+    const node = target && root().querySelector(`[data-key="${CSS.escape(target)}"]`);
+    if (node) {
+      node.focus();
+      if (sel && target === key && typeof node.setSelectionRange === "function") {
+        try { node.setSelectionRange(...sel); } catch { /* not a text field */ }
+      }
+    }
+  }
+
+  /// Which card a plan check problem is about: its step or claim, or the line it names.
+  function cardOf(p) {
+    const step = p.step != null ? plan.steps.findIndex((s) => s.id === p.step) : -1;
+    if (step >= 0) return cardKey("step", step);
+    const claim = p.claim != null ? plan.claims.findIndex((c) => c.id === p.claim) : -1;
+    if (claim >= 0) return cardKey("claim", claim);
+    const line = /^line (\d+): /.exec(p.message);
+    const item = line && lines[Number(line[1]) - 1];
+    if (item?.step) return cardKey("step", plan.steps.findIndex((s) => s.id === item.step));
+    if (item?.claim) return cardKey("claim", plan.claims.findIndex((c) => c.id === item.claim));
+    return null;
+  }
+
+  /// The plan check's problems, one per line of a parse error.
+  const problemsOf = (res) => (res?.problems ?? []).flatMap((p) =>
+    /^line \d+: /.test(p.message) ? p.message.split("\n").map((message) => ({ ...p, message })) : [p]);
+
+  /// The fields where the builder says what the plan check's coded problems say.
+  const SAID_ON = { "todo-task": "todo", "todo-claim": "text", "unchecked-claim": "claims" };
+
+  const itemOf = (kind, index) => (kind === "claim" ? plan.claims : plan.steps)[index];
+
+  /// Shows what each card still needs (by field) and the plan check's problems on the
+  /// card they are about; the rest, and how ready the plan is, below the builder.
+  function marks() {
+    if (!plan || !active()) return;
+    const needs = planText.needs(plan);
+    const byField = new Map(needs.map((n) => [`${cardKey(n.kind, n.index)}-${n.field}`, n]));
+    for (const p of root().querySelectorAll("[data-need]")) {
+      const n = byField.get(p.dataset.need);
+      const been = n && fresh.get(itemOf(n.kind, n.index));
+      const missing = n && ["target", "todo", "text"].includes(n.field);
+      const show = Boolean(n && (!missing || showAll || !been || been.has(n.field)));
+      p.hidden = !show;
+      p.textContent = show ? n.message : "";
+      p.classList.toggle("bad", show && showAll);
+      root().querySelector(`[data-key="${CSS.escape(p.dataset.need)}"]`)?.toggleAttribute("aria-invalid", show);
+    }
+    const incomplete = new Set(needs.map((n) => cardKey(n.kind, n.index)));
+    for (const b of root().querySelectorAll("[data-badge]")) b.hidden = !incomplete.has(b.dataset.badge);
+    // The check's problems, on their cards; not those a card already says on a field,
+    // nor parse errors about what a card still needs.
+    const rest = [];
+    const byCard = new Map();
+    for (const p of problemsOf(check)) {
+      const card = cardOf(p);
+      if (!card) rest.push(p);
+      else if (byField.has(`${card}-${SAID_ON[p.code]}`)) continue;
+      else if (!(incomplete.has(card) && /^line \d+: /.test(p.message))) byCard.set(card, [...(byCard.get(card) ?? []), p]);
+    }
+    for (const box of root().querySelectorAll("[data-marks]")) {
+      box.replaceChildren(...(byCard.get(box.dataset.marks) ?? []).map(problemLine));
+    }
+    const summary = $("#plan-editor-check");
+    if (!editor().value.trim()) {
+      summary.hidden = true;
+      return;
+    }
+    summary.hidden = false;
+    const cards = incomplete.size;
+    const errors = problemsOf(check).filter((p) => p.error).length;
+    const head = cards ? el("p", { class: "warn", text: `Not ready yet: ${nOf(cards, "card")} still ${cards === 1 ? "needs" : "need"} something.` })
+      : !check ? el("p", { class: "muted", text: "Checking the plan…" })
+        : !check.problems.length ? el("p", { class: "ok", text: `✓ Ready to run: ${nOf(check.steps, "step")}, ${nOf(check.claims, "claim")}` })
+          : el("p", { class: errors ? "bad" : "warn", text: errors ? `Can't run yet: ${nOf(errors, "problem")}, marked where they are.` : "Ready to run, with warnings (marked where they are)." });
+    summary.replaceChildren(...[head, rest.length ? el("ul", {}, ...rest.map((p) => el("li", { class: p.error ? "bad" : "warn" }, problemLine(p)))) : null].filter(Boolean));
+  }
+
+  function problemLine(p) {
+    return el("p", { class: `pb-problem ${p.error ? "bad" : "warn"}` },
+      el("strong", { text: p.error ? "Error: " : "Warning: " }), p.message.replace(/^line \d+: /, ""),
+      p.fixes?.length ? el("span", { class: "fixes" }, ...p.fixes.map((f) => fixButton(f, editor(), $("#plan-editor-check")))) : null);
+  }
+
+  // ---------- the editor's views ----------
+  function setView(view, { focus = true } = {}) {
+    const body = $("#plan-editor-body");
+    body.dataset.view = view;
+    localStorage.setItem(VIEW_KEY, view);
+    for (const b of document.querySelectorAll("#plan-view [data-view]")) {
+      b.setAttribute("aria-checked", String(b.dataset.view === view));
+      b.tabIndex = b.dataset.view === view ? 0 : -1;
+    }
+    $("#plan-editor-tip").textContent = view === "builder"
+      ? "Fill in the cards · the plan is checked as you go · Ctrl+Enter runs it"
+      : "Claims first, then one step per line · Ctrl+Enter runs the plan";
+    if (view === "builder") {
+      load(editor().value);
+      if (focus) {
+        // The first thing still needed, else the first field.
+        const n = planText.needs(plan)[0];
+        const first = n && root().querySelector(`[data-key="${CSS.escape(`${cardKey(n.kind, n.index)}-${n.field}`)}"]`);
+        (first ?? root().querySelector("input, select, textarea, button"))?.focus();
+      }
+    } else {
+      renderPalette();
+      if (focus) editor().focus();
+    }
+    checkPlan(editor().value, $("#plan-editor-check"), editor()).catch(() => {});
+  }
+
+  /// Draws the builder for plan `text` (when the editor opens, after the Text view or
+  /// a fix).
+  function load(text) {
+    plan = planText.parsePlan(text);
+    lines = sourceLines(text);
+    render();
+  }
+
+  /// What each line of `text` is, by the order of the claims and steps parsed from it.
+  function sourceLines(text) {
+    let claim = 0;
+    let step = 0;
+    return text.split("\n").map((line) => {
+      const t = line.trim();
+      if (!t || t.startsWith("//")) return null;
+      return t.startsWith("claim:") ? { claim: plan.claims[claim++]?.id } : { step: plan.steps[step++]?.id };
+    });
+  }
+
+  /// Whether the plan can be run or scheduled as far as the builder can tell; if not,
+  /// points out everything missing and goes to the first.
+  function ready() {
+    if (!active() || !plan) return true;
+    const needs = planText.needs(plan);
+    if (!needs.length) return true;
+    showAll = true;
+    marks();
+    const first = needs[0];
+    root().querySelector(`[data-key="${CSS.escape(`${cardKey(first.kind, first.index)}-${first.field}`)}"]`)?.focus();
+    toast(`Fill in what's marked first: ${nOf(needs.length, "thing")}`, "error");
+    return false;
+  }
+
+  /// The plan check's result, for the cards.
+  function checked(res) {
+    check = res;
+    marks();
+  }
+
+  function reset() {
+    fresh = new WeakMap();
+    showAll = false;
+    check = null;
+  }
+
+  function init() {
+    radioGroup($("#plan-view"), (btn) => setView(btn.dataset.view));
+    // Leaving a field of a card added here: what it still needs shows from now on.
+    root().addEventListener("focusout", (e) => {
+      const m = /^([cs])(\d+)-(\w+)$/.exec(e.target.dataset?.key ?? "");
+      const been = m && fresh.get(itemOf(m[1] === "c" ? "claim" : "step", Number(m[2])));
+      if (been && !been.has(m[3])) {
+        been.add(m[3]);
+        marks();
+      }
+    });
+    root().addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        $("#plan-editor-run").click();
+      }
+    });
+  }
+
+  return {
+    init, load, ready, checked, reset, active,
+    view: () => (localStorage.getItem(VIEW_KEY) === "text" ? "text" : "builder"),
+    setView,
+  };
+})();
+
+planBuilder.init();

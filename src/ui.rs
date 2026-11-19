@@ -41,6 +41,7 @@ const APP_CSS: &str = include_str!("../ui/app.css");
 const APP_JS: &str = include_str!("../ui/app.js");
 const TOOLS_JS: &str = include_str!("../ui/tools.js");
 const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
+const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const FEED_LIMIT: usize = 500;
 
 /// What the UI shows about this agent besides live state.
@@ -487,6 +488,10 @@ pub async fn start(
             "/plan-text.js",
             get(|| async { asset("text/javascript; charset=utf-8", PLAN_TEXT_JS) }),
         )
+        .route(
+            "/plan-builder.js",
+            get(|| async { asset("text/javascript; charset=utf-8", PLAN_BUILDER_JS) }),
+        )
         // Outside the token check: the unguessable capability in the path is the
         // authorization, and the content runs in a CSP sandbox (see crate::preview).
         .route("/preview/{cap}", get(preview_root))
@@ -684,6 +689,10 @@ async fn state(State(s): State<AppState>) -> Json<Value> {
     v["feed"] = json!(s.feed.lock().unwrap().iter().cloned().collect::<Vec<_>>());
     v["tasks"] = json!(s.tasks.lock().unwrap().clone());
     v["approvals"] = approvals_json(&s);
+    v["builtin_checks"] = crate::spec::BUILT_IN_CHECKS
+        .iter()
+        .map(|name| json!({ "name": name, "about": crate::spec::about(name) }))
+        .collect();
     Json(v)
 }
 

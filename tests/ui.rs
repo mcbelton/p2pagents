@@ -820,6 +820,18 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
     assert_eq!(unknown.status, 400);
     assert!(unknown.body.contains("no topic 'nope'"), "{}", unknown.body);
 
+    // The plan builder offers the built-in checks, each with what it proves.
+    let builtin = get("/api/state").await.json()["builtin_checks"].clone();
+    assert!(
+        builtin
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "spec:api"
+                && c["about"].as_str().unwrap().contains("spec/openapi.json")),
+        "{builtin}"
+    );
+
     // The plan check lists every problem without running anything.
     let checked = post(
         "/api/plans/check",
@@ -1569,6 +1581,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<meta name="theme-color""#));
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
+    assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     for id in [
         "confirm-dialog",
         "plan-editor",
@@ -1577,6 +1590,8 @@ async fn the_page_follows_the_ux_guidelines() {
         "when-preview",
         "playbook-pick",
         "playbook-choices",
+        "plan-view",
+        "plan-builder",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -1603,7 +1618,7 @@ async fn the_page_follows_the_ux_guidelines() {
             &d[1]
         );
     }
-    for script in ["/app.js", "/tools.js", "/plan-text.js"] {
+    for script in ["/app.js", "/tools.js", "/plan-text.js", "/plan-builder.js"] {
         let js = request(port, "GET", script, &host, None, None).await;
         assert_eq!(js.status, 200, "{script}");
         assert!(
@@ -1627,11 +1642,12 @@ async fn the_page_follows_the_ux_guidelines() {
     agent.shutdown().await;
 }
 
-/// The plan editor's palette (ui/plan-text.js) puts each part where the plan syntax
-/// expects it: its cases (tests/plan_text.test.cjs) run in node, which loads the
-/// script the way the page does.
+/// The plan editor (ui/plan-text.js) keeps plans valid: its palette puts each part
+/// where the plan syntax expects it, the plan check's fixes change the text as they
+/// say, and the builder's model writes back the plan it read. The cases
+/// (tests/plan_text.test.cjs) run in node, which loads the script as the page does.
 #[test]
-fn the_plan_editor_puts_each_part_where_it_belongs() {
+fn the_plan_editor_keeps_plans_valid() {
     let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plan_text.test.cjs");
     let out = std::process::Command::new("node")
         .arg(&cases)

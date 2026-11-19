@@ -1029,13 +1029,24 @@ p2pagents --name me --providers copilot --serve --ui
   The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
   results and errors, and has a **Cancel** button on running tasks.
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
-  Ctrl+Enter runs it), or press **Open editor** for a full-size editor with everything a
-  plan can use beside it: line templates (claim, step, sign-off), connected peers and
-  their folders, squads, the folders' checks and MCP servers, skills, knowledge topics,
-  `after` and other options. A click adds to the step your cursor is on, in the place the
-  plan syntax expects (skills you click add up, who runs it is replaced), or starts a new
-  step on an empty line, then selects what to type next. The plan is checked as you type,
-  and problems with a clear fix come with a button that makes it.
+  Ctrl+Enter runs it), or press **Open editor** for a full-size editor with two views of
+  the same plan:
+  - **Builder** (forms, no syntax to learn): what must be true (claims), then a card per
+    step, an agent task or a sign-off: who does it (connected peers, their folders and
+    squads), what to do, skills (picked from a list with what each is for), the checks
+    the folder offers (and the built-in ones), the claims it proves, the steps it waits
+    for, and more options (tries, model, knowledge, MCP servers). It can't hold the
+    usual mistakes: a task proves claims only once it has a check, a step can't wait for
+    one that waits for it, renaming or removing a step or claim updates what refers to
+    it, and what a card still needs is said on its field. **Run plan** goes to the first
+    field still missing.
+  - **Text**: the plan as text, with everything it can use beside it. A click adds to
+    the step your cursor is on, in the place the plan syntax expects (skills you click
+    add up, who runs it is replaced), or starts a new step on an empty line, then
+    selects what to type next.
+
+  The plan is checked as you go, and problems with a clear fix come with a button that
+  makes it (in the builder, on the card they are about).
   Steps show which steps they wait for, and skipped steps are flagged. **Schedule…** runs
   the plan on its own at set times ([scheduled plans](#scheduled-plans)). "What is a
   plan?" stays folded until you open it.
