@@ -53,6 +53,8 @@ const cases = [
     "ok after fix approve @carol claims=C-1 Approve it[]"],
   ["no squad sign-off", part("ok approve @me Approve| it", "#qa"), `error: ${ERRORS.squadSignoff}`],
   ["no checks on a sign-off", part("ok approve @me Approve| it", "verify=test"), `error: ${ERRORS.signoffOption}`],
+  ["no agent on a sign-off", part("ok approve @me Approve| it", "agent=sec"), `error: ${ERRORS.signoffOption}`],
+  ["one agent per step", part("a @x agent=old Do| it", "agent=new"), "a @x agent=new Do it[]"],
   // after: once, in its place, never on the step itself.
   ["after in its place", part("a @x do\nb @x Do| it", "after a"), "a @x do\nb after a @x Do it[]"],
   ["after adds up", part("a @x do\nb after a @x Do| it", "after c"), "a @x do\nb after a,c @x Do it[]"],

@@ -5,10 +5,11 @@
 //! (`marketplace.json`).
 //!
 //! Importing runs nothing. A plugin's skills become available to plan steps
-//! (`skill=name`). Its MCP servers are templates: their owner offers one in a shared
-//! folder when they choose, with the access and tools they allow and the values
-//! (keys, tokens) it needs. Agents, commands, hooks and LSP servers are listed and
-//! left out; hooks never run.
+//! (`skill=name`), and its agents too (`agent=name`: instructions with the skills they
+//! follow and the MCP servers they use). Its MCP servers are templates: their owner
+//! offers one in a shared folder when they choose, with the access and tools they
+//! allow and the values (keys, tokens) it needs. Commands, hooks and LSP servers are
+//! listed and left out; hooks never run.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -336,6 +337,21 @@ pub struct PluginSkill {
     pub path: String,
 }
 
+/// An agent a plugin contains: a role plan steps can take (see [`crate::skills`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginAgent {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Its file, relative to the plugin's folder.
+    pub path: String,
+    /// The skills it follows and the MCP servers it uses, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
+}
+
 /// An imported plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plugin {
@@ -359,6 +375,8 @@ pub struct Plugin {
     pub updated_unix: Option<i64>,
     #[serde(default)]
     pub skills: Vec<PluginSkill>,
+    #[serde(default)]
+    pub agents: Vec<PluginAgent>,
     /// MCP server templates by name.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpTemplate>,
@@ -756,12 +774,27 @@ pub fn inspect(root: &Path) -> Result<Inspection> {
         mcp_from(root, declared, &known, &mut mcp, &mut notes);
     }
 
+    // Agents: what the manifest declares, else `agents/` (Copilot CLI's own folder too).
+    let mut agents = Vec::new();
+    let declared = paths(manifest.get("agents"));
+    let agent_paths = if declared.is_empty() {
+        vec!["agents".to_owned(), "com.github.copilot/agents".to_owned()]
+    } else {
+        declared
+    };
+    for dir in &agent_paths {
+        match clean_subpath(dir) {
+            Ok(sub) => {
+                let path = sub.map_or_else(|| root.to_path_buf(), |s| root.join(s));
+                agents_in(root, &path, &mcp, &mut agents, &mut notes);
+            }
+            Err(e) => notes.push(format!("agents {dir:?}: {e:#}")),
+        }
+    }
+
     // What isn't used here.
     let mut unused = Vec::new();
     let has = |dir: &str| root.join(dir).is_dir();
-    if has("agents") || manifest.get("agents").is_some() || has("com.github.copilot/agents") {
-        unused.push("agents");
-    }
     if has("commands") || manifest.get("commands").is_some() || has("com.github.copilot/commands") {
         unused.push("commands");
     }
@@ -784,9 +817,9 @@ pub fn inspect(root: &Path) -> Result<Inspection> {
     if !unused.is_empty() {
         notes.insert(0, format!("Not used here: {}.", unused.join(", ")));
     }
-    if skills.is_empty() && mcp.is_empty() {
+    if skills.is_empty() && mcp.is_empty() && agents.is_empty() {
         bail!(
-            "{} has no skills (skills/NAME/SKILL.md) or MCP servers (.mcp.json or mcp.json) that p2pagents can use{}",
+            "{} has no skills (skills/NAME/SKILL.md), agents (agents/*.md) or MCP servers (.mcp.json or mcp.json) that p2pagents can use{}",
             if manifest_path.is_some() {
                 format!("plugin '{name}'")
             } else {
@@ -814,9 +847,93 @@ pub fn inspect(root: &Path) -> Result<Inspection> {
         installed_unix: 0,
         updated_unix: None,
         skills,
+        agents,
         mcp,
         notes,
     })))
+}
+
+/// The agents in `path`, a folder of `*.md` files (`NAME.agent.md` too) or one file;
+/// what can't be used is a note.
+fn agents_in(
+    root: &Path,
+    path: &Path,
+    mcp: &BTreeMap<String, McpTemplate>,
+    agents: &mut Vec<PluginAgent>,
+    notes: &mut Vec<String>,
+) {
+    let files: Vec<PathBuf> = if path.is_dir() {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        files.sort();
+        files
+    } else if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        return;
+    };
+    for file in files {
+        // Not through links: a plugin's files stay inside it.
+        let Ok(meta) = std::fs::symlink_metadata(&file) else {
+            continue;
+        };
+        let stem = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("agent")
+            .trim_end_matches(".md")
+            .trim_end_matches(".agent")
+            .to_owned();
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.len() > MAX_SKILL_BYTES {
+            notes.push(format!("agent {stem}: over 64 KB, left out"));
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let def = match crate::skills::parse_agent(&text, &safe_name(&stem)) {
+            Ok(def) => def,
+            Err(e) => {
+                notes.push(format!("agent {stem}: {e:#}; left out"));
+                continue;
+            }
+        };
+        if agents.iter().any(|a| a.name == def.name) {
+            notes.push(format!(
+                "agent '{}' appears twice; the first one is used",
+                def.name
+            ));
+            continue;
+        }
+        for server in def.mcp.iter().filter(|m| !mcp.contains_key(*m)) {
+            notes.push(format!(
+                "agent '{}' uses MCP server '{server}', which this plugin doesn't bring: steps with it need a folder that offers one by that name",
+                def.name
+            ));
+        }
+        notes.extend(
+            def.notes
+                .iter()
+                .map(|n| format!("agent '{}': {n}", def.name)),
+        );
+        agents.push(PluginAgent {
+            name: def.name,
+            description: def.description,
+            path: file
+                .strip_prefix(root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            skills: def.skills,
+            mcp: def.mcp,
+        });
+    }
 }
 
 fn marketplace(v: &Value) -> Result<Inspection> {
@@ -1202,6 +1319,25 @@ impl PluginStore {
             .collect()
     }
 
+    /// The agents of enabled plugins: (plugin, agent, its file).
+    pub fn agents(&self) -> Vec<(String, String, PathBuf)> {
+        let Ok(index) = self.load() else {
+            return Vec::new();
+        };
+        index
+            .plugins
+            .into_iter()
+            .filter(|p| p.enabled)
+            .flat_map(|p| {
+                let dir = self.plugin_dir(&p.name);
+                p.agents
+                    .into_iter()
+                    .map(move |a| (p.name.clone(), a.name, dir.join(&a.path)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Server `server` of plugin `plugin`, filled in for folder `folder` with
     /// `values`; the result remembers where it came from.
     pub fn instantiate(
@@ -1340,7 +1476,11 @@ mod tests {
                 "socket": {"type": "ws", "url": "wss://x.example.com"}
             }}"#,
         );
-        write(dir, "agents/helper.md", "---\nname: helper\n---\nHelp.");
+        write(
+            dir,
+            "agents/helper.md",
+            "---\nname: helper\ndescription: Checks the site\nskills: [smoke-test]\nmcp-servers: [browser, ghost]\ntools: Read\n---\nHelp.",
+        );
         write(dir, "hooks/hooks.json", "{}");
     }
 
@@ -1409,7 +1549,28 @@ mod tests {
         assert!(search.inputs[0].secret && search.inputs[0].description == "Search API key");
         let notes = p.notes.join("\n");
         assert!(
-            notes.contains("Not used here: agents, hooks (they never run here)"),
+            notes.contains("Not used here: hooks (they never run here)"),
+            "{notes}"
+        );
+        // Its agent, with the skills it follows and the MCP servers it uses.
+        assert_eq!(
+            p.agents,
+            [PluginAgent {
+                name: "helper".into(),
+                description: "Checks the site".into(),
+                path: "agents/helper.md".into(),
+                skills: vec!["smoke-test".into()],
+                mcp: vec!["browser".into(), "ghost".into()],
+            }]
+        );
+        assert!(
+            notes.contains(
+                "agent 'helper' uses MCP server 'ghost', which this plugin doesn't bring"
+            ),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("agent 'helper': its tools list is left out"),
             "{notes}"
         );
         assert!(notes.contains("socket: left out: WebSocket"), "{notes}");
@@ -1500,7 +1661,7 @@ mod tests {
         let plugin = store.install(&fetched, None).unwrap();
         assert!(store.plugin_dir("web-tools").join("server.js").is_file());
         assert!(store.install(&fetched, None).is_err(), "names are unique");
-        assert_eq!(store.skills().len(), 1);
+        assert_eq!((store.skills().len(), store.agents().len()), (1, 1));
         assert_eq!(plugin.source, src.display().to_string());
 
         // Offer the browser in a folder: placeholders filled, origin remembered.
@@ -1531,9 +1692,9 @@ mod tests {
         assert_eq!(search.headers["Authorization"], "Bearer k-123");
         shares.add_mcp("app", "search", search).unwrap();
 
-        // Turning it off hides its skills and stops offering its servers.
+        // Turning it off hides its skills and agents and stops offering its servers.
         let off = store.set_enabled("web-tools", false, &mut shares).unwrap();
-        assert!(off.shares_changed && store.skills().is_empty());
+        assert!(off.shares_changed && store.skills().is_empty() && store.agents().is_empty());
         assert!(
             shares.visible(&["app".into()], crate::Access::Full)[0]
                 .mcp

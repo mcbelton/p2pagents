@@ -92,6 +92,7 @@ fn plugin_json(
     shares: Option<&ShareStore>,
 ) -> Value {
     let listed = skills.map(|s| s.list()).unwrap_or_default();
+    let agents = skills.map(|s| s.agents()).unwrap_or_default();
     json!({
         "name": p.name,
         "version": p.version,
@@ -109,6 +110,17 @@ fn plugin_json(
                 "name": s.name,
                 "description": s.description,
                 "use": if short { s.name.clone() } else { format!("{}.{}", p.name, s.name) },
+            })
+        }).collect::<Vec<_>>(),
+        "agents": p.agents.iter().map(|a| {
+            let short = skills.is_none()
+                || agents.iter().any(|l| l.name == a.name && l.plugin.as_deref() == Some(p.name.as_str()));
+            json!({
+                "name": a.name,
+                "description": a.description,
+                "skills": a.skills,
+                "mcp": a.mcp,
+                "use": if short { a.name.clone() } else { format!("{}.{}", p.name, a.name) },
             })
         }).collect::<Vec<_>>(),
         "mcp": p.mcp.iter().map(|(name, t)| json!({
@@ -280,9 +292,10 @@ pub(super) async fn install_plugin(
     s.system(
         "info",
         format!(
-            "Imported plugin {}: {} skill(s), {} MCP server template(s). Nothing in it ran.",
+            "Imported plugin {}: {} skill(s), {} agent(s), {} MCP server template(s). Nothing in it ran.",
             plugin.name,
             plugin.skills.len(),
+            plugin.agents.len(),
             plugin.mcp.len()
         ),
     );
@@ -705,6 +718,46 @@ pub(super) async fn remove_skill(
         Ok(false) => Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("the profile has no skill of its own named '{name}'") })),
+        )),
+        Err(e) => Err(err400(e)),
+    }
+}
+
+/// Adds or replaces one of the profile's agents (named by the body, else its front
+/// matter).
+pub(super) async fn add_agent(
+    State(s): State<AppState>,
+    Json(body): Json<SkillBody>,
+) -> Result<Json<Value>, ApiError> {
+    let name = Some(body.name.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .or_else(|| crate::skills::front_matter_name(&body.text))
+        .ok_or_else(|| bad_request("give the agent a name, or a name: line in its front matter"))?;
+    let skills = s.info.profile.skills();
+    let replaced = skills
+        .agents()
+        .into_iter()
+        .find(|a| a.name == name)
+        .map(|a| a.source);
+    let agent = skills.add_agent(&name, &body.text).map_err(err400)?;
+    s.system("info", format!("Saved agent {name}"));
+    s.send(json!({ "type": "tools" }));
+    Ok(Json(json!({ "agent": agent, "replaced": replaced })))
+}
+
+pub(super) async fn remove_agent(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    match s.info.profile.skills().remove_agent(&name) {
+        Ok(true) => {
+            s.system("info", format!("Removed agent {name}"));
+            s.send(json!({ "type": "tools" }));
+            Ok(Json(json!({ "removed": name })))
+        }
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("the profile has no agent of its own named '{name}'") })),
         )),
         Err(e) => Err(err400(e)),
     }

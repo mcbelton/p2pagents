@@ -16,7 +16,27 @@
 //! # Security review
 //! ...
 //! ```
+//!
+//! An agent is a role a plan step can take (`agent=name`): Markdown instructions with
+//! front matter naming the skills it follows and the MCP servers it uses, the layout
+//! of GitHub Copilot and Claude Code agents (`tools` and `model` are left out: what a
+//! step may do is set by the folder's owner, and the peer picks its model):
+//!
+//! ```text
+//! ---
+//! name: security-reviewer
+//! description: Reviews a change for security problems
+//! skills: [security-review, code-review]
+//! mcp-servers: [semgrep]
+//! ---
+//! You review changes the way a security engineer would...
+//! ```
+//!
+//! A profile's own agents live in `<profile>/agents/<name>.md`; enabled plugins add
+//! theirs (`agents/*.md`), by name when no other agent has it, always as
+//! `<plugin>.<agent>`. A plugin agent's skills are its plugin's skills first.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -199,19 +219,180 @@ fn parse(text: &str) -> (String, &str) {
     (description, body.trim_start_matches(['\r', '\n']))
 }
 
+/// Front matter as `key -> values`, and the body after it. A value is `key: value`
+/// (a list for list keys: `[a, b]` or `a, b`), or a block under the key: `- item`
+/// lines, or a map whose keys are the values (`mcp-servers:` with a server per key).
+pub fn front_matter(text: &str) -> (BTreeMap<String, Vec<String>>, &str) {
+    const ONE_VALUE: &[&str] = &["name", "description", "model"];
+    let text = text.trim_start_matches('\u{feff}');
+    let mut fields: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Some((head, body)) = text
+        .strip_prefix("---")
+        .and_then(|rest| rest.split_once("\n---"))
+    else {
+        return (fields, text);
+    };
+    let unquote = |v: &str| v.trim().trim_matches(['"', '\'']).trim().to_owned();
+    let list = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(unquote)
+            .filter(|v| !v.is_empty())
+            .collect()
+    };
+    let mut key: Option<String> = None;
+    let mut indent_of_block: Option<usize> = None;
+    for line in head.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        // A list may sit at the key's own indent (`skills:` then `- a`).
+        if indent == 0 && !trimmed.starts_with('-') {
+            indent_of_block = None;
+            key = None;
+            let Some((k, v)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let (k, v) = (k.trim().to_owned(), v.trim());
+            let values = if let Some(inner) = v.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
+            {
+                list(inner)
+            } else if v.is_empty() {
+                Vec::new()
+            } else if ONE_VALUE.contains(&k.as_str()) {
+                vec![unquote(v)]
+            } else {
+                list(v)
+            };
+            fields.insert(k.clone(), values);
+            key = Some(k);
+        } else if let Some(k) = &key {
+            if indent_of_block.is_some_and(|i| indent > i) {
+                continue;
+            }
+            indent_of_block = Some(indent);
+            let entry = fields.entry(k.clone()).or_default();
+            if let Some(item) = trimmed.strip_prefix('-') {
+                entry.push(unquote(item));
+            } else if let Some((map_key, _)) = trimmed.split_once(':') {
+                entry.push(unquote(map_key));
+            }
+        }
+    }
+    // The body starts on the line after the closing `---`.
+    let body = body.split_once('\n').map_or("", |(_, rest)| rest);
+    (fields, body.trim_start_matches(['\r', '\n']))
+}
+
+/// A role a plan step can take: its instructions, the skills it follows and the MCP
+/// servers it uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentDef {
+    pub name: String,
+    pub description: String,
+    pub skills: Vec<String>,
+    pub mcp: Vec<String>,
+    pub instructions: String,
+    /// `profile` or `plugin`.
+    pub source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    /// What its file has that isn't used here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// Reads an agent file: its front matter (name, description, skills, MCP servers) and
+/// instructions. `fallback` names it when the front matter doesn't.
+pub fn parse_agent(text: &str, fallback: &str) -> Result<AgentDef> {
+    let (fields, body) = front_matter(text);
+    let one = |key: &str| {
+        fields
+            .get(key)
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let name = Some(one("name"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| fallback.to_owned());
+    validate_name(&name)
+        .with_context(|| format!("the agent's name {name:?} isn't usable; rename it"))?;
+    let skills: Vec<String> = ["skills", "skill"]
+        .iter()
+        .flat_map(|k| fields.get(*k).cloned().unwrap_or_default())
+        .collect();
+    let mcp: Vec<String> = ["mcp-servers", "mcpServers", "mcp"]
+        .iter()
+        .flat_map(|k| fields.get(*k).cloned().unwrap_or_default())
+        .collect();
+    for (what, names) in [("skill", &skills), ("MCP server", &mcp)] {
+        if let Some(bad) = names.iter().find(|n| validate_name(n).is_err()) {
+            bail!("agent '{name}' names the {what} {bad:?}, which isn't a usable name");
+        }
+    }
+    let mut notes = Vec::new();
+    if fields.contains_key("tools") {
+        notes.push(
+            "its tools list is left out: what a step may do is set by the folder's owner".into(),
+        );
+    }
+    if fields.contains_key("model") {
+        notes.push("its model is left out: the peer picks its model".into());
+    }
+    let instructions = body.trim().to_owned();
+    if instructions.is_empty() {
+        bail!("agent '{name}' has no instructions after its front matter");
+    }
+    Ok(AgentDef {
+        name,
+        description: one("description"),
+        skills,
+        mcp,
+        instructions,
+        source: "profile",
+        plugin: None,
+        notes,
+    })
+}
+
+/// An agent of an enabled plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAgentRef {
+    pub plugin: String,
+    pub name: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct Skills {
     dir: PathBuf,
     plugins: Vec<PluginSkillRef>,
+    /// The profile's own agents, next to its skills (`<profile>/agents`).
+    agents_dir: PathBuf,
+    plugin_agents: Vec<PluginAgentRef>,
 }
 
 impl Skills {
-    /// The skills of a profile whose own skills live in `dir`.
+    /// The skills (and agents) of a profile whose own skills live in `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
         Self {
-            dir: dir.into(),
+            agents_dir: dir.with_file_name("agents"),
+            dir,
             plugins: Vec::new(),
+            plugin_agents: Vec::new(),
         }
+    }
+
+    /// With the agents of enabled plugins: (plugin, agent, its file).
+    pub fn with_plugin_agents(mut self, agents: Vec<(String, String, PathBuf)>) -> Self {
+        self.plugin_agents = agents
+            .into_iter()
+            .map(|(plugin, name, path)| PluginAgentRef { plugin, name, path })
+            .collect();
+        self
     }
 
     /// With the skills of enabled plugins: (plugin, skill, its `SKILL.md`).
@@ -370,6 +551,135 @@ impl Skills {
         }
         Ok(text)
     }
+
+    /// A file that goes into prompts, at most 64 KB.
+    fn read_prompt_file(path: &Path, what: &str) -> Result<String> {
+        let meta = std::fs::metadata(path).with_context(|| format!("{what} is missing"))?;
+        if meta.len() > MAX_SKILL_BYTES {
+            bail!("{what} is over 64 KB; it goes into prompts, keep it short");
+        }
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {what}"))?;
+        Ok(text.trim_start_matches('\u{feff}').to_owned())
+    }
+
+    fn own_agent(&self, name: &str) -> Option<PathBuf> {
+        validate_name(name).ok()?;
+        Some(self.agents_dir.join(format!("{name}.md"))).filter(|p| p.is_file())
+    }
+
+    /// The plugin agent `name` refers to: `<plugin>.<agent>`, or a short name no
+    /// profile agent has.
+    fn plugin_agent(&self, name: &str) -> Option<&PluginAgentRef> {
+        self.plugin_agents
+            .iter()
+            .find(|a| format!("{}.{}", a.plugin, a.name) == name)
+            .or_else(|| {
+                (self.own_agent(name).is_none())
+                    .then(|| self.plugin_agents.iter().find(|a| a.name == name))
+                    .flatten()
+            })
+    }
+
+    /// The agent `name` refers to (named so): the profile's own, else a plugin's. A
+    /// plugin agent's skills are its plugin's skills when it has one by that name.
+    pub fn agent(&self, name: &str) -> Result<AgentDef> {
+        if let Some(path) = self.own_agent(name) {
+            let mut def = parse_agent(
+                &Self::read_prompt_file(&path, &format!("agent '{name}'"))?,
+                name,
+            )?;
+            def.name = name.to_owned();
+            return Ok(def);
+        }
+        let Some(a) = self.plugin_agent(name) else {
+            bail!("there is no agent '{name}' (see p2pagents agent list)");
+        };
+        let what = format!("agent '{name}' of plugin '{}'", a.plugin);
+        let text = Self::read_prompt_file(&a.path, &what).context("update the plugin")?;
+        let mut def = parse_agent(&text, &a.name)?;
+        def.name = name.to_owned();
+        def.skills = def
+            .skills
+            .into_iter()
+            .map(|s| {
+                if self
+                    .plugins
+                    .iter()
+                    .any(|p| p.plugin == a.plugin && p.name == s)
+                {
+                    format!("{}.{s}", a.plugin)
+                } else {
+                    s
+                }
+            })
+            .collect();
+        def.source = "plugin";
+        def.plugin = Some(a.plugin.clone());
+        Ok(def)
+    }
+
+    /// Every agent: the profile's own, then plugins' (by short name when no other
+    /// agent has it). One that can't be read is left out.
+    pub fn agents(&self) -> Vec<AgentDef> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.agents_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                path.extension().is_some_and(|x| x == "md").then_some(())?;
+                path.file_stem()?.to_str().map(str::to_owned)
+            })
+            .filter(|n| validate_name(n).is_ok())
+            .collect();
+        names.sort();
+        let mut agents: Vec<AgentDef> = names.iter().filter_map(|n| self.agent(n).ok()).collect();
+        for a in &self.plugin_agents {
+            let reference = if agents.iter().any(|x| x.name == a.name) {
+                format!("{}.{}", a.plugin, a.name)
+            } else {
+                a.name.clone()
+            };
+            if let Ok(def) = self.agent(&reference) {
+                agents.push(def);
+            }
+        }
+        agents
+    }
+
+    /// Adds or replaces a profile agent; the skills it follows must exist.
+    pub fn add_agent(&self, name: &str, text: &str) -> Result<AgentDef> {
+        validate_name(name).context("invalid agent name")?;
+        if text.len() as u64 > MAX_SKILL_BYTES {
+            bail!("the agent is over 64 KB; it goes into prompts, keep it short");
+        }
+        let def = parse_agent(text, name)?;
+        for skill in &def.skills {
+            self.text(skill)
+                .with_context(|| format!("agent '{name}' follows skill '{skill}'"))?;
+        }
+        std::fs::create_dir_all(&self.agents_dir)?;
+        std::fs::write(self.agents_dir.join(format!("{name}.md")), text)?;
+        self.agent(name)
+    }
+
+    /// Removes a profile agent (a plugin's go with their plugin).
+    pub fn remove_agent(&self, name: &str) -> Result<bool> {
+        validate_name(name).context("invalid agent name")?;
+        match std::fs::remove_file(self.agents_dir.join(format!("{name}.md"))) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(a) = self.plugin_agent(name) {
+                    bail!(
+                        "agent '{name}' comes with plugin '{}': turn the plugin off or remove it",
+                        a.plugin
+                    );
+                }
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -502,5 +812,129 @@ mod tests {
             front_matter_name("---\nname: \"x-y\"\n---\nz"),
             Some("x-y".into())
         );
+    }
+
+    #[test]
+    fn agent_files_name_their_skills_and_mcp_servers_in_any_list_form() {
+        let (fields, body) = front_matter(
+            "---\nname: reviewer\ndescription: Reviews things, carefully\nskills: [a, \"b\"]\ntools: Read, Grep\nmcp-servers:\n  semgrep:\n    type: local\n    command: semgrep\n  github:\n    url: x\nskill:\n- c\n- d\n---\n- a list in the body stays\n",
+        );
+        assert_eq!(fields["description"], ["Reviews things, carefully"]);
+        assert_eq!(fields["skills"], ["a", "b"]);
+        assert_eq!(fields["skill"], ["c", "d"]);
+        assert_eq!(fields["tools"], ["Read", "Grep"]);
+        assert_eq!(fields["mcp-servers"], ["semgrep", "github"]);
+        assert_eq!(body, "- a list in the body stays\n");
+
+        let def = parse_agent(
+            "---\ndescription: d\nskills: [a, b]\nmcp: [semgrep]\nmodel: sonnet\n---\nBe careful.",
+            "fallback",
+        )
+        .unwrap();
+        assert_eq!(
+            (def.name.as_str(), def.skills.as_slice(), def.mcp.as_slice()),
+            (
+                "fallback",
+                &["a".to_owned(), "b".to_owned()][..],
+                &["semgrep".to_owned()][..]
+            )
+        );
+        assert_eq!(def.instructions, "Be careful.");
+        assert!(
+            def.notes[0].contains("model is left out"),
+            "{:?}",
+            def.notes
+        );
+        assert!(
+            parse_agent("---\nname: x\n---\n", "x").is_err(),
+            "no instructions"
+        );
+        assert!(parse_agent("---\nskills: [../up]\n---\nHi", "x").is_err());
+    }
+
+    #[test]
+    fn agents_come_from_the_profile_and_plugins_with_their_plugins_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("plugin");
+        std::fs::create_dir_all(plugin.join("skills/security-review")).unwrap();
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("skills/security-review/SKILL.md"),
+            "---\nname: security-review\ndescription: Ours\n---\nUse the plugin's checklist.",
+        )
+        .unwrap();
+        let agent_file = plugin.join("agents/sec.md");
+        std::fs::write(
+            &agent_file,
+            "---\nname: sec\ndescription: Security reviewer\nskills: [security-review, code-review]\nmcp-servers: [semgrep]\n---\nAct as a security engineer.",
+        )
+        .unwrap();
+        let skill = crate::plugins::PluginSkill {
+            name: "security-review".into(),
+            description: "Ours".into(),
+            path: "skills/security-review/SKILL.md".into(),
+        };
+        let skills = Skills::new(dir.path().join("profile/skills"))
+            .with_plugins(vec![(
+                "acme".into(),
+                skill,
+                plugin.join("skills/security-review/SKILL.md"),
+            )])
+            .with_plugin_agents(vec![("acme".into(), "sec".into(), agent_file)]);
+
+        // A plugin agent: its plugin's own skill, not the built-in of that name.
+        let sec = skills.agent("sec").unwrap();
+        assert_eq!(sec.skills, ["acme.security-review", "code-review"]);
+        assert_eq!(
+            (sec.source, sec.plugin.as_deref()),
+            ("plugin", Some("acme"))
+        );
+        assert!(
+            skills
+                .instructions(&sec.skills)
+                .unwrap()
+                .contains("Use the plugin's checklist.")
+        );
+        assert_eq!(skills.agent("acme.sec").unwrap().name, "acme.sec");
+
+        // The profile's own agent of that name comes first; the plugin's stays reachable.
+        assert!(
+            skills
+                .add_agent("sec", "---\nskills: [nope]\n---\nHi")
+                .is_err(),
+            "unknown skill"
+        );
+        let mine = skills
+            .add_agent(
+                "sec",
+                "---\ndescription: Mine\nskills: [code-review]\n---\nBe brief.",
+            )
+            .unwrap();
+        assert_eq!(
+            (mine.source, mine.instructions.as_str()),
+            ("profile", "Be brief.")
+        );
+        let names: Vec<(String, &str)> = skills
+            .agents()
+            .into_iter()
+            .map(|a| (a.name, a.source))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("sec".to_owned(), "profile"),
+                ("acme.sec".to_owned(), "plugin")
+            ]
+        );
+        assert!(
+            skills
+                .remove_agent("acme.sec")
+                .unwrap_err()
+                .to_string()
+                .contains("comes with plugin 'acme'")
+        );
+        assert!(skills.remove_agent("sec").unwrap());
+        assert_eq!(skills.agent("sec").unwrap().source, "plugin");
+        assert!(skills.agent("ghost").is_err());
     }
 }

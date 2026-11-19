@@ -1397,6 +1397,8 @@ function renderPalette() {
       ...[...new Set(shares.flatMap((s) => s.mcp ?? []))].map((m) =>
         part(`mcp=${m}`, about(m) ? `${m}: ${about(m)}` : `Let the step use MCP server ${m}`)),
     ]),
+    section("Agents", "A role the step takes, with its instructions, skills and MCP servers", (state.agents ?? []).map((a) =>
+      part(`agent=${a.name}`, [a.description, a.skills.length ? `skills: ${a.skills.join(", ")}` : "", a.mcp.length ? `MCP servers: ${a.mcp.join(", ")}` : ""].filter(Boolean).join(" · ") || a.name))),
     section("Skills", "Instructions the step follows; pick several to combine them", (state.skills ?? []).map((s) =>
       part(`skill=${s.name}`, s.description || s.name))),
     section("Knowledge", "What agents learned, given to the step", (state.knowledge ?? []).map((k) =>
@@ -1470,6 +1472,7 @@ async function loadOps() {
 async function loadSkills() {
   const res = await api("/api/skills");
   state.skills = res.skills;
+  state.agents = res.agents ?? [];
   $("#skills-summary").textContent = `Skills (${res.skills.length})`;
   $("#skill-list").replaceChildren(...res.skills.map((s) => el("li", {},
     el("button", { type: "button", class: "run-open", onclick: () => openSkill(s.name), "aria-label": `Open skill ${s.name}` },
@@ -1933,7 +1936,8 @@ function connectEvents() {
     else if (msg.type === "schedules") loadSchedules().catch((err) => toast(err.message, "error"));
     else if (msg.type === "tools") {
       loadTools().catch((err) => toast(err.message, "error"));
-      loadSkills().catch(() => {});
+      // Skills and agents changed: a plan naming them is checked again.
+      loadSkills().then(schedulePlanCheck).catch(() => {});
     }
     else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
     else if (msg.type === "approvals") {

@@ -433,8 +433,9 @@ try:
     print("\n".join("  " + l for l in (out_w + out_b).splitlines()))
     hooks_ran = os.path.exists(os.path.join(REPO, "HOOK-RAN.txt")) or any(
         "HOOK-RAN.txt" in files for root in (HOME, ws) for _, _, files in os.walk(root))
-    check("a plugin was imported with its skill and MCP server, and nothing in it ran",
+    check("a plugin was imported with its skill, agent and MCP server, and nothing in it ran",
           code_w == 0 and code_b == 0 and "Nothing in it ran" in out_w and "release-notes" in out_b
+          and "agent=NAME" in out_b and "reviewer" in out_b
           and "hooks (they never run here)" in out_w and not hooks_ran, out_w + out_b)
     code, out = cli("mcp", "add", "code", "echo2", "--plugin", "echo-tools", "--set", "ECHO_WORD=PLUGIN-LIVE-5531",
                     "--set", f"PYTHON={sys.executable}", "--access", "read-only", "--tool", "secret_word",
@@ -469,6 +470,21 @@ try:
     boss.send(f"/plan {plan_file}")
     refused = boss.wait_for(r"offers you no MCP server echo2", 30)
     check("pausing a server from the CLI withdrew it from the running agent's peers", code == 0 and refused, refused)
+    # The plugin's agent brings its instructions (their marker), its skill (the skill's marker) and the
+    # MCP server it uses (worker2's echo, whose word only that server knows); the task names none of them.
+    code, shown = cli("agent", "show", "reviewer", "--profile", "boss")
+    print("\n".join("  " + l for l in shown.splitlines()[:5]))
+    agent_plan = os.path.join(HOME, "review.plan")
+    with open(agent_plan, "w") as f:
+        f.write("review @worker2:code agent=reviewer Review this release: an echo tool was added.\n")
+    boss.cursor = len(boss.lines)
+    boss.send(f"/plan {agent_plan}")
+    boss.wait_for(r"=== plan finished", 400)
+    text = "\n".join(boss.lines[boss.cursor:])
+    check("a plugin's agent brought its instructions, skill and MCP server to a plan step",
+          code == 0 and "skills: echo-tools.release-notes; MCP servers: echo" in shown
+          and re.search(r"REVIEWER-AGENT:[^\n]*MCP-LIVE-8842", text) is not None and "RELEASE-NOTES-SKILL:" in text,
+          (shown, text[-1500:]))
 
     print("== schedules: a plan boss scheduled, missed while it was off, runs once on its own")
     sched_plan = os.path.join(HOME, "ping.plan")

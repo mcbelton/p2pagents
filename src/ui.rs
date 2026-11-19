@@ -443,6 +443,11 @@ pub async fn start(
             "/api/skills/{name}",
             get(skill_text).delete(tools::remove_skill),
         )
+        .route("/api/agents", post(tools::add_agent))
+        .route(
+            "/api/agents/{name}",
+            get(agent_def).delete(tools::remove_agent),
+        )
         .route(
             "/api/plugins",
             get(tools::list_plugins).post(tools::install_plugin),
@@ -1629,7 +1634,21 @@ async fn open_pr(
 }
 
 async fn list_skills(State(s): State<AppState>) -> Json<Value> {
-    Json(json!({ "skills": s.info.profile.skills().list() }))
+    let skills = s.info.profile.skills();
+    Json(json!({ "skills": skills.list(), "agents": skills.agents() }))
+}
+
+async fn agent_def(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let agent = s.info.profile.skills().agent(&name).map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("{e:#}") })),
+        )
+    })?;
+    Ok(Json(json!(agent)))
 }
 
 async fn skill_text(

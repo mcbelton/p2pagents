@@ -629,14 +629,14 @@
     {
       "id": "PLG-1",
       "area": "plugins",
-      "claim": "A profile imports plugins from a folder, a GitHub repository (private ones with the profile's GitHub sign-in) or a git URL, in the layouts GitHub Copilot CLI, Claude Code and Agent Plugins use, or picks one from a marketplace; its owner reviews what a plugin contains (skills, MCP servers and the values they need, what isn't used) before anything is kept, and importing runs nothing: agents, commands, hooks and LSP servers are listed and left out.",
+      "claim": "A profile imports plugins from a folder, a GitHub repository (private ones with the profile's GitHub sign-in) or a git URL, in the layouts GitHub Copilot CLI, Claude Code and Agent Plugins use, or picks one from a marketplace; its owner reviews what a plugin contains (skills, agents, MCP servers and the values they need, what isn't used) before anything is kept, and importing runs nothing: commands, hooks and LSP servers are listed and left out.",
       "tests": [
         "lib::plugins::sources_are_folders_github_repositories_or_git_urls",
         "lib::plugins::plugins_are_inspected_in_every_layout_and_import_runs_nothing",
         "lib::plugins::git_sources_are_cloned_and_marketplace_entries_resolved",
         "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills"
       ],
-      "live": ["a plugin was imported with its skill and MCP server, and nothing in it ran"]
+      "live": ["a plugin was imported with its skill, agent and MCP server, and nothing in it ran"]
     },
     {
       "id": "PLG-2",
@@ -650,6 +650,24 @@
       "live": [
         "a plugin's skill guided a plan step",
         "a plugin's MCP server, offered while worker2 ran, served boss's task"
+      ]
+    },
+    {
+      "id": "AGT-1",
+      "area": "plugins",
+      "claim": "A plan step can act as an agent (agent=NAME): a role with instructions, the skills it follows and the MCP servers it uses. Agents are Markdown files with front matter (lists in any YAML form) that an owner adds in the web UI or the CLI, or that a plugin brings; a plugin's agent follows the plugin's own skills, and the tools and model fields of an agent file are left out with a note. The step gets the agent's instructions before its skills, and the agent's skills and MCP servers along with its own; an unknown agent, a sign-off acting as an agent, or an agent whose MCP servers the step's folder doesn't offer is refused before anything runs. A profile's agent names only skills that exist; a plugin's agents are withdrawn when it is turned off and can't be removed apart from it.",
+      "tests": [
+        "lib::skills::agent_files_name_their_skills_and_mcp_servers_in_any_list_form",
+        "lib::skills::agents_come_from_the_profile_and_plugins_with_their_plugins_skills",
+        "lib::plan::steps_act_as_agents_with_their_skills_and_mcp_servers",
+        "lib::plan::preflight_finds_what_would_fail_before_anything_runs",
+        "lib::plugins::plugins_are_inspected_in_every_layout_and_import_runs_nothing",
+        "lib::plugins::plugins_install_offer_update_disable_and_remove",
+        "ui::ui_imports_plugins_and_configures_mcp_servers_and_skills",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ],
+      "live": [
+        "a plugin's agent brought its instructions, skill and MCP server to a plan step"
       ]
     },
     {
@@ -703,7 +721,7 @@
     {
       "id": "UX-1",
       "area": "ui",
-      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; a plan builder edits the same plan as forms (claims, then a card per task or sign-off) that can't express the usual mistakes: tasks prove claims only with a check, no step can wait for one that waits for it, renames and removals carry through, what a field still needs is said on it, and Run goes to the first; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills, agents and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; a plan builder edits the same plan as forms (claims, then a card per task or sign-off) that can't express the usual mistakes: tasks prove claims only with a check, no step can wait for one that waits for it, renames and removals carry through, what a field still needs is said on it, and Run goes to the first; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
       "tests": [
         "ui::the_page_follows_the_ux_guidelines",
         "ui::the_plan_editor_keeps_plans_valid",

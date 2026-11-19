@@ -601,6 +601,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `claims=ID,...` | The claims this step's evidence counts towards. Claims must be defined with a `claim:` line first. |
 | `apply=step` | Applies that earlier step's commit (as a patch) in this step's own worktree first, so a *different* peer can verify the work independently. Needs edit access in a `--worktrees` folder. |
 | `skill=a,b` | Puts those skills (instructions: procedure, rules, output format) in the step's prompt. See [The lifecycle](#the-lifecycle-from-a-fresh-project-to-operations) |
+| `agent=name` | The step acts as that [agent](#agents): its instructions come first in the prompt, and its skills and MCP servers are added to the step's own. Not on sign-offs. |
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
@@ -608,7 +609,7 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 A step line is `name [after steps] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `attempts`, `apply` and `save` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply` and `save` are given once.
 
 **3. Agents do the work, and each result comes back with signed evidence.**
 
@@ -727,14 +728,52 @@ p2pagents skill import .\skills\release-notes --profile boss                    
 
 In the web UI, **Plugins & tools › Skills** adds a skill (pasted, or loaded from a
 `SKILL.md`) and lists yours, those of your plugins and the built-in ones. Skills also come
-in [plugins](#plugins-skills-and-mcp-servers-packaged-together).
+in [plugins](#plugins-skills-agents-and-mcp-servers-packaged-together).
+
+#### Agents
+
+An **agent** is a role a step takes (`agent=sec-reviewer`): instructions, the skills it
+follows and the MCP servers it uses, in one Markdown file with front matter (the format
+of GitHub Copilot and Claude Code agent files):
+
+```markdown
+---
+name: sec-reviewer
+description: Reviews a change the way a security engineer would
+skills: [security-review, threat-modeling]
+mcp-servers: [semgrep]
+---
+Report each finding with its file, line, severity and the fix.
+```
+
+```powershell
+p2pagents agent add .\sec-reviewer.agent.md --profile boss   # named by its front matter (or --as NAME); - reads stdin
+p2pagents agent list --profile boss                          # yours, then your plugins'
+p2pagents agent show sec-reviewer --profile boss
+p2pagents agent remove sec-reviewer --profile boss
+```
+
+- A step `review @alice:app agent=sec-reviewer Review the diff` gets the agent's
+  instructions first, then its skills and the step's own `skill=`, and may use its MCP
+  servers along with the step's own `mcp=`.
+- The plan check refuses an unknown agent, an agent on a sign-off, and an agent whose MCP
+  servers the step's folder doesn't offer you (the folder's owner offers servers by name,
+  as for `mcp=`). An agent you add may name only skills that exist.
+- An agent file's `tools` and `model` are left out, with a note: the folder's owner
+  decides what a step may do, and the peer picks its model.
+- Agents also come in [plugins](#plugins-skills-agents-and-mcp-servers-packaged-together),
+  where they follow the plugin's own skills.
+
+In the web UI, **Plugins & tools › Agents** adds one (pasted, or loaded from a file) and
+lists yours and your plugins' with what each uses and its instructions. In the plan editor,
+each task card has an **Agent** field, and the text view lists agents beside the plan.
 
 **Plan check.** Before a plan runs, it is checked against what exists now:
 
 - connected peers, and the folders they share with you (each folder's checks, your access
   there, worktrees);
 - your squads;
-- knowledge topics and skills.
+- knowledge topics, skills and agents.
 
 `verify=` with the folder's own checks needs full access (the built-in `spec:`, `design:`
 and `review:` checks need only read access), `apply=` a `--worktrees` folder, and approvers must be
@@ -1000,7 +1039,7 @@ Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|lis
 `p2pagents share add|list|remove`, `p2pagents mcp add|import|list|pause|resume|remove`,
 `p2pagents plugin add|list|show|update|enable|disable|remove`, `p2pagents worker create|list`,
 `p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
-`p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|import|remove`, `p2pagents github login|status|logout`,
+`p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|import|remove`, `p2pagents agent list|show|add|remove`, `p2pagents github login|status|logout`,
 `p2pagents repo link|list|sync|branches|pr|unlink`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `P2PAGENTS_SCHEDULE_TICK_SECS` sets how
 often an agent looks for due schedules (default 30).
@@ -1033,7 +1072,8 @@ p2pagents --name me --providers copilot --serve --ui
   the same plan:
   - **Builder** (forms, no syntax to learn): what must be true (claims), then a card per
     step, an agent task or a sign-off: who does it (connected peers, their folders and
-    squads), what to do, skills (picked from a list with what each is for), the checks
+    squads), what to do, the [agent](#agents) it acts as (with what that agent brings),
+    skills (picked from a list with what each is for), the checks
     the folder offers (and the built-in ones), the claims it proves, the steps it waits
     for, and more options (tries, model, knowledge, MCP servers). It can't hold the
     usual mistakes: a task proves claims only once it has a check, a step can't wait for
@@ -1052,11 +1092,11 @@ p2pagents --name me --providers copilot --serve --ui
   plan?" stays folded until you open it.
 - **Schedules**: each schedule in plain words, its next run, its last run's result (with
   a link to the evidence run), and Run now, Pause/Resume, Edit and Delete.
-- **Plugins & tools**: import [plugins](#plugins-skills-and-mcp-servers-packaged-together)
+- **Plugins & tools**: import [plugins](#plugins-skills-agents-and-mcp-servers-packaged-together)
   (review what one contains first; importing runs nothing), offer, pause, change or remove
   [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks) in your shared
   folders (by hand, from an MCP configuration file or from a plugin), and add or remove
-  your own skills.
+  your own skills and agents.
 - **Squads**: create, view (members, who is online, running tasks) and remove squads.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
@@ -1198,7 +1238,7 @@ p2pagents mcp remove app docs --profile alice
 Changes take effect for a running agent's peers within seconds, also when made from the
 command line. In the web UI, **Plugins & tools › MCP servers** does the same: offer a
 server by hand, from a pasted (or loaded) MCP configuration or from a
-[plugin](#plugins-skills-and-mcp-servers-packaged-together), type the values it needs
+[plugin](#plugins-skills-agents-and-mcp-servers-packaged-together), type the values it needs
 (secrets in hidden fields; they are never shown again), and pause, edit or remove offered
 servers. It warns when a server needs more access than its folder ever gives.
 
@@ -1222,35 +1262,40 @@ look @alice:app mcp=browser Open http://localhost:3000 and report what the home 
 Servers run on your machine with your rights, outside the shell sandbox, so offer only
 servers you trust. Remote URLs must be `https://`, except `http://` on this machine.
 
-### Plugins: skills and MCP servers, packaged together
+### Plugins: skills, agents and MCP servers, packaged together
 
-A **plugin** bundles skills and MCP servers, in the layouts GitHub Copilot CLI
+A **plugin** bundles skills, agents and MCP servers, in the layouts GitHub Copilot CLI
 (`plugin.json`, `.github/plugin/plugin.json`), Claude Code (`.claude-plugin/plugin.json`)
 and Agent Plugins (`plugin.json` with its `$schema`, `skills/`, `mcp.json`) use, or a bare
-folder of `skills/*/SKILL.md` and `.mcp.json`. A marketplace (`marketplace.json`) lists
+folder of `skills/*/SKILL.md`, `agents/*.md` and `.mcp.json`. A marketplace (`marketplace.json`) lists
 several; pick one with `--plugin`.
 
 ```powershell
 p2pagents plugin add .\team-tools --profile alice                          # a folder
 p2pagents plugin add octo-org/agent-plugins:plugins/reviewer --profile alice  # GitHub (private ones with the profile's GitHub sign-in)
 p2pagents plugin add octo-org/marketplace --plugin reviewer --profile alice   # from a marketplace
-p2pagents plugin show reviewer --profile alice     # its skills, MCP servers, the values they need, where they're offered
+p2pagents plugin show reviewer --profile alice     # its skills, agents, MCP servers, the values they need, where they're offered
 # offer one of its MCP servers in a shared folder, with the values it needs
 p2pagents mcp add app tickets --plugin reviewer --set TICKETS_TOKEN=<token> --access read-only --profile alice
 p2pagents plugin update reviewer --profile alice   # fetch it again
 p2pagents plugin disable reviewer --profile alice  # enable / remove
 ```
 
-- **Importing runs nothing.** The plugin's files are copied into the profile. Agents,
-  commands, hooks and LSP servers are listed as not used and never run.
+- **Importing runs nothing.** The plugin's files are copied into the profile. Commands,
+  hooks and LSP servers are listed as not used and never run.
 - **Skills** become usable in plan steps (`skill=name`, or `skill=plugin.name` when
   another skill has that name), and peers' steps get their `SKILL.md` text like any skill.
+- **Agents** (`agents/*.md`, `NAME.agent.md`, or the manifest's `agents`) become usable
+  in plan steps (`agent=name`, or `agent=plugin.name` when you have an agent of that
+  name). A plugin's agent follows the plugin's own skills; the MCP servers it uses are
+  names the step's folder must offer, so offer the plugin's servers under the names its
+  agents use. The review notes an agent's server the plugin doesn't bring.
 - **MCP servers** are templates: nothing is offered until you offer one in a folder, with
   the values it needs (a plugin's `userConfig`, `${input:x}`, `${env:X}` or `${X}`
   placeholders; values not given with `--set` come from environment variables of the same
   name). `${PLUGIN_ROOT}` (and the Claude and Copilot spellings) becomes the plugin's
   folder, `${PLUGIN_DATA}` a folder it may write to, `${workspaceFolder}` the shared folder.
-- **Turning a plugin off** withdraws its skills and the servers it offered; turning it on
+- **Turning a plugin off** withdraws its skills, agents and the servers it offered; turning it on
   offers them again. **Updating** keeps each offer's access, tools and values, and pauses
   servers that would now start differently until you look at them and resume them.
   **Removing** a plugin removes the servers it offered.

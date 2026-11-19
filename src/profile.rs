@@ -410,7 +410,9 @@ impl Profile {
 
     /// Built-in skills, this profile's own (`skills/`) and those of its enabled plugins.
     pub fn skills(&self) -> crate::skills::Skills {
-        crate::skills::Skills::new(self.dir.join("skills")).with_plugins(self.plugins().skills())
+        crate::skills::Skills::new(self.dir.join("skills"))
+            .with_plugins(self.plugins().skills())
+            .with_plugin_agents(self.plugins().agents())
     }
 
     /// Plugins imported into this profile (see [`crate::plugins`]).

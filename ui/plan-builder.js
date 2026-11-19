@@ -200,10 +200,32 @@ const planBuilder = (() => {
         provesField(s, k, true), waitsField(s, k)]
       : [field(`${k}-target`, "Who does it", who, "A peer and one of the folders it shares with you, or any member of a squad"),
         field(`${k}-todo`, "What to do", todo),
+        agentField(s, k),
         skillsField(s, k), checksField(s, k), provesField(s, k, planText.valuesOf(s, "verify").length > 0),
         waitsField(s, k), moreOptions(s, k)];
     return el("li", { class: `pb-step${s.approve ? " signoff" : ""}`, "data-card": k }, head, ...body,
       el("div", { class: "pb-marks", "data-marks": k }));
+  }
+
+  /// The agent a task acts as (from a plugin or the profile's own): what it brings.
+  function agentField(s, k) {
+    const agents = state.agents ?? [];
+    const chosen = planText.valuesOf(s, "agent")[0] ?? "";
+    if (!agents.length && !chosen) return null;
+    const label = (a) => `${a.name}${a.description ? `: ${a.description}` : ""}`;
+    const pick = select({
+      Yours: agents.filter((a) => a.source === "profile").map((a) => [a.name, label(a)]),
+      "From plugins": agents.filter((a) => a.source === "plugin").map((a) => [a.name, `${label(a)} (plugin ${a.plugin})`]),
+    }, chosen, "None: just the task");
+    pick.addEventListener("change", () => { planText.setValues(s, "agent", pick.value || null); changed(true); });
+    const a = agents.find((x) => x.name === chosen);
+    const brings = a && [
+      "Its instructions come first",
+      a.skills.length ? `it follows ${a.skills.join(", ")}` : "",
+      a.mcp.length ? `it uses the MCP servers ${a.mcp.join(", ")}, which the folder must offer` : "",
+    ].filter(Boolean).join("; ");
+    return field(`${k}-agent`, "Agent", pick,
+      brings ? `${brings}.` : "A role from a plugin or your own, with its instructions, skills and MCP servers");
   }
 
   function skillsField(s, k) {
@@ -370,10 +392,10 @@ const planBuilder = (() => {
     if (s.approve === approve) return;
     s.approve = approve;
     if (approve) {
-      // A person's decision: no folder, checks, retries, patch, saved result or tools.
+      // A person's decision: no folder, checks, retries, patch, saved result, tools or agent.
       s.target = "@me";
       s.using = null;
-      for (const option of ["verify", "attempts", "apply", "save", "mcp"]) planText.setValues(s, option, null);
+      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent"]) planText.setValues(s, option, null);
     } else {
       s.target = null;
     }

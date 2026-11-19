@@ -10,15 +10,15 @@ const planText = (() => {
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"]]);
-  const SINGLE = new Set(["attempts", "save", "apply"]);
-  // A sign-off is a person's decision: no checks, retries, patches or saved result.
-  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent"]);
+  // A sign-off is a person's decision: no checks, retries, patches, saved result or agent.
+  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent"]);
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";
   const ERRORS = {
     squadSignoff: "A sign-off needs a person (@name or @me), not a squad.",
-    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches or saved result.",
+    signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result or agent.",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
 

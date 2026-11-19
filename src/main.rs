@@ -87,6 +87,10 @@ enum Command {
     /// ship with p2pagents; a profile's own replace or add to them.
     #[command(subcommand)]
     Skill(SkillCommand),
+    /// Agents: roles plan steps take (agent=name), with their instructions, the
+    /// skills they follow and the MCP servers they use; a profile's own, or from plugins.
+    #[command(subcommand)]
+    Agent(AgentCommand),
     /// Spec-driven development: check a feature's spec, REST API contract and UX
     /// prototype, its design and its review pack (the checks plan steps run as
     /// verify=spec:api,design:threats,...).
@@ -374,6 +378,48 @@ Use it in a plan step with skill=security-review.")]
         /// Save it under another name.
         #[arg(long = "as", value_name = "NAME")]
         rename: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// List agents: the profile's own and those of enabled plugins.
+    List {
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Print an agent: what it follows and uses, and its instructions.
+    Show {
+        name: String,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Add an agent, or replace one, from a Markdown file (`-` for stdin). Its name
+    /// comes from its front matter, else the file's name.
+    #[command(after_help = "\
+An agent file starts with front matter, as GitHub Copilot and Claude Code agents do:
+  ---
+  name: security-reviewer
+  description: Reviews a change for security problems
+  skills: [security-review, code-review]
+  mcp-servers: [semgrep]
+  ---
+  You review changes the way a security engineer would...
+Use it in a plan step with agent=security-reviewer: its instructions come first, its
+skills with them, and the step's folder must offer its MCP servers.")]
+    Add {
+        file: PathBuf,
+        /// Save it under another name.
+        #[arg(long = "as", value_name = "NAME")]
+        rename: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Remove a profile agent (a plugin's go with their plugin).
+    Remove {
+        name: String,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1046,6 +1092,7 @@ async fn main() -> Result<()> {
         Some(Command::Kb(command)) => run_kb(command),
         Some(Command::Playbook(command)) => run_playbook(command),
         Some(Command::Skill(command)) => run_skill(command),
+        Some(Command::Agent(command)) => run_agent_command(command),
         Some(Command::Spec(command)) => run_spec(command),
         Some(Command::Design(command)) => run_design(command),
         Some(Command::Github(command)) => run_github(command),
@@ -1777,6 +1824,95 @@ fn run_skill(command: SkillCommand) -> Result<()> {
                     None => "",
                 }
             );
+        }
+    }
+    Ok(())
+}
+
+fn run_agent_command(command: AgentCommand) -> Result<()> {
+    let uses = |a: &p2pagents::skills::AgentDef| {
+        [("skills", &a.skills), ("MCP servers", &a.mcp)]
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(what, v)| format!("{what}: {}", v.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    match command {
+        AgentCommand::List { profile } => {
+            let agents = Profile::open(&profile.name)?.skills().agents();
+            if agents.is_empty() {
+                println!(
+                    "no agents yet: add one with agent add FILE, or import a plugin that has some"
+                );
+            }
+            let from = |a: &p2pagents::skills::AgentDef| {
+                a.plugin
+                    .as_deref()
+                    .map(|p| format!("plugin {p}"))
+                    .unwrap_or_else(|| "yours".into())
+            };
+            let width = agents.iter().map(|a| from(a).len()).max().unwrap_or(0);
+            for a in &agents {
+                println!("  {:<22} {:<width$} {}", a.name, from(a), a.description);
+                let uses = uses(a);
+                if !uses.is_empty() {
+                    println!("  {:<22} {:<width$} {uses}", "", "");
+                }
+            }
+        }
+        AgentCommand::Show { name, profile } => {
+            let a = Profile::open(&profile.name)?.skills().agent(&name)?;
+            println!(
+                "agent {}{}",
+                a.name,
+                a.plugin
+                    .as_deref()
+                    .map(|p| format!(" (plugin {p})"))
+                    .unwrap_or_default()
+            );
+            if !a.description.is_empty() {
+                println!("  {}", a.description);
+            }
+            let uses = uses(&a);
+            if !uses.is_empty() {
+                println!("  {uses}");
+            }
+            for note in &a.notes {
+                println!("  note: {note}");
+            }
+            println!("\n{}", a.instructions);
+        }
+        AgentCommand::Add {
+            file,
+            rename,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let text = read_input(&file)?;
+            let fallback = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("agent")
+                .trim_end_matches(".md")
+                .trim_end_matches(".agent")
+                .to_owned();
+            let name = rename
+                .or_else(|| p2pagents::skills::front_matter_name(&text))
+                .unwrap_or(fallback);
+            let a = profile.skills().add_agent(&name, &text)?;
+            println!(
+                "profile '{}': saved agent {}. Use it with agent={} in a plan step.",
+                profile.name, a.name, a.name
+            );
+            for note in &a.notes {
+                println!("  note: {note}");
+            }
+        }
+        AgentCommand::Remove { name, profile } => {
+            if !Profile::open(&profile.name)?.skills().remove_agent(&name)? {
+                bail!("profile has no agent '{name}' of its own");
+            }
         }
     }
     Ok(())
@@ -2573,6 +2709,17 @@ fn print_plugin(p: &p2pagents::plugins::Plugin, profile: &Profile) -> Result<()>
         println!("  skills (use with skill=NAME in a plan step):");
         for s in &p.skills {
             println!("    {:<24} {}", s.name, s.description);
+        }
+    }
+    if !p.agents.is_empty() {
+        println!("  agents (use with agent=NAME in a plan step):");
+        for a in &p.agents {
+            println!("    {:<24} {}", a.name, a.description);
+            for (what, names) in [("skills", &a.skills), ("MCP servers", &a.mcp)] {
+                if !names.is_empty() {
+                    println!("    {:<24} {what}: {}", "", names.join(", "));
+                }
+            }
         }
     }
     if !p.mcp.is_empty() {

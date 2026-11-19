@@ -19,9 +19,11 @@
 //! prompt: `verify=a,b` asks the peer's runtime to run those owner-defined checks
 //! after the model (as signed evidence), `attempts=N` retries with the failures,
 //! `claims=C-1` says which claims the step proves, `apply=step` applies that
-//! prerequisite's commit first and `mcp=a,b` lets the model use those MCP servers
-//! of the folder. Repeating an option that takes a list adds to it (`skill=a skill=b`
-//! is `skill=a,b`); the others are given once. `approve @person` (or `@me`) asks a
+//! prerequisite's commit first, `mcp=a,b` lets the model use those MCP servers
+//! of the folder and `agent=name` makes the step act as that agent (its
+//! instructions first, its skills and MCP servers added to the step's). Repeating
+//! an option that takes a list adds to it (`skill=a skill=b` is `skill=a,b`); the
+//! others are given once. `approve @person` (or `@me`) asks a
 //! team member to sign off instead of running a model. See [`crate::runs`] for the
 //! verdicts.
 
@@ -156,6 +158,10 @@ pub struct Step {
     /// MCP servers of the peer's folder the model may use (`mcp=a,b`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<String>,
+    /// The agent the step acts as (`agent=name`): its instructions come first, and
+    /// its skills and MCP servers with it (see [`crate::skills`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// A statement the plan must prove with evidence (`claim: ID text`).
@@ -261,6 +267,12 @@ impl Plan {
             if step.approve && step.save.is_some() {
                 bail!("approval step '{}' has no result to save", step.id);
             }
+            if step.approve && step.agent.is_some() {
+                bail!(
+                    "approval step '{}' is a person's decision: it can't act as an agent",
+                    step.id
+                );
+            }
             if step.approve && matches!(step.target, Target::Squad(_)) {
                 bail!("approval step '{}' needs a person: @name or @me", step.id);
             }
@@ -303,10 +315,25 @@ impl Plan {
     pub fn prepare(&self, kb: &KnowledgeBase, skills: &Skills) -> Result<Plan> {
         let mut plan = self.with_knowledge(kb)?;
         for step in &mut plan.steps {
-            if step.skills.is_empty() {
+            let agent = match &step.agent {
+                Some(name) => Some(
+                    skills
+                        .agent(name)
+                        .with_context(|| format!("step '{}'", step.id))?,
+                ),
+                None => None,
+            };
+            if let Some(agent) = &agent {
+                step.skills = union(&agent.skills, &step.skills);
+                step.mcp = union(&agent.mcp, &step.mcp);
+            }
+            if step.skills.is_empty() && agent.is_none() {
                 continue;
             }
-            let instructions = skills
+            let mut instructions = agent
+                .map(|a| format!("\n### Agent: {}\n{}\n", a.name, a.instructions))
+                .unwrap_or_default();
+            instructions += &skills
                 .instructions(&step.skills)
                 .with_context(|| format!("step '{}'", step.id))?;
             step.prompt = format!(
@@ -394,6 +421,7 @@ const TODO_CLAIM: &str = "What must be true at the end";
 /// Step options (`name=value`, before what to do).
 const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
+    "agent",
 ];
 
 /// Whether `word` sets a step option.
@@ -463,6 +491,7 @@ fn parse_step(line: &str) -> Result<Step> {
     let mut provider = Provider::Copilot;
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
+    let mut agent = None;
     let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
@@ -474,7 +503,7 @@ fn parse_step(line: &str) -> Result<Step> {
             }
             Some(word) if word.contains('=') => {
                 let (key, value) = word.split_once('=').expect("contains '='");
-                if matches!(key, "attempts" | "apply" | "save") && !once.insert(key) {
+                if matches!(key, "attempts" | "apply" | "save" | "agent") && !once.insert(key) {
                     bail!("{key}= is given twice; a step has one");
                 }
                 match key {
@@ -506,6 +535,11 @@ fn parse_step(line: &str) -> Result<Step> {
                             .map_err(|_| anyhow!("save= needs a topic name, got {value:?}"))?;
                         save = Some(value.to_owned());
                     }
+                    "agent" => {
+                        validate_name(value)
+                            .map_err(|_| anyhow!("agent= needs an agent's name, got {value:?}"))?;
+                        agent = Some(value.to_owned());
+                    }
                     _ => break,
                 }
                 words.next();
@@ -533,7 +567,26 @@ fn parse_step(line: &str) -> Result<Step> {
         save,
         skills,
         mcp,
+        agent,
     })
+}
+
+/// `first`, then those of `then` that aren't in it.
+fn union(first: &[String], then: &[String]) -> Vec<String> {
+    let mut all = first.to_vec();
+    all.extend(then.iter().filter(|x| !first.contains(x)).cloned());
+    all
+}
+
+/// The step as it runs as its agent: the agent's skills and MCP servers come first.
+fn with_agent(step: &Step, skills: &Skills) -> Result<Step> {
+    let mut step = step.clone();
+    if let Some(name) = &step.agent {
+        let agent = skills.agent(name)?;
+        step.skills = union(&agent.skills, &step.skills);
+        step.mcp = union(&agent.mcp, &step.mcp);
+    }
+    Ok(step)
 }
 
 /// Where a step is in its life.
@@ -876,7 +929,14 @@ pub fn preflight(
             fixes: Vec::new(),
         })
     };
-    for step in &plan.steps {
+    for own in &plan.steps {
+        let step = &match with_agent(own, skills) {
+            Ok(step) => step,
+            Err(e) => {
+                report(Some(own), true, format!("{e:#}"));
+                own.clone()
+            }
+        };
         if let Some(word) = step.prompt.split_whitespace().find(|w| is_option(w)) {
             report(
                 Some(step),
@@ -934,7 +994,15 @@ pub fn preflight(
         }
         let reasons: Vec<String> = candidates.iter().filter_map(|p| unable(step, p)).collect();
         if reasons.len() == candidates.len() {
-            report(Some(step), true, reasons.join("; "));
+            let reasons = reasons.join("; ");
+            // Only the agent's MCP servers stand in the way: say so.
+            let message = match &step.agent {
+                Some(agent) if candidates.iter().any(|p| unable(own, p).is_none()) => {
+                    format!("agent {agent} can't work here: {reasons}")
+                }
+                _ => reasons,
+            };
+            report(Some(step), true, message);
         }
     }
     // Each claim needs a step that can prove it: one with checks, or a sign-off.
@@ -1570,6 +1638,49 @@ mod tests {
     }
 
     #[test]
+    fn steps_act_as_agents_with_their_skills_and_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        skills
+            .add_agent(
+                "sec",
+                "---\ndescription: Security reviewer\nskills: [security-review]\nmcp: [semgrep]\n---\nAct as a security engineer.",
+            )
+            .unwrap();
+        let plan = Plan::parse("a @x agent=sec skill=code-review Review the diff").unwrap();
+        assert_eq!(plan.steps[0].agent.as_deref(), Some("sec"));
+        let ready = plan.prepare(&kb, &skills).unwrap();
+        let step = &ready.steps[0];
+        assert_eq!(step.skills, ["security-review", "code-review"]);
+        assert_eq!(step.mcp, ["semgrep"]);
+        assert!(
+            step.prompt.starts_with(
+                "Follow these instructions:\n\n### Agent: sec\nAct as a security engineer.\n\n### Skill: security-review"
+            ),
+            "{}",
+            step.prompt
+        );
+        assert!(step.prompt.ends_with("---\nReview the diff"));
+
+        let unknown = Plan::parse("a @x agent=nope do").unwrap();
+        assert!(
+            unknown
+                .prepare(&kb, &skills)
+                .unwrap_err()
+                .to_string()
+                .contains("step 'a'")
+        );
+        let fails = |text: &str, expected: &str| {
+            let err = Plan::parse(text).unwrap_err().to_string();
+            assert!(err.contains(expected), "{text}: {err}");
+        };
+        fails("a @x agent=sec agent=sec do", "agent= is given twice");
+        fails("a @x agent=../up do", "agent= needs an agent's name");
+        fails("a approve @me agent=sec ok?", "can't act as an agent");
+    }
+
+    #[test]
     fn squads_persist_and_validate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("squads.json");
@@ -1668,6 +1779,29 @@ mod tests {
         };
         let good = "claim: C-1 tests pass\nfix @alice:app verify=test skill=implement-change claims=C-1 Fix it\nok after fix approve @me claims=C-1 Approve\nlook @alice:app mcp=browser Open the app";
         assert!(check(good).is_empty(), "{:?}", check(good));
+        // An agent's MCP servers must be offered by the step's folder, like its own.
+        skills
+            .add_agent("web", "---\nmcp-servers: [browser]\n---\nTest the web app.")
+            .unwrap();
+        assert!(check("a @alice:app agent=web Test it").is_empty());
+        let agents = check("b @bob:app agent=web Test it\nc @alice:app agent=ghost Do it");
+        assert!(
+            agents[0].starts_with(
+                "E b: agent web can't work here: folder 'app' on bob offers you no MCP server browser"
+            ),
+            "{agents:?}"
+        );
+        let own_too = check("b @bob:app agent=web mcp=db Test it");
+        assert!(
+            own_too[0].starts_with("E b: folder 'app' on bob offers you no MCP server browser, db"),
+            "the step's own servers are missing too: {own_too:?}"
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|p| p.starts_with("E c: there is no agent 'ghost'")),
+            "{agents:?}"
+        );
         let spec_on_bob = "s @bob:app verify=spec:spec,spec:trace skill=write-spec Write the spec";
         assert!(
             check(spec_on_bob).iter().all(|p| !p.starts_with("E ")),

@@ -1,8 +1,8 @@
 // p2pagents web UI: Plugins & tools. Import plugins (reviewed before anything is
 // kept; importing runs nothing), offer MCP servers in shared folders, and add the
-// profile's own skills. Uses app.js helpers: $, el, api, toast, confirmDialog,
-// radioGroup, openSkill, ACCESS_SHORT. Plugin and server text is rendered with
-// textContent only.
+// profile's own skills and agents. Uses app.js helpers: $, el, api, toast,
+// confirmDialog, radioGroup, openSkill, loadSkills, ACCESS_SHORT. Plugin and server
+// text is rendered with textContent only.
 "use strict";
 
 const tools = {
@@ -10,6 +10,7 @@ const tools = {
   plugins: [],
   mcp: { shares: [], templates: [] },
   skills: [],
+  agents: [],
   /** What was fetched for review: a plugin, or a marketplace to pick from. */
   review: null,
   /** The offered server being edited ("share/name"): lists wait until it's saved. */
@@ -42,9 +43,10 @@ async function loadTools() {
   tools.plugins = plugins.plugins;
   tools.mcp = mcp;
   tools.skills = skills.skills;
+  tools.agents = skills.agents ?? [];
   const offered = mcp.shares.reduce((n, s) => n + s.mcp.length, 0);
   $("#tools-summary").textContent =
-    `${plural(tools.plugins.length, "plugin")} · ${plural(offered, "MCP server")} offered · ${plural(tools.skills.length, "skill")}`;
+    `${plural(tools.plugins.length, "plugin")} · ${plural(offered, "MCP server")} offered · ${plural(tools.skills.length, "skill")} · ${plural(tools.agents.length, "agent")}`;
   if ($("#tools-dialog").open) renderTools();
 }
 
@@ -74,6 +76,7 @@ function buildTools() {
   buildPluginsPanel();
   buildMcpPanel();
   buildSkillsPanel();
+  buildAgentsPanel();
 }
 
 function renderTools() {
@@ -81,6 +84,7 @@ function renderTools() {
   renderOffered();
   refreshOfferForm();
   renderSkillList();
+  renderAgentList();
 }
 
 // ---------- plugins ----------
@@ -106,7 +110,7 @@ function buildPluginsPanel() {
       el("h3", { text: "Import a plugin" }),
       el("p", {
         class: "muted small",
-        text: "A plugin packages skills and MCP servers. You see what it contains before anything is kept, and importing runs nothing: its skills become usable in plan steps, and its MCP servers wait until you offer one in a folder.",
+        text: "A plugin packages skills, agents and MCP servers. You see what it contains before anything is kept, and importing runs nothing: its skills and agents become usable in plan steps, and its MCP servers wait until you offer one in a folder.",
       }),
       form,
       el("div", { id: "plugin-review" })),
@@ -186,20 +190,28 @@ function renderReview() {
     pluginContents(p, false),
     field("Import as", rename, r.exists
       ? `A plugin named ${p.name} is imported already: pick another name, or update that one instead.`
-      : "The name its skills and servers are known by here."),
+      : "The name its skills, agents and servers are known by here."),
     el("p", { class: "form-error", id: "plugin-import-error", role: "alert" }),
     el("div", { class: "dialog-actions" },
       el("button", { type: "button", class: "btn", onclick: discardReview }, "Discard"),
       importBtn)));
 }
 
-/** What a plugin contains: skills, MCP servers (offerable once imported) and notes. */
+/** What a plugin contains: skills, agents, MCP servers (offerable once imported) and notes. */
 function pluginContents(p, installed) {
   const parts = [el("h4", { text: `Skills (${p.skills.length})` })];
   parts.push(p.skills.length
     ? el("ul", { class: "plain-list" }, ...p.skills.map((s) => el("li", {},
       el("span", { class: "mono", text: installed ? `skill=${s.use}` : s.name }),
       s.description ? el("span", { class: "muted", text: ` · ${s.description}` }) : null)))
+    : el("p", { class: "muted small", text: "None." }));
+  const agents = p.agents ?? [];
+  parts.push(el("h4", { text: `Agents (${agents.length})` }));
+  parts.push(agents.length
+    ? el("ul", { class: "plain-list" }, ...agents.map((a) => el("li", {},
+      el("span", { class: "mono", text: installed ? `agent=${a.use}` : a.name }),
+      a.description ? el("span", { class: "muted", text: ` · ${a.description}` }) : null,
+      agentUses(a))))
     : el("p", { class: "muted small", text: "None." }));
   parts.push(el("h4", { text: `MCP servers (${p.mcp.length})` }));
   if (p.mcp.length) {
@@ -281,7 +293,7 @@ async function togglePlugin(p, toggle) {
   toggle.disabled = true;
   try {
     await api(`/api/plugins/${encodeURIComponent(p.name)}`, { method: "PATCH", body: JSON.stringify({ enabled: toggle.checked }) });
-    toast(toggle.checked ? `${p.name} is on` : `${p.name} is off: its skills and MCP servers no longer apply`);
+    toast(toggle.checked ? `${p.name} is on` : `${p.name} is off: its skills, agents and MCP servers no longer apply`);
     await loadTools();
   } catch (err) {
     toggle.checked = !toggle.checked;
@@ -875,6 +887,125 @@ async function removeSkill(name) {
     await api(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" });
     toast(`Removed skill ${name}`);
     await loadTools();
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+// ---------- agents ----------
+/** What an agent follows and uses, in a line. */
+function agentUses(a) {
+  const parts = [a.skills.length ? `follows ${a.skills.join(", ")}` : "", a.mcp.length ? `uses MCP servers ${a.mcp.join(", ")}` : ""].filter(Boolean);
+  return parts.length ? el("div", { class: "muted small", text: parts.join(" · ") }) : null;
+}
+
+function buildAgentsPanel() {
+  const name = el("input", { type: "text", maxlength: "64", spellcheck: "false", autocomplete: "off", placeholder: "taken from its front matter…" });
+  const text = el("textarea", {
+    rows: "10", class: "mono", spellcheck: "false",
+    placeholder: "---\nname: security-reviewer\ndescription: Reviews a change for security problems\nskills: [security-review, code-review]\nmcp-servers: [semgrep]\n---\nYou review changes the way a security engineer would…",
+  });
+  const file = el("input", { type: "file", accept: ".md,text/markdown,text/plain" });
+  file.addEventListener("change", async () => {
+    const picked = file.files?.[0];
+    if (!picked) return;
+    text.value = await picked.text();
+    if (!name.value && !/^---[\s\S]*?\nname:/m.test(text.value)) name.value = picked.name.replace(/(\.agent)?\.md$/i, "");
+    text.focus();
+  });
+  const error = el("p", { class: "form-error", role: "alert" });
+  const save = el("button", { type: "submit", class: "btn primary" }, "Save agent");
+  const form = el("form", {
+    class: "tool-form", novalidate: true,
+    onsubmit: async (e) => {
+      e.preventDefault();
+      error.textContent = "";
+      if (!text.value.trim()) {
+        error.textContent = "Write or load the agent: its front matter and instructions.";
+        text.focus();
+        return;
+      }
+      save.disabled = true;
+      save.textContent = "Saving…";
+      try {
+        const res = await api("/api/agents", { method: "POST", body: JSON.stringify({ name: name.value.trim(), text: text.value }) });
+        const replaced = { profile: " (it replaces your earlier one)", plugin: " (used instead of the plugin's)" }[res.replaced] ?? "";
+        toast(`Saved agent ${res.agent.name}${replaced}. Use it with agent=${res.agent.name}`);
+        for (const note of res.agent.notes ?? []) toast(note);
+        name.value = "";
+        text.value = "";
+        file.value = "";
+        await loadTools();
+        await loadSkills();
+      } catch (err) {
+        error.textContent = err.message;
+      } finally {
+        save.disabled = false;
+        save.textContent = "Save agent";
+      }
+    },
+  },
+  el("div", { class: "form-actions start" }, el("label", { class: "btn small file-btn" }, "Load an agent file (.md, .agent.md)…", file)),
+  field("Name", name, "Optional when its front matter has a name: line."),
+  field("Agent (front matter and instructions)", text,
+    "The layout GitHub Copilot and Claude Code agents use. skills: and mcp-servers: name what it follows and uses; tools: and model: are left out, since the folder's owner sets what a step may do."),
+  error,
+  el("div", { class: "form-actions" }, save));
+  $("#panel-agents").replaceChildren(
+    el("section", { class: "tool-section" },
+      el("h3", { text: "Add an agent" }),
+      el("p", {
+        class: "muted small",
+        text: "An agent is a role a plan step takes (agent=name): its instructions come first, with the skills it follows and the MCP servers it uses. The step's folder must offer those servers, as for any step.",
+      }),
+      form),
+    el("section", { class: "tool-section" },
+      el("h3", { id: "agent-list-h", text: "Agents" }),
+      el("div", { id: "agent-groups" })));
+}
+
+function renderAgentList() {
+  const box = $("#agent-groups");
+  if (!box) return;
+  $("#agent-list-h").textContent = `Agents (${tools.agents.length})`;
+  const item = (a, removable) => {
+    const instructions = el("details", { class: "agent-text" },
+      el("summary", { text: "Instructions" }),
+      el("pre", { class: "mono", text: a.instructions }));
+    return el("li", { class: "tool-item" },
+      el("div", { class: "task-top" },
+        el("span", { class: "mono", text: `agent=${a.name}` }),
+        a.plugin ? el("span", { class: "badge neutral", text: `plugin ${a.plugin}` }) : null,
+        removable ? el("button", { type: "button", class: "btn small danger", onclick: () => removeAgent(a.name) }, "Remove") : null),
+      a.description ? el("div", { class: "task-meta", text: a.description }) : null,
+      agentUses(a),
+      ...(a.notes ?? []).map((n) => el("p", { class: "note", text: n })),
+      instructions);
+  };
+  const group = (title, agents, removable) => agents.length ? el("div", { class: "skill-group" },
+    el("h4", { text: `${title} (${agents.length})` }),
+    el("ul", { class: "tool-list compact" }, ...agents.map((a) => item(a, removable)))) : null;
+  const groups = [
+    group("Yours", tools.agents.filter((a) => a.source === "profile"), true),
+    group("From plugins", tools.agents.filter((a) => a.source === "plugin"), false),
+  ].filter(Boolean);
+  box.replaceChildren(...(groups.length ? groups
+    : [el("p", { class: "muted small", text: "None yet: add one above, or import a plugin that has agents (agents/*.md)." })]));
+}
+
+async function removeAgent(name) {
+  const ok = await confirmDialog({
+    title: `Remove agent ${name}?`,
+    body: "Plans that name it can't run until it's back. A plugin's agent of the same name applies again.",
+    confirm: "Remove agent",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+    toast(`Removed agent ${name}`);
+    await loadTools();
+    await loadSkills();
   } catch (err) {
     toast(err.message, "error");
   }

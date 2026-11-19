@@ -1325,6 +1325,62 @@ async fn ui_imports_plugins_and_configures_mcp_servers_and_skills() {
         "{skills}"
     );
 
+    // The plugin's agent comes with it: its own skill and the MCP server it uses.
+    assert_eq!(plugin["agents"][0]["name"], "reviewer");
+    let reviewer = skills["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "reviewer")
+        .unwrap_or_else(|| panic!("{skills}"))
+        .clone();
+    assert_eq!(
+        (&reviewer["source"], &reviewer["plugin"]),
+        (&Value::from("plugin"), &Value::from("echo-tools"))
+    );
+    assert_eq!(
+        (reviewer["skills"].clone(), reviewer["mcp"].clone()),
+        (
+            serde_json::json!(["echo-tools.release-notes"]),
+            serde_json::json!(["echo"])
+        )
+    );
+    // The profile's own agents: added, shown, used in plans and removed.
+    let added = call(
+        "POST",
+        "/api/agents".into(),
+        serde_json::json!({ "name": "", "text": "---\nname: editor\nskills: [release-notes]\n---\nEdit carefully." }),
+    )
+    .await;
+    assert_eq!(added.status, 200, "{}", added.body);
+    let shown = call("GET", "/api/agents/editor".into(), Value::Null)
+        .await
+        .json();
+    assert_eq!(shown["instructions"], "Edit carefully.");
+    for (step, unknown) in [("agent=editor", false), ("agent=ghost", true)] {
+        let checked = call(
+            "POST",
+            "/api/plans/check".into(),
+            serde_json::json!({ "text": format!("a @owner:app {step} Edit it") }),
+        )
+        .await
+        .json();
+        assert_eq!(
+            checked["problems"]
+                .to_string()
+                .contains("there is no agent"),
+            unknown,
+            "{step}: {checked}"
+        );
+    }
+    let gone = call("DELETE", "/api/agents/editor".into(), Value::Null).await;
+    assert_eq!(gone.status, 200, "{}", gone.body);
+    let plugin_own = call("DELETE", "/api/agents/reviewer".into(), Value::Null).await;
+    assert_eq!(
+        plugin_own.status, 400,
+        "a plugin's agent goes with its plugin"
+    );
+
     // Offering a plugin's MCP server in a folder, with the values it needs; the
     // values stay in the profile, peers learn the name and the description.
     let offer = |values: Value| {
