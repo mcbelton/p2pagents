@@ -415,12 +415,12 @@ mod tests {
     fn repository_names_are_parsed_strictly() {
         let gh = "github.com";
         assert_eq!(
-            parse_repo("mcbelton/p2pagents", gh).unwrap(),
-            (gh.into(), "mcbelton/p2pagents".into())
+            parse_repo("mcbelton/proofkin", gh).unwrap(),
+            (gh.into(), "mcbelton/proofkin".into())
         );
         assert_eq!(
-            parse_repo("https://github.com/mcbelton/p2pagents.git", gh).unwrap(),
-            (gh.into(), "mcbelton/p2pagents".into())
+            parse_repo("https://github.com/mcbelton/proofkin.git", gh).unwrap(),
+            (gh.into(), "mcbelton/proofkin".into())
         );
         assert_eq!(
             parse_repo("corp.ghe.com/team/app", gh).unwrap(),

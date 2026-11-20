@@ -1,12 +1,12 @@
 #!/bin/sh
 # Installs the Proofkin binary (`proofkin`) from GitHub releases (no source code or Rust needed).
-#   curl -fsSL https://github.com/mcbelton/p2pagents/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/mcbelton/proofkin/releases/latest/download/install.sh | sh
 # Options (env vars): PROOFKIN_VERSION (default latest), PROOFKIN_REPO, PROOFKIN_INSTALL_DIR,
 #   PROOFKIN_GH_USER (GitHub CLI account to download with; default: gh's active account).
 #   The P2PAGENTS_* names from before the rename work too.
 set -eu
 
-repo="${PROOFKIN_REPO:-${P2PAGENTS_REPO:-mcbelton/p2pagents}}"
+repo="${PROOFKIN_REPO:-${P2PAGENTS_REPO:-mcbelton/proofkin}}"
 version="${PROOFKIN_VERSION:-${P2PAGENTS_VERSION:-latest}}"
 dir="${PROOFKIN_INSTALL_DIR:-${P2PAGENTS_INSTALL_DIR:-$HOME/.local/bin}}"
 gh_user="${PROOFKIN_GH_USER:-${P2PAGENTS_GH_USER:-}}"

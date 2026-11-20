@@ -1,7 +1,8 @@
 # Vendored iroh 1.4.1
 
-Unmodified copy of [iroh 1.4.1](https://crates.io/crates/iroh/1.4.1) (MIT OR Apache-2.0)
-with one change in `Cargo.toml`:
+Unmodified copy of [iroh 1.4.1](https://crates.io/crates/iroh/1.4.1) (MIT OR Apache-2.0),
+plus iroh's `LICENSE-MIT` and `LICENSE-APACHE` from its repository at tag `v1.4.1` (the
+crates.io package ships only `LICENSE-BSD3`), with one change in `Cargo.toml`:
 
 ```diff
 -crate-type = ["lib", "cdylib"]

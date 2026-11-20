@@ -1029,9 +1029,9 @@ pub(super) async fn agent_card(State(s): State<AppState>, headers: HeaderMap) ->
             "protocolBinding": "JSONRPC",
             "protocolVersion": A2A_VERSION,
         }],
-        "provider": { "organization": "Proofkin", "url": "https://github.com/mcbelton/p2pagents" },
+        "provider": { "organization": "Proofkin", "url": "https://github.com/mcbelton/proofkin" },
         "version": env!("CARGO_PKG_VERSION"),
-        "documentationUrl": "https://github.com/mcbelton/p2pagents#connect-other-agents-mcp-and-a2a",
+        "documentationUrl": "https://github.com/mcbelton/proofkin#connect-other-agents-mcp-and-a2a",
         "capabilities": { "streaming": false, "pushNotifications": false, "extendedAgentCard": false },
         "securitySchemes": {
             "bearer": { "httpAuthSecurityScheme": {

@@ -27,25 +27,25 @@ An agent never uses the machine's global Copilot/Claude/Codex sign-in. See
 ## Install (no source code or Rust needed)
 
 Prebuilt binaries for Windows (x64, ARM64), Linux (x64, ARM64) and macOS (Apple Silicon) are published as
-[GitHub releases](https://github.com/mcbelton/p2pagents/releases). Everything an agent
+[GitHub releases](https://github.com/mcbelton/proofkin/releases). Everything an agent
 needs at runtime is in the one `proofkin` executable, except the provider CLIs below.
 
 **1. Install Proofkin**
 
 ```powershell
 # Windows (PowerShell)
-irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex
+irm https://github.com/mcbelton/proofkin/releases/latest/download/install.ps1 | iex
 ```
 
 ```sh
 # Linux / macOS
-curl -fsSL https://github.com/mcbelton/p2pagents/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/mcbelton/proofkin/releases/latest/download/install.sh | sh
 ```
 
 The installer puts `proofkin` in `%LOCALAPPDATA%\proofkin\bin` (Windows) or
 `~/.local/bin`, and adds it to `PATH`; open a new terminal afterwards. You can also
 download the archive for your platform from the
-[releases page](https://github.com/mcbelton/p2pagents/releases) and put `proofkin`
+[releases page](https://github.com/mcbelton/proofkin/releases) and put `proofkin`
 anywhere on `PATH`. To install a specific version on Windows, download `install.ps1` and
 run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `PROOFKIN_VERSION=v0.1.2 sh install.sh`).
 
@@ -79,8 +79,9 @@ See [Internet P2P](#internet-p2p) for how peers find each other, [Web UI](#web-u
 [Accounts and profiles](#accounts-and-profiles) for sign-in options. Building from source
 is described in the rest of this README.
 
-> **Renamed from p2pagents.** The program is now `proofkin` (the GitHub repository keeps
-> its name). Installs from before keep working as they are: while there is no
+> **Renamed from p2pagents.** The program is now `proofkin`, and the repository moved from
+> `mcbelton/p2pagents` to `mcbelton/proofkin` (old links, clones and installers are
+> redirected). Installs from before keep working as they are: while there is no
 > `~/.proofkin`, profiles stay in `~/.p2pagents`, the data, repository and worktree
 > folders keep their old names (`.p2pdata`, ...), every `P2PAGENTS_*` setting still
 > applies when its `PROOFKIN_*` name is unset, and secrets stored under `p2pagents` in the
@@ -91,11 +92,12 @@ is described in the rest of this README.
 
 ## Quick start (Windows, after setup)
 
-Run these from the repo folder in any PowerShell window. The script reloads `PATH` itself,
-so it also works in terminals opened before Rust was installed:
+Get the source once, then run these from its folder in any PowerShell window. The script
+reloads `PATH` itself, so it also works in terminals opened before Rust was installed:
 
 ```powershell
-cd D:\dev\p2pagents
+git clone https://github.com/mcbelton/proofkin   # once
+cd proofkin
 .\scripts\p2p.ps1 doctor      # checks every prerequisite, prints the fix for anything missing
 .\scripts\p2p.ps1 test        # automated tests (no LLM sign-in needed)
 .\scripts\p2p.ps1 demo        # worker + boss windows, allowlisted to each other, connected over the internet

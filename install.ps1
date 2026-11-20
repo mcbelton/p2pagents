@@ -3,11 +3,11 @@
   Installs the Proofkin binary (proofkin.exe) from GitHub releases (no source code or Rust needed).
 
 .EXAMPLE
-  irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex
+  irm https://github.com/mcbelton/proofkin/releases/latest/download/install.ps1 | iex
 #>
 param(
     [string]$Version = 'latest',
-    [string]$Repo = 'mcbelton/p2pagents',
+    [string]$Repo = 'mcbelton/proofkin',
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'proofkin\bin'),
     # GitHub CLI account to download with (default: gh's active account).
     [string]$GhUser
