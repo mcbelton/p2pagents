@@ -389,7 +389,9 @@ impl Profile {
     fn secret_delete(&self, key: &str) -> Result<()> {
         match SecretStore::current() {
             SecretStore::Keyring => {
-                for service in keyring_services() {
+                // Legacy first: a read in between finds neither, instead of copying
+                // the legacy secret forward again (see `secret_get`).
+                for service in keyring_services().into_iter().rev() {
                     match self.keyring_entry(&service, key)?.delete_credential() {
                         Ok(()) | Err(keyring::Error::NoEntry) => {}
                         Err(e) => return Err(e).context("deleting from the OS credential store"),
