@@ -94,6 +94,7 @@ async fn ui_requires_token_and_local_host_and_runs_tasks() {
         workspace: home.path().to_path_buf(),
         providers: vec![Provider::Copilot],
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -183,6 +184,7 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
         workspace: home.path().to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -266,6 +268,7 @@ async fn ui_cancels_running_tasks_and_shows_the_audit_log() {
         workspace: home.path().to_path_buf(),
         providers: vec![Provider::Copilot],
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -362,6 +365,7 @@ async fn ui_runs_plans_and_shows_squads() {
         workspace: home.path().to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         boss.clone(),
@@ -718,6 +722,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         workspace: home.path().to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -958,6 +963,7 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
         workspace: home.path().to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -1203,6 +1209,7 @@ async fn ui_imports_plugins_and_configures_mcp_servers_and_skills() {
         workspace: home.path().to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -1620,6 +1627,7 @@ async fn the_page_follows_the_ux_guidelines() {
         workspace: home.path().to_path_buf(),
         providers: Vec::new(),
         accounts: Vec::new(),
+        workers: None,
     };
     let server = ui::start(
         agent.clone(),
@@ -1638,6 +1646,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<script src="/tools.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
+    assert!(page.contains(r#"<script src="/workers.js" defer>"#));
     for id in [
         "confirm-dialog",
         "plan-editor",
@@ -1648,6 +1657,8 @@ async fn the_page_follows_the_ux_guidelines() {
         "playbook-choices",
         "plan-view",
         "plan-builder",
+        "worker-list",
+        "worker-dialog",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -1674,7 +1685,13 @@ async fn the_page_follows_the_ux_guidelines() {
             &d[1]
         );
     }
-    for script in ["/app.js", "/tools.js", "/plan-text.js", "/plan-builder.js"] {
+    for script in [
+        "/app.js",
+        "/tools.js",
+        "/plan-text.js",
+        "/plan-builder.js",
+        "/workers.js",
+    ] {
         let js = request(port, "GET", script, &host, None, None).await;
         assert_eq!(js.status, 200, "{script}");
         assert!(

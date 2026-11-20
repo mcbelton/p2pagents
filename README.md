@@ -305,7 +305,8 @@ Several agents can share one identity by passing the same `--profile`. Each stil
 own provider processes.
 
 `p2pagents profile delete --profile P` removes a profile: its identity key, stored
-credentials, allowlist and provider sign-ins.
+credentials, allowlist and provider sign-ins (not while an agent runs with it; a profile
+runs in one agent at a time).
 
 ### Digital workers
 
@@ -313,10 +314,18 @@ A **digital worker** is an autonomous agent with no identity of its own: it work
 accounts of the person (profile) who created it, its **owner**.
 
 ```powershell
-p2pagents worker create tester --owner alice --role "test engineer for the parser"
-p2pagents --name tester --providers copilot --serve     # runs on alice's Copilot sign-in
+p2pagents worker create tester --owner alice --role "test engineer for the parser" `
+    --providers copilot --folder app --start-with-owner   # alice's agent runs it
+p2pagents --name tester --providers copilot --serve     # or run it yourself, on alice's Copilot sign-in
 p2pagents worker list --owner alice
+p2pagents worker remove tester                           # delete it
 ```
+
+In alice's [web UI](#web-ui), **Digital workers** does the same: **New worker** names it,
+says what it's for, picks what it runs on alice's sign-ins (and signs alice in to Copilot
+with a GitHub CLI account if she isn't yet) and the folders of hers it works in. Each
+worker shows whether it is online, starting, stopped or stopped on its own (with the end
+of its log), with **Start**/**Stop**, **Starts with this agent** and **Delete**.
 
 - The worker is its own peer: its own key, allowlist, [shared folders](#shared-folders),
   hourly limits and [audit log](#audit-log). Peers allowlist it like any agent, and alice
@@ -326,8 +335,19 @@ p2pagents worker list --owner alice
   `auth status` shows whose accounts they use. A worker can't own another worker.
 - Peers see `[digital worker of alice: test engineer for the parser]` next to it, and the
   role is given to the model with every task the worker runs.
-- `worker create` allowlists the owner on the worker (read-only tasks in its data folder)
-  and the worker on the owner (chat only). Widen either with `peers allow`.
+- `worker create` allowlists the owner on the worker (tasks in its data folder, and in the
+  `--folder` ones, which the worker shares as the owner does: same path, most access and
+  checks) and the worker on the owner (chat only). Widen either with `peers allow`.
+- **Run by its owner:** a worker that starts with its owner (`--start-with-owner`, or
+  started from the web UI) runs as a background agent of the owner's agent, with the
+  providers it was created with, and dials it. It stops when the owner's agent stops,
+  cleanly, even if the owner's agent is killed (the owner holds its input). Its output is
+  in `agent.log` in its profile folder.
+- **Deleting** a worker (`worker remove`, `profile delete`, or **Delete** in the web UI,
+  which stops it first) deletes its key, allowlist, folder settings and audit log, and
+  takes it off its owner's allowlist and out of its squads (a squad left empty goes). Its
+  data folder stays. A worker running outside its owner's agent isn't deleted until it
+  stops.
 - Work stays private unless shared: a peer reaches only the folders the worker or owner
   explicitly shares with that peer.
 
@@ -1037,7 +1057,7 @@ p2pagents playbook show rehearse --set peer=alice --set folder=shop --set change
 
 Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
 `p2pagents share add|list|remove`, `p2pagents mcp add|import|list|pause|resume|remove`,
-`p2pagents plugin add|list|show|update|enable|disable|remove`, `p2pagents worker create|list`,
+`p2pagents plugin add|list|show|update|enable|disable|remove`, `p2pagents worker create|list|remove`,
 `p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
 `p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|import|remove`, `p2pagents agent list|show|add|remove`, `p2pagents github login|status|logout`,
 `p2pagents repo link|list|sync|branches|pr|unlink`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
@@ -1058,6 +1078,10 @@ p2pagents --name me --providers copilot --serve --ui
   hourly limit and an access level: read only, edit files, or full) or remove one; changes
   are saved to the profile's `peers.json` and take effect at once (removed peers are
   disconnected).
+- **Digital workers**: create [digital workers](#digital-workers) that run on your
+  sign-ins (sign in to Copilot right there with a GitHub CLI account), in the folders you
+  pick; start and stop them, choose whether they start with this agent, read why one
+  stopped on its own, and delete them (they leave your allowlist and squads).
 - **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
   access level and workspace.
 - **Activity feed**: chat with all connected peers, joins and leaves, refused connections,
@@ -1433,7 +1457,8 @@ Workflow for a change:
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
 - [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with per-access tool allowlists and the path-checking permission handler
 - [src/llm/policy.rs](src/llm/policy.rs): workspace confinement, credential-file and code-execution-file rules, shell command scan
-- [src/profile.rs](src/profile.rs): profiles: private provider homes, OS credential store secrets, environment isolation, digital workers (owner accounts, role)
+- [src/profile.rs](src/profile.rs): profiles: private provider homes, OS credential store secrets, environment isolation, digital workers (owner accounts, role), one agent per profile
+- [src/workers.rs](src/workers.rs): digital workers: create (folders, both allowlists), delete, and the supervisor that runs them as background agents of their owner
 - [src/auth.rs](src/auth.rs): `auth login/status/logout` for Copilot, Claude and Codex
 - [src/llm/bridge.rs](src/llm/bridge.rs): client for the Node bridge (multiplexed JSON lines over stdio)
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
@@ -1463,8 +1488,8 @@ Workflow for a change:
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
-- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API
-- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog
+- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API; [src/ui/workers.rs](src/ui/workers.rs): its digital workers API
+- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card
 - [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot

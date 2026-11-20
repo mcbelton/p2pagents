@@ -200,8 +200,9 @@ try:
               out.strip())
     else:
         check("linked a GitHub repository with the profile's GitHub sign-in", False, "needs a github.com account in gh")
-    print("== digital worker: worker1's owner creates 'helper', which runs on worker1's account")
-    _, out = cli("worker", "create", "helper", "--owner", "worker1", "--role", "release note writer")
+    print("== digital worker: worker1's owner creates 'helper', which runs on worker1's account and starts with it")
+    _, out = cli("worker", "create", "helper", "--owner", "worker1", "--role", "release note writer",
+                 "--providers", "copilot", "--start-with-owner")
     print(f"  {out.strip()}")
     _, out = cli("peers", "id", "--profile", "helper")
     ids["helper"] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
@@ -218,6 +219,7 @@ try:
     agents.append(w1)
     check("worker1 online with a ticket", w1.wait_for(r"^ticket: p2pa1", 90))
     check("worker1 uses its own account", w1.wait_for(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'worker1'\]"))
+    check("worker1's agent started its digital worker helper", w1.wait_for(r"^started digital worker helper", 30))
 
     print("== start worker2 (internet, own Copilot instance; boss may edit its 'code' folder)")
     w2 = Agent("worker2", ["--providers", "copilot", "--serve"])
@@ -231,10 +233,19 @@ try:
     check("boss connected to worker1", boss.wait_for(r"^\+ worker1", 120))
     check("boss connected to worker2", boss.wait_for(r"^\+ worker2", 120))
 
-    print("== start digital worker 'helper' (no sign-in of its own)")
-    helper = Agent("helper", ["--providers", "copilot", "--serve"])
-    agents.append(helper)
-    helper_acct = helper.wait_for(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'helper'\]", 90)
+    print("== digital worker 'helper' (no sign-in of its own), which worker1's agent runs; its output is in its log")
+    helper_log = os.path.join(HOME, "profiles", "helper", "agent.log")
+    def log_line(pattern, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            text = open(helper_log, encoding="utf-8", errors="replace").read() if os.path.exists(helper_log) else ""
+            found = re.search(pattern, text, re.M)
+            if found:
+                return found.group(0)
+            time.sleep(0.5)
+        return None
+    helper_acct = log_line(rf"copilot: {re.escape(acct1[0])}@{re.escape(acct1[1])} \[profile 'helper'\]", 90)
+    print(f"  [helper log] {helper_acct}")
     boss.wait_for(r"^\+ helper", 120)
     # Simultaneous dials may still be converging on one connection: ask a few times.
     seen = None
@@ -545,6 +556,23 @@ try:
     check("worker2 audited the refused request from worker1",
           any(e["peer"] == "worker1" and e["outcome"] == "refused" for e in a2), a2)
     check("audit logs hold no prompt text", not any("p2p_live" in json.dumps(e) for e in a1 + a2))
+
+    print("== worker1 stops, and its digital worker helper with it; then helper is deleted")
+    boss.cursor = len(boss.lines)
+    w1.stop()
+    left = boss.wait_for(r"^- helper", 60)
+    removed = (1, "")
+    for _ in range(30):
+        removed = cli("worker", "remove", "helper")
+        if removed[0] == 0:
+            break
+        time.sleep(1)
+    print(f"  {removed[1].strip()}")
+    _, trust = cli("peers", "list", "--profile", "worker1")
+    check("stopping worker1 stopped its digital worker, which was then deleted and left worker1's allowlist",
+          left and removed[0] == 0 and "deleted" in removed[1]
+          and not os.path.exists(os.path.join(HOME, "profiles", "helper")) and "helper" not in trust,
+          (left, removed, trust))
 finally:
     for a in reversed(agents):
         a.stop()

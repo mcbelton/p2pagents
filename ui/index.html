@@ -11,6 +11,7 @@
 <script src="/app.js" defer></script>
   <script src="/tools.js" defer></script>
 <script src="/plan-builder.js" defer></script>
+<script src="/workers.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#composer-input">Skip to message box</a>
@@ -59,6 +60,16 @@
           </button>
         </div>
         <ul class="list" id="trust-list"></ul>
+      </section>
+
+      <section class="card" aria-labelledby="workers-h">
+        <div class="card-head">
+          <h2 id="workers-h">Digital workers</h2>
+          <button type="button" class="btn small" id="add-worker-btn" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>New worker
+          </button>
+        </div>
+        <ul class="list" id="worker-list"></ul>
       </section>
 
       <section class="card" aria-labelledby="squads-h">
@@ -394,6 +405,42 @@
       <div class="dialog-actions">
         <button type="button" class="btn" id="squad-cancel">Cancel</button>
         <button type="submit" class="btn primary">Save squad</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="worker-dialog" aria-labelledby="worker-h">
+    <form method="dialog" id="worker-form" novalidate>
+      <h2 id="worker-h">New digital worker</h2>
+      <p class="muted small">A digital worker is an agent of yours with its own key, allowlist and folders, running on your sign-ins. It shows up as a peer you can give tasks, put in a squad or name in a plan.</p>
+      <label class="field">
+        <span>Name</span>
+        <input id="worker-name" type="text" maxlength="64" spellcheck="false" autocomplete="off" placeholder="e.g. tester…" aria-describedby="worker-name-hint">
+        <span class="muted small" id="worker-name-hint">Its peer name: letters, digits, '-', '_' and '.'</span>
+      </label>
+      <label class="field">
+        <span>Role <span class="muted">(optional)</span></span>
+        <input id="worker-role" type="text" maxlength="200" autocomplete="off" placeholder="e.g. test engineer for the parser…" aria-describedby="worker-role-hint">
+        <span class="muted small" id="worker-role-hint">Peers see it, and the model gets it with every task.</span>
+      </label>
+      <fieldset class="field">
+        <legend>Runs on your sign-ins</legend>
+        <div id="worker-providers" class="share-checks"></div>
+        <div id="worker-signin"></div>
+      </fieldset>
+      <fieldset class="field">
+        <legend>Folders it works in</legend>
+        <div id="worker-folders" class="share-checks"></div>
+        <span class="muted small">It shares them as you do, so your plans can run steps on it there. It always has its own data folder.</span>
+      </fieldset>
+      <label class="check">
+        <input id="worker-start" type="checkbox" checked>
+        <span>Start it now, and whenever this agent starts <span class="muted small">(it stops when this agent stops)</span></span>
+      </label>
+      <p class="form-error" id="worker-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="worker-cancel">Cancel</button>
+        <button type="submit" class="btn primary" id="worker-submit">Create worker</button>
       </div>
     </form>
   </dialog>

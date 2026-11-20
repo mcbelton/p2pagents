@@ -102,6 +102,20 @@ impl SquadStore {
         self.squads.len() != before
     }
 
+    /// Takes `member` out of every squad; a squad left without members is removed.
+    /// Returns the squads it was in.
+    pub fn remove_member(&mut self, member: &str) -> Vec<String> {
+        let mut left = Vec::new();
+        for squad in &mut self.squads {
+            if squad.members.iter().any(|m| m == member) {
+                squad.members.retain(|m| m != member);
+                left.push(squad.name.clone());
+            }
+        }
+        self.squads.retain(|s| !s.members.is_empty());
+        left
+    }
+
     pub fn get(&self, name: &str) -> Option<&Squad> {
         self.squads.iter().find(|s| s.name == name)
     }

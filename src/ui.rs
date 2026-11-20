@@ -35,6 +35,7 @@ use crate::runs::RunRecord;
 use crate::trust::{Ticket, TrustedPeer};
 
 mod tools;
+mod workers;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_CSS: &str = include_str!("../ui/app.css");
@@ -42,6 +43,7 @@ const APP_JS: &str = include_str!("../ui/app.js");
 const TOOLS_JS: &str = include_str!("../ui/tools.js");
 const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
+const WORKERS_JS: &str = include_str!("../ui/workers.js");
 const FEED_LIMIT: usize = 500;
 
 /// What the UI shows about this agent besides live state.
@@ -53,6 +55,9 @@ pub struct UiInfo {
     pub workspace: PathBuf,
     pub providers: Vec<Provider>,
     pub accounts: Vec<(Provider, String)>,
+    /// Starts and stops this profile's digital workers (none for a digital worker,
+    /// which can't own workers).
+    pub workers: Option<Arc<crate::workers::Supervisor>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,6 +342,7 @@ pub async fn start(
         staging: tools::Staging::default(),
     });
     start_scheduler(&shared);
+    watch_workers(&shared);
 
     let pump = shared.clone();
     tokio::spawn(async move {
@@ -466,6 +472,14 @@ pub async fn start(
         )
         .route("/api/squads", post(save_squad))
         .route("/api/squads/{name}", delete(remove_squad))
+        .route("/api/workers", get(workers::list).post(workers::create))
+        .route(
+            "/api/workers/{name}",
+            delete(workers::delete).patch(workers::edit),
+        )
+        .route("/api/workers/{name}/start", post(workers::start))
+        .route("/api/workers/{name}/stop", post(workers::stop))
+        .route("/api/sign-in/copilot", post(workers::sign_in_copilot))
         .route("/api/trust", post(allow_peer))
         .route("/api/trust/{id}", delete(remove_peer))
         .route_layer(middleware::from_fn_with_state(
@@ -497,6 +511,10 @@ pub async fn start(
             "/plan-builder.js",
             get(|| async { asset("text/javascript; charset=utf-8", PLAN_BUILDER_JS) }),
         )
+        .route(
+            "/workers.js",
+            get(|| async { asset("text/javascript; charset=utf-8", WORKERS_JS) }),
+        )
         // Outside the token check: the unguessable capability in the path is the
         // authorization, and the content runs in a CSP sandbox (see crate::preview).
         .route("/preview/{cap}", get(preview_root))
@@ -521,6 +539,38 @@ pub async fn start(
     Ok(UiServer {
         url: format!("http://127.0.0.1:{port}/#t={token}"),
     })
+}
+
+/// Tells the page when a digital worker's process starts or ends, and the feed when
+/// one stops on its own.
+fn watch_workers(shared: &AppState) {
+    let Some(supervisor) = shared.info.workers.clone() else {
+        return;
+    };
+    let mut changes = supervisor.subscribe();
+    let pump = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            let name = match changes.recv().await {
+                Ok(name) => Some(name),
+                Err(broadcast::error::RecvError::Lagged(_)) => None,
+                Err(broadcast::error::RecvError::Closed) => return,
+            };
+            if let Some(name) = name
+                && let Ok(worker) = crate::workers::worker_of(&pump.info.profile, &name)
+                && let crate::workers::Process::Exited { code, .. } = supervisor.process(&worker)
+            {
+                pump.system(
+                    "warn",
+                    format!(
+                        "Digital worker {name} stopped on its own{}; its log is under Digital workers",
+                        code.map(|c| format!(" (exit code {c})")).unwrap_or_default()
+                    ),
+                );
+            }
+            pump.send(json!({ "type": "workers" }));
+        }
+    });
 }
 
 fn asset(content_type: &'static str, body: &'static str) -> Response {

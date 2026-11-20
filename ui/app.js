@@ -1919,7 +1919,7 @@ async function loadState() {
   renderFeed();
   renderTasks();
   renderApprovals();
-  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools()]);
+  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools(), loadWorkers()]);
 }
 
 let events = null;
@@ -1940,6 +1940,7 @@ function connectEvents() {
       loadSkills().then(schedulePlanCheck).catch(() => {});
     }
     else if (msg.type === "ops") loadOps().catch((err) => toast(err.message, "error"));
+    else if (msg.type === "workers") loadWorkers().catch((err) => toast(err.message, "error"));
     else if (msg.type === "approvals") {
       const before = state.approvals?.length ?? 0;
       state.approvals = msg.approvals;
@@ -1952,6 +1953,7 @@ function connectEvents() {
       state.squads = msg.squads;
       renderPeers();
       renderSquads();
+      renderWorkers();
     }
   };
   source.onerror = () => {
@@ -2063,7 +2065,7 @@ function init() {
     openScheduleDialog();
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
-    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog"]) guardDialog($(id));
+    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", renderMcpOptions);

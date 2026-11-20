@@ -161,11 +161,15 @@ enum WorkerCommand {
     /// Create a digital worker owned by --owner.
     #[command(after_help = "\
 examples:
-  p2pagents worker create tester --owner alice --role \"test engineer for the parser\"
-  p2pagents --name tester --providers copilot --serve        (runs on alice's Copilot sign-in)
+  p2pagents worker create tester --owner alice --role \"test engineer for the parser\" \\
+      --providers copilot --folder app --start-with-owner
+  p2pagents --name tester --providers copilot --serve        (or run it yourself)
 The worker gets its own key, allowlist, shared folders and audit log, but no accounts:
-it always uses its owner's. Its owner is allowlisted on it (may run read-only tasks in its
-data folder) and it is allowlisted on its owner (chat only).")]
+it always uses its owner's. Its owner is allowlisted on it (may give it tasks in its data
+folder and the --folder ones, which it shares as its owner does) and it is allowlisted
+on its owner (chat only). With --start-with-owner, its owner's agent starts it (with
+--providers) whenever it starts, and stops it when it stops; the owner's web UI starts,
+stops and deletes it too.")]
     Create {
         /// Name of the new worker (also its profile name).
         name: String,
@@ -175,11 +179,27 @@ data folder) and it is allowlisted on its owner (chat only).")]
         /// What the worker is for; shown to peers and given to the model with every task.
         #[arg(long)]
         role: Option<String>,
+        /// Providers it runs when its owner's agent starts it (comma-separated); the
+        /// owner must be signed in to each.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        providers: Vec<Provider>,
+        /// A folder its owner shares that the worker works in too (repeatable).
+        #[arg(long = "folder", value_delimiter = ',')]
+        folders: Vec<String>,
+        /// Its owner's agent starts it whenever it starts.
+        #[arg(long)]
+        start_with_owner: bool,
     },
     /// List digital workers (all, or those of --owner).
     List {
         #[arg(long)]
         owner: Option<String>,
+    },
+    /// Delete a digital worker: its key, allowlist, folder settings and audit log. It
+    /// leaves its owner's allowlist and squads; its data folder stays.
+    Remove {
+        /// Name of the worker.
+        name: String,
     },
 }
 
@@ -1103,6 +1123,12 @@ async fn main() -> Result<()> {
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
             let name = profile.name.clone();
+            if profile.is_running() {
+                bail!("profile '{name}' is running; stop its agent first");
+            }
+            if profile.config.owner.is_some() {
+                return remove_worker(&name);
+            }
             profile.delete()?;
             println!("profile '{name}' deleted");
             Ok(())
@@ -1194,41 +1220,70 @@ fn civil_date(days: u64) -> String {
 }
 
 fn run_worker(command: WorkerCommand) -> Result<()> {
+    use p2pagents::workers;
     match command {
-        WorkerCommand::Create { name, owner, role } => {
+        WorkerCommand::Create {
+            name,
+            owner,
+            role,
+            providers,
+            folders,
+            start_with_owner,
+        } => {
             let owner = Profile::open(&owner)?;
-            let worker = owner.create_digital_worker(&name, role)?;
-            // Owner and worker know each other: the owner may give it tasks.
-            let (owner_id, worker_id) = (owner.identity()?.public(), worker.identity()?.public());
-            let mut trust = worker.trust()?;
-            trust.allow(TrustedPeer {
-                name: owner.name.clone(),
-                id: owner_id,
-                addrs: Default::default(),
-                can_delegate: true,
-                tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
-                access: Access::ReadOnly,
-                shares: vec![p2pagents::shares::DATA_SHARE.to_owned()],
-            });
-            trust.save(&worker.trust_path())?;
+            let addr = p2pagents::EndpointAddr::new(owner.identity()?.public());
             let mut trust = owner.trust()?;
-            trust.allow(TrustedPeer {
-                name: worker.name.clone(),
-                id: worker_id,
-                addrs: Default::default(),
-                can_delegate: false,
-                tasks_per_hour: DEFAULT_TASKS_PER_HOUR,
-                access: Access::ReadOnly,
-                shares: vec![p2pagents::shares::DATA_SHARE.to_owned()],
-            });
+            let spec = workers::WorkerSpec {
+                name,
+                role,
+                providers,
+                folders,
+                start_with_owner,
+            };
+            let created = workers::create(&owner, addr, &trust, &spec)?;
+            trust.allow(created.entry);
             trust.save(&owner.trust_path())?;
+            let worker = &created.worker;
             println!(
-                "digital worker '{name}' created for '{}' (endpoint id {worker_id}); it runs on '{}''s accounts",
-                owner.name, owner.name
+                "digital worker '{}' created for '{}' (endpoint id {}); it runs on '{}''s accounts",
+                worker.name, owner.name, created.id, owner.name
             );
+            let mut works_in = vec!["its data folder".to_owned()];
+            works_in.extend(workers::folders(worker));
+            println!("works in: {}", works_in.join(", "));
+            let providers: Vec<String> = worker
+                .config
+                .providers
+                .iter()
+                .map(Provider::to_string)
+                .collect();
+            if worker.config.start_with_owner {
+                println!(
+                    "'{}''s agent starts it (running {}) whenever it starts",
+                    owner.name,
+                    providers.join(", ")
+                );
+            } else {
+                println!(
+                    "start it:  p2pagents --name {} --providers {} --serve",
+                    worker.name,
+                    if providers.is_empty() {
+                        "copilot".to_owned()
+                    } else {
+                        providers.join(",")
+                    }
+                );
+            }
             println!(
-                "start it:  p2pagents --name {name} --providers copilot --serve\nshare its ticket with peers:  p2pagents peers id --profile {name}"
+                "share its ticket with peers:  p2pagents peers id --profile {}",
+                worker.name
             );
+            if owner.is_running() {
+                println!(
+                    "note: '{}' is running and lets the worker in once restarted; its web UI creates workers without a restart",
+                    owner.name
+                );
+            }
         }
         WorkerCommand::List { owner } => {
             for name in Profile::list()? {
@@ -1240,11 +1295,48 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
                     continue;
                 }
                 println!(
-                    "  {name:<16} owner {of:<12} {}",
-                    profile.config.role.as_deref().unwrap_or("")
+                    "  {name:<16} owner {of:<12} {}{}",
+                    profile.config.role.as_deref().unwrap_or(""),
+                    if profile.config.start_with_owner {
+                        "  [starts with its owner]"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
+        WorkerCommand::Remove { name } => remove_worker(&name)?,
+    }
+    Ok(())
+}
+
+/// Deletes digital worker `name` and takes it off its owner's allowlist and squads.
+fn remove_worker(name: &str) -> Result<()> {
+    use p2pagents::workers;
+    let worker = Profile::open(name)?;
+    let Some(owner) = worker.config.owner.clone() else {
+        bail!(
+            "'{name}' isn't a digital worker; delete a profile with: p2pagents profile delete --profile {name}"
+        );
+    };
+    let owner = Profile::open(&owner)?;
+    workers::delete(&owner, name)?;
+    let squads = workers::forget(&owner, name)?;
+    println!(
+        "digital worker '{name}' deleted; it left '{}''s allowlist{}",
+        owner.name,
+        if squads.is_empty() {
+            String::new()
+        } else {
+            format!(" and squads {}", squads.join(", "))
+        }
+    );
+    println!("its data folder stays: {}", worker.data_folder().display());
+    if owner.is_running() {
+        println!(
+            "note: '{}' is running; its web UI deletes workers without a restart, otherwise restart it",
+            owner.name
+        );
     }
     Ok(())
 }
@@ -2967,6 +3059,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             .exit();
     };
     let profile = Profile::open(args.profile.as_deref().unwrap_or(&name))?;
+    // One agent per profile: two would share one identity.
+    let _instance = profile.lock_instance()?;
     let executor: Option<Arc<SdkExecutor>> = if args.providers.is_empty() {
         None
     } else {
@@ -3087,6 +3181,30 @@ async fn run_agent(args: RunArgs) -> Result<()> {
     }
     agent.keep_connected(Duration::from_secs(30));
 
+    // Digital workers this profile owns: started by this agent, which stops them
+    // when it stops (a digital worker can't own workers).
+    let workers = match (profile.config.owner.is_none(), std::env::current_exe()) {
+        (true, Ok(exe)) => Some(p2pagents::workers::Supervisor::new(
+            profile.clone(),
+            agent.clone(),
+            p2pagents::workers::Launch {
+                exe,
+                network: args.network,
+                ip: args.listen.map(|a| a.ip()),
+                bridge: Some(args.bridge.path()),
+            },
+        )),
+        _ => None,
+    };
+    if let Some(workers) = &workers {
+        for (name, started) in workers.start_all() {
+            match started {
+                Ok(()) => println!("started digital worker {name}"),
+                Err(e) => eprintln!("could not start digital worker {name}: {e:#}"),
+            }
+        }
+    }
+
     if args.ui {
         let info = p2pagents::ui::UiInfo {
             profile: profile.clone(),
@@ -3099,6 +3217,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 .as_ref()
                 .map(|e| e.accounts().to_vec())
                 .unwrap_or_default(),
+            workers: workers.clone(),
         };
         let local = executor.clone().map(|e| e as Arc<dyn Executor>);
         let bind = SocketAddr::from(([127, 0, 0, 1], args.ui_port));
@@ -3109,6 +3228,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
             open_browser(&server.url);
         }
         tokio::signal::ctrl_c().await?;
+        if let Some(workers) = &workers {
+            workers.stop_all().await;
+        }
         agent.shutdown().await;
         return Ok(());
     }
@@ -3416,6 +3538,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 agent.broadcast(line);
             }
         }
+    }
+    if let Some(workers) = &workers {
+        workers.stop_all().await;
     }
     agent.shutdown().await;
     Ok(())

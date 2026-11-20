@@ -32,6 +32,7 @@ pub mod spec;
 pub mod store;
 pub mod trust;
 pub mod ui;
+pub mod workers;
 pub mod worktree;
 
 pub use agent::{Agent, AgentConfig, ApprovalInfo, Delivered, Event, Network, PeerInfo};

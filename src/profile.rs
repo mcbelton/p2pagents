@@ -153,6 +153,21 @@ pub struct ProfileConfig {
     /// the model with every task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// For a digital worker: the providers it runs when its owner's agent starts it
+    /// (see [`crate::workers`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<Provider>,
+    /// For a digital worker: its owner's agent starts it whenever it starts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_with_owner: bool,
+}
+
+/// Held while an agent runs with a profile, so a profile runs in one agent at a
+/// time (two would share one identity). Released when dropped or when the process
+/// ends, however it ends.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
 }
 
 #[derive(Debug, Clone)]
@@ -544,6 +559,38 @@ impl Profile {
 
     pub fn trust(&self) -> Result<crate::trust::TrustStore> {
         crate::trust::TrustStore::load(&self.trust_path())
+    }
+
+    fn instance_lock_path(&self) -> PathBuf {
+        self.dir.join("agent.lock")
+    }
+
+    /// Takes this profile's [`InstanceLock`]; fails while an agent runs with it.
+    pub fn lock_instance(&self) -> Result<InstanceLock> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating {}", self.dir.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.instance_lock_path())
+            .with_context(|| format!("opening {}", self.instance_lock_path().display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(InstanceLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "profile '{}' is already running in another p2pagents agent",
+                self.name
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking profile '{}'", self.name))
+            }
+        }
+    }
+
+    /// Whether an agent runs with this profile now, in any process.
+    pub fn is_running(&self) -> bool {
+        std::fs::File::open(self.instance_lock_path())
+            .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
     }
 
     /// The profile whose accounts this profile's tasks run on: itself, or for a
