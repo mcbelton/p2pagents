@@ -1,5 +1,5 @@
 //! Digital workers from their owner's web UI, end to end: a worker created there
-//! runs as a real p2pagents agent that the owner's agent starts, connects to its
+//! runs as a real proofkin agent that the owner's agent starts, connects to its
 //! owner, and is stopped, started and deleted from there. Its own test binary
 //! because it sets this process's environment (profiles home, secrets in files),
 //! which the workers it starts inherit.
@@ -7,15 +7,15 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use p2pagents::trust::{DEFAULT_TASKS_PER_HOUR, TrustedPeer};
-use p2pagents::ui::{self, UiInfo};
-use p2pagents::workers::{Launch, Supervisor};
-use p2pagents::{Access, Agent, AgentConfig, Network, Profile, SecretKey};
+use proofkin::trust::{DEFAULT_TASKS_PER_HOUR, TrustedPeer};
+use proofkin::ui::{self, UiInfo};
+use proofkin::workers::{Launch, Supervisor};
+use proofkin::{Access, Agent, AgentConfig, Network, Profile, SecretKey};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const EXE: &str = env!("CARGO_BIN_EXE_p2pagents");
+const EXE: &str = env!("CARGO_BIN_EXE_proofkin");
 
 struct Ui {
     port: u16,
@@ -73,8 +73,8 @@ async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
     let home = tempfile::tempdir().unwrap();
     // SAFETY: this binary has a single test, so nothing reads the environment concurrently.
     unsafe {
-        std::env::set_var("P2PAGENTS_HOME", home.path());
-        std::env::set_var("P2PAGENTS_SECRET_STORE", "file");
+        std::env::set_var("PROOFKIN_HOME", home.path());
+        std::env::set_var("PROOFKIN_SECRET_STORE", "file");
     }
     let boss = Profile::open("boss").unwrap();
     boss.save().unwrap();
@@ -140,7 +140,7 @@ async fn owners_create_start_stop_and_delete_digital_workers_from_the_web_ui() {
     assert!(
         !Profile::open("boss")
             .unwrap()
-            .is_configured(p2pagents::Provider::Copilot)
+            .is_configured(proofkin::Provider::Copilot)
     );
     let (status, refused) = ui
         .call(

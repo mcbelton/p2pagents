@@ -258,7 +258,7 @@ pub fn check_topics(kb: &KnowledgeBase, topics: &[String]) -> Result<()> {
     for topic in topics.iter().filter(|t| *t != "all") {
         if kb.read(topic).is_err() {
             bail!(
-                "the knowledge base has no topic '{topic}' (add it with a step's save={topic}, or p2pagents kb add)"
+                "the knowledge base has no topic '{topic}' (add it with a step's save={topic}, or proofkin kb add)"
             );
         }
     }

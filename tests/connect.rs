@@ -1,0 +1,613 @@
+//! Other agents hand work to a profile's peers over MCP and A2A, with the profile's
+//! integration token (never the web UI's), and get the results and their evidence;
+//! the spec import fills in plans from Spec Kit features in the UI and over MCP.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use proofkin::shares::ShareStore;
+use proofkin::ui::{self, UiInfo};
+use proofkin::{
+    Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, SecretKey,
+    TaskContext, TrustedPeer,
+};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+struct Echo;
+
+#[async_trait]
+impl Executor for Echo {
+    fn providers(&self) -> Vec<Provider> {
+        vec![Provider::Copilot]
+    }
+
+    async fn execute(&self, task: &LlmTask, _ctx: &TaskContext) -> anyhow::Result<String> {
+        if task.prompt == "hang" {
+            std::future::pending::<()>().await;
+        }
+        Ok(format!("echo: {}", task.prompt))
+    }
+}
+
+struct Response {
+    status: u16,
+    body: String,
+}
+
+impl Response {
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or_else(|_| panic!("JSON body: {}", self.body))
+    }
+}
+
+async fn request(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Response {
+    let mut req =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        req += &format!("{name}: {value}\r\n");
+    }
+    let body = body.unwrap_or("");
+    if !body.is_empty() {
+        req += &format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+    }
+    req += "\r\n";
+    req += body;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response");
+    Response {
+        status: head.split(' ').nth(1).unwrap().parse().unwrap(),
+        body: body.to_owned(),
+    }
+}
+
+/// A JSON-RPC request.
+fn rpc(method: &str, params: Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }).to_string()
+}
+
+/// A request of MCP's stateless revision: the version in `_meta`, mirrored in headers.
+fn modern(method: &str, mut params: Value) -> String {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    rpc(method, params)
+}
+
+#[tokio::test]
+async fn other_agents_hand_work_to_peers_over_mcp_and_a2a() {
+    let home = tempfile::tempdir().unwrap();
+    // The only test in this binary: no other thread reads the environment yet. Its
+    // integration token goes to files under the temporary home, never the OS store.
+    unsafe {
+        std::env::set_var("PROOFKIN_HOME", home.path());
+        std::env::set_var("PROOFKIN_SECRET_STORE", "file");
+    }
+    let (boss_key, worker_key) = (SecretKey::generate(), SecretKey::generate());
+    let trust = |name: &str, key: &SecretKey, delegate: bool| TrustedPeer {
+        name: name.into(),
+        id: key.public(),
+        addrs: Default::default(),
+        can_delegate: delegate,
+        tasks_per_hour: 100,
+        access: Access::ReadOnly,
+        shares: vec!["data".into()],
+    };
+    let mut worker = AgentConfig::new("worker", worker_key.clone());
+    worker.network = Network::Local;
+    worker.bind = Some("127.0.0.1:0".parse().unwrap());
+    worker.trust.allow(trust("boss", &boss_key, true));
+    worker.executor = Some(Arc::new(Echo));
+    worker.shares = ShareStore::with_data(home.path().join("data"));
+    let (worker, _we) = Agent::bind(worker).await.unwrap();
+    let mut config = AgentConfig::new("boss", boss_key);
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    config.trust.allow(trust("worker", &worker_key, false));
+    let (boss, events) = Agent::bind(config).await.unwrap();
+    boss.connect(worker.addr()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while boss.peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let profiles = home.path().join("profiles");
+    let info = UiInfo {
+        profile: Profile::open_in(&profiles, "boss").unwrap(),
+        network: Network::Local,
+        serving: false,
+        access: Access::ReadOnly,
+        workspace: home.path().to_path_buf(),
+        providers: Vec::new(),
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        boss.clone(),
+        events,
+        info,
+        None,
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, ui_token) = rest.split_once("/#t=").unwrap();
+    let port: u16 = port.parse().unwrap();
+    let ui_auth = format!("Bearer {ui_token}");
+    let admin = |method: &'static str, path: &'static str, body: Option<String>| {
+        let auth = ui_auth.clone();
+        async move {
+            request(
+                port,
+                method,
+                path,
+                &[("Authorization", auth.as_str())],
+                body.as_deref(),
+            )
+            .await
+        }
+    };
+
+    // Off until the owner turns it on: the endpoints refuse and say how.
+    let off = request(port, "POST", "/mcp", &[], Some(&rpc("ping", json!({})))).await;
+    assert_eq!(off.status, 401);
+    assert!(
+        off.body.contains("proofkin connect --profile boss"),
+        "{}",
+        off.body
+    );
+    let card = request(port, "GET", "/.well-known/agent-card.json", &[], None).await;
+    assert_eq!(card.status, 404);
+
+    let on = admin("POST", "/api/connect", None).await.json();
+    let token = on["token"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("pfk_") && token.len() == 68, "{token}");
+    assert_eq!(on["mcp"], format!("http://127.0.0.1:{port}/mcp"));
+    let auth = format!("Bearer {token}");
+    let mcp = |extra: Vec<(&'static str, String)>, body: String| {
+        let auth = auth.clone();
+        async move {
+            let mut headers = vec![
+                ("Authorization", auth),
+                ("Accept", "application/json, text/event-stream".to_owned()),
+            ];
+            headers.extend(extra);
+            let headers: Vec<(&str, &str)> =
+                headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+            request(port, "POST", "/mcp", &headers, Some(&body)).await
+        }
+    };
+    // Each token works only where it belongs; other sites' pages are refused.
+    let ui_token_on_mcp = request(
+        port,
+        "POST",
+        "/mcp",
+        &[("Authorization", ui_auth.as_str())],
+        Some(&rpc("ping", json!({}))),
+    )
+    .await;
+    assert_eq!(ui_token_on_mcp.status, 401);
+    let token_on_ui = request(
+        port,
+        "GET",
+        "/api/state",
+        &[("Authorization", auth.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(token_on_ui.status, 401);
+    let page = request(
+        port,
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", auth.as_str()),
+            ("Origin", "https://evil.example"),
+        ],
+        Some(&rpc("ping", json!({}))),
+    )
+    .await;
+    assert_eq!(page.status, 403);
+
+    // MCP before 2026-07-28: initialize, then tools.
+    let init = mcp(
+        vec![],
+        rpc(
+            "initialize",
+            json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } }),
+        ),
+    )
+    .await
+    .json();
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(init["result"]["serverInfo"]["name"], "proofkin");
+    let note = mcp(
+        vec![],
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string(),
+    )
+    .await;
+    assert_eq!(note.status, 202);
+    let list = mcp(vec![], rpc("tools/list", json!({}))).await.json();
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "list_peers",
+            "delegate",
+            "get_task",
+            "cancel_task",
+            "check_plan",
+            "run_plan",
+            "get_run",
+            "import_spec"
+        ]
+    );
+    let peers = mcp(vec![], rpc("tools/call", json!({ "name": "list_peers" })))
+        .await
+        .json();
+    assert_eq!(
+        peers["result"]["structuredContent"]["peers"][0]["providers"],
+        json!(["copilot"])
+    );
+    let delegated = mcp(
+        vec![],
+        rpc(
+            "tools/call",
+            json!({ "name": "delegate", "arguments": { "prompt": "hello", "peer": "worker", "wait_seconds": 20 } }),
+        ),
+    )
+    .await
+    .json();
+    let result = &delegated["result"]["structuredContent"];
+    assert_eq!(result["state"], "completed", "{delegated}");
+    assert_eq!(result["output"], "echo: hello");
+    assert_eq!(result["peer"], "worker");
+    assert_eq!(result["evidence"], "verified", "signed by the worker");
+    // It shows up in the owner's Tasks, marked as asked by another agent.
+    let state = admin("GET", "/api/state", None).await.json();
+    assert!(
+        state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["via"] == "MCP" && t["output"] == "echo: hello"),
+        "{}",
+        state["tasks"]
+    );
+    // A problem is the calling model's to see, not a protocol error.
+    let nobody = mcp(
+        vec![],
+        rpc(
+            "tools/call",
+            json!({ "name": "delegate", "arguments": { "prompt": "x", "peer": "nobody" } }),
+        ),
+    )
+    .await
+    .json();
+    assert_eq!(nobody["result"]["isError"], true);
+    assert!(
+        nobody["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nobody is not connected (connected: worker)")
+    );
+    let long = mcp(
+        vec![],
+        rpc(
+            "tools/call",
+            json!({ "name": "delegate", "arguments": { "prompt": "x".repeat(200_001) } }),
+        ),
+    )
+    .await
+    .json();
+    assert_eq!(long["result"]["isError"], true);
+    assert!(
+        long["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("prompt is too long")
+    );
+
+    // MCP 2026-07-28: stateless; the headers must match the body.
+    let headers = |method: &str, name: Option<&str>| {
+        let mut h = vec![
+            ("MCP-Protocol-Version", "2026-07-28".to_owned()),
+            ("Mcp-Method", method.to_owned()),
+        ];
+        if let Some(name) = name {
+            h.push(("Mcp-Name", name.to_owned()));
+        }
+        h
+    };
+    let discover = mcp(
+        headers("server/discover", None),
+        modern("server/discover", json!({})),
+    )
+    .await
+    .json();
+    assert_eq!(
+        discover["result"]["supportedVersions"],
+        json!(["2026-07-28"])
+    );
+    assert_eq!(discover["result"]["resultType"], "complete");
+    assert_eq!(
+        discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "proofkin"
+    );
+    let plan = "say @worker say hi";
+    let check = mcp(
+        headers("tools/call", Some("check_plan")),
+        modern(
+            "tools/call",
+            json!({ "name": "check_plan", "arguments": { "plan": plan } }),
+        ),
+    )
+    .await
+    .json();
+    assert_eq!(check["result"]["structuredContent"]["ok"], true, "{check}");
+    // Base64 in Mcp-Name is decoded before it is compared.
+    let ran = mcp(
+        headers("tools/call", Some("=?base64?cnVuX3BsYW4=?=")),
+        modern(
+            "tools/call",
+            json!({ "name": "run_plan", "arguments": { "plan": plan, "wait_seconds": 30 } }),
+        ),
+    )
+    .await
+    .json();
+    let run = &ran["result"]["structuredContent"];
+    assert_eq!(run["state"], "completed", "{ran}");
+    assert_eq!(run["steps"][0]["output"], "echo: say hi");
+    assert_eq!(run["steps"][0]["evidence"], "verified");
+    let report = mcp(
+        headers("tools/call", Some("get_run")),
+        modern(
+            "tools/call",
+            json!({ "name": "get_run", "arguments": { "run_id": run["run_id"] } }),
+        ),
+    )
+    .await
+    .json();
+    assert!(
+        report["result"]["structuredContent"]["report"]
+            .as_str()
+            .unwrap()
+            .contains("say"),
+        "{report}"
+    );
+    let mismatch = mcp(
+        headers("tools/call", Some("delegate")),
+        modern("tools/call", json!({ "name": "list_peers" })),
+    )
+    .await;
+    assert_eq!(mismatch.status, 400);
+    assert_eq!(mismatch.json()["error"]["code"], -32020);
+    let mut old = headers("tools/list", None);
+    old[0].1 = "2099-01-01".into();
+    let mut body: Value = serde_json::from_str(&modern("tools/list", json!({}))).unwrap();
+    body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
+    let unsupported = mcp(old, body.to_string()).await;
+    assert_eq!(unsupported.status, 400);
+    let unsupported = unsupported.json();
+    assert_eq!(unsupported["error"]["code"], -32022);
+    assert!(
+        unsupported["error"]["data"]["supported"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("2025-11-25"))
+    );
+    let unknown = mcp(headers("ping", None), modern("ping", json!({}))).await;
+    assert_eq!(unknown.status, 404, "ping is gone in 2026-07-28");
+    let stream = request(
+        port,
+        "GET",
+        "/mcp",
+        &[("Authorization", auth.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(stream.status, 405);
+
+    // Spec Kit features become plans over MCP and in the UI, the spec saved as knowledge.
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let feature = fixtures.join("speckit/specs/001-photo-albums");
+    let imported = mcp(
+        vec![],
+        rpc(
+            "tools/call",
+            json!({ "name": "import_spec", "arguments": { "path": feature, "peer": "worker" } }),
+        ),
+    )
+    .await
+    .json();
+    let imported = &imported["result"]["structuredContent"];
+    assert!(
+        imported["plan"]
+            .as_str()
+            .unwrap()
+            .contains("claim: US-1 User story 1"),
+        "{imported}"
+    );
+    assert_eq!(imported["knowledge"], json!(["spec-001-photo-albums"]));
+    assert!(
+        profiles
+            .join("boss/knowledge/spec-001-photo-albums.md")
+            .is_file()
+    );
+    let several = admin(
+        "POST",
+        "/api/playbooks/implement-speckit",
+        Some(json!({ "vars": { "spec": fixtures, "peer": "worker" } }).to_string()),
+    )
+    .await;
+    assert_eq!(several.status, 400);
+    assert_eq!(several.json()["candidates"].as_array().unwrap().len(), 2);
+    let filled = admin(
+        "POST",
+        "/api/playbooks/implement-speckit",
+        Some(
+            json!({ "vars": { "spec": fixtures.join("openspec/openspec/changes/add-dark-mode"), "peer": "worker" } })
+                .to_string(),
+        ),
+    )
+    .await
+    .json();
+    assert!(
+        filled["text"]
+            .as_str()
+            .unwrap()
+            .contains("claim: ui-1 Theme selection")
+    );
+    assert!(
+        filled["notes"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("OpenSpec change openspec/changes/add-dark-mode")
+    );
+
+    // A2A: the agent card says where and how; version 1.0 only.
+    let card = request(port, "GET", "/.well-known/agent-card.json", &[], None)
+        .await
+        .json();
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"],
+        format!("http://127.0.0.1:{port}/a2a")
+    );
+    assert_eq!(card["supportedInterfaces"][0]["protocolVersion"], "1.0");
+    assert_eq!(
+        card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"],
+        "Bearer"
+    );
+    let a2a = |method: &'static str, params: Value, version: Option<&'static str>| {
+        let auth = auth.clone();
+        async move {
+            let mut headers = vec![("Authorization", auth.as_str())];
+            if let Some(v) = version {
+                headers.push(("A2A-Version", v));
+            }
+            request(port, "POST", "/a2a", &headers, Some(&rpc(method, params)))
+                .await
+                .json()
+        }
+    };
+    let message = |text: &str, meta: Value| {
+        json!({ "message": {
+            "messageId": "m-1", "role": "ROLE_USER", "parts": [{ "text": text }], "metadata": meta,
+        }})
+    };
+    let v03 = a2a("SendMessage", message("hi", json!({})), None).await;
+    assert_eq!(v03["error"]["code"], -32009, "no version means 0.3");
+    let sent = a2a(
+        "SendMessage",
+        message("hello a2a", json!({ "peer": "worker" })),
+        Some("1.0"),
+    )
+    .await;
+    let task = &sent["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{sent}");
+    assert_eq!(task["artifacts"][0]["parts"][0]["text"], "echo: hello a2a");
+    assert_eq!(task["history"][0]["messageId"], "m-1");
+    let id = task["id"].as_str().unwrap().to_owned();
+    let got = a2a("GetTask", json!({ "id": id }), Some("1.0")).await;
+    assert_eq!(got["result"]["status"]["state"], "TASK_STATE_COMPLETED");
+    let ended = a2a("CancelTask", json!({ "id": id }), Some("1.0")).await;
+    assert_eq!(ended["error"]["code"], -32002);
+    let listed = a2a(
+        "ListTasks",
+        json!({ "contextId": task["contextId"] }),
+        Some("1.0"),
+    )
+    .await;
+    assert_eq!(listed["result"]["totalSize"], 1);
+    assert!(
+        listed["result"]["tasks"][0].get("artifacts").is_none(),
+        "artifacts only when asked for"
+    );
+    // A plan as the message text runs as a plan.
+    let planned = a2a("SendMessage", message(plan, json!({})), Some("1.0")).await;
+    let planned = &planned["result"]["task"];
+    assert_eq!(
+        planned["status"]["state"], "TASK_STATE_COMPLETED",
+        "{planned}"
+    );
+    assert_eq!(planned["metadata"]["kind"], "plan");
+    assert!(
+        planned["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["artifactId"] == "evidence")
+    );
+    // Work that's still running can be cancelled.
+    let mut hang = message("hang", json!({ "peer": "worker" }));
+    hang["configuration"] = json!({ "returnImmediately": true });
+    let hanging = a2a("SendMessage", hang, Some("1.0")).await;
+    assert_eq!(
+        hanging["result"]["task"]["status"]["state"],
+        "TASK_STATE_WORKING"
+    );
+    let hanging_id = hanging["result"]["task"]["id"].clone();
+    let cancelled = a2a("CancelTask", json!({ "id": hanging_id }), Some("1.0")).await;
+    assert_eq!(
+        cancelled["result"]["status"]["state"], "TASK_STATE_CANCELED",
+        "{cancelled}"
+    );
+    let rejected = a2a(
+        "SendMessage",
+        message("x", json!({ "peer": "nobody" })),
+        Some("1.0"),
+    )
+    .await;
+    assert_eq!(
+        rejected["result"]["task"]["status"]["state"],
+        "TASK_STATE_REJECTED"
+    );
+    let missing = a2a("GetTask", json!({ "id": "t-nope" }), Some("1.0")).await;
+    assert_eq!(missing["error"]["code"], -32001);
+    let mut file = message("see attached", json!({}));
+    file["message"]["parts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "url": "https://example.com/a.txt" }));
+    let file = a2a("SendMessage", file, Some("1.0")).await;
+    assert_eq!(file["error"]["code"], -32005);
+    let stream = a2a("SendStreamingMessage", message("x", json!({})), Some("1.0")).await;
+    assert_eq!(stream["error"]["code"], -32004);
+    // The card says it has no extended card, so asking for one is unsupported.
+    let extended = a2a("GetExtendedAgentCard", json!({}), Some("1.0")).await;
+    assert_eq!(extended["error"]["code"], -32004);
+
+    // Turned off: the token stops working at once, and the card is gone.
+    let off = admin("DELETE", "/api/connect", None).await.json();
+    assert_eq!(off["on"], false);
+    let refused = mcp(vec![], rpc("tools/list", json!({}))).await;
+    assert_eq!(refused.status, 401);
+    let card = request(port, "GET", "/.well-known/agent-card.json", &[], None).await;
+    assert_eq!(card.status, 404);
+    boss.shutdown().await;
+    worker.shutdown().await;
+}

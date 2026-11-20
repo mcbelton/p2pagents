@@ -1,5 +1,5 @@
 // Keep learning about the system from how it runs: usage, health, incidents and
-// which troubleshooting guides work. Run `p2pagents kb learn` first so the
+// which troubleshooting guides work. Run `proofkin kb learn` first so the
 // knowledge base has the latest ops summary.
 // Vars: peer, folder, approver
 claim: LEARN-1 The knowledge base has an up-to-date analysis of how the system is used and how it behaves

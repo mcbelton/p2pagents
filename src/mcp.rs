@@ -746,7 +746,7 @@ pub fn parse_config(
     Ok((found, notes))
 }
 
-/// A server name that p2pagents accepts, made from `name` (`github.com/x` -> `github-com-x`).
+/// A server name that proofkin accepts, made from `name` (`github.com/x` -> `github-com-x`).
 pub fn server_name(name: &str) -> String {
     let mut out: String = name
         .chars()

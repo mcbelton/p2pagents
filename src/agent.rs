@@ -77,7 +77,7 @@ impl AgentConfig {
             shares: ShareStore::default(),
             owner: None,
             role: None,
-            worktrees_dir: std::env::temp_dir().join("p2pagents-worktrees"),
+            worktrees_dir: std::env::temp_dir().join("proofkin-worktrees"),
         }
     }
 }
@@ -457,7 +457,7 @@ impl Agent {
     }
 
     /// Reloads the shared folders from `path` (the built-in data folder is at `data`)
-    /// whenever the file changes, checking every `every`; e.g. `p2pagents mcp remove`
+    /// whenever the file changes, checking every `every`; e.g. `proofkin mcp remove`
     /// or `share remove` run while the agent runs take effect for peers right away.
     pub fn watch_shares(&self, path: PathBuf, data: PathBuf, every: Duration) {
         let agent = self.clone();
@@ -846,9 +846,7 @@ fn dial_with(
             return Ok(());
         }
         if !inner.is_trusted(&id) {
-            bail!(
-                "{id} is not on the allowlist; add it with: p2pagents peers allow <ticket-or-id>"
-            );
+            bail!("{id} is not on the allowlist; add it with: proofkin peers allow <ticket-or-id>");
         }
         if !inner.dialing.lock().unwrap().insert(id) {
             return Ok(());
@@ -1403,7 +1401,7 @@ impl Inner {
         if let Some(wt) = &worktree {
             let first = task.prompt.lines().next().unwrap_or_default();
             let message = format!(
-                "p2pagents: task {task_id} from {from}\n\n{}",
+                "proofkin: task {task_id} from {from}\n\n{}",
                 first.chars().take(200).collect::<String>()
             );
             let (commit, text) = wt.commit(&message).await?;

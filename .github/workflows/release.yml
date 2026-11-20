@@ -1,6 +1,6 @@
 name: release
 
-# Builds p2pagents for Windows, Linux and macOS and publishes the archives as a
+# Builds Proofkin for Windows, Linux and macOS and publishes the archives as a
 # GitHub release. Triggered by pushing a version tag, e.g. `git tag v0.1.0 && git push --tags`.
 on:
   push:
@@ -45,23 +45,23 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "p2pagents-${{ matrix.target }}"
+          $name = "proofkin-${{ matrix.target }}"
           New-Item -ItemType Directory $name | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/p2pagents.exe, README.md, LICENSE-MIT, LICENSE-APACHE $name
+          Copy-Item target/${{ matrix.target }}/release/proofkin.exe, README.md, LICENSE-MIT, LICENSE-APACHE $name
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
 
       - name: Package (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
-          name="p2pagents-${{ matrix.target }}"
+          name="proofkin-${{ matrix.target }}"
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/p2pagents README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          cp target/${{ matrix.target }}/release/proofkin README.md LICENSE-MIT LICENSE-APACHE "$name/"
           tar -czf "$name.tar.gz" -C "$name" .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: p2pagents-${{ matrix.target }}
-          path: p2pagents-${{ matrix.target }}.*
+          name: proofkin-${{ matrix.target }}
+          path: proofkin-${{ matrix.target }}.*
 
   publish:
     needs: build
@@ -78,4 +78,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ github.ref_name }}" dist/* install.ps1 install.sh \
-            --title "p2pagents ${{ github.ref_name }}" --generate-notes
+            --title "Proofkin ${{ github.ref_name }}" --generate-notes

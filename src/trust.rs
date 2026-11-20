@@ -134,7 +134,7 @@ impl Ticket {
                 name: String::new(),
                 addr: EndpointAddr::new(id),
             }),
-            Err(_) => bail!("not a p2pagents ticket or endpoint id: {s}"),
+            Err(_) => bail!("not a proofkin ticket or endpoint id: {s}"),
         }
     }
 }

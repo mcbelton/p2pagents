@@ -1,4 +1,4 @@
-// p2pagents web UI: digital workers. Agents of this profile, each with its own
+// Proofkin web UI: digital workers. Agents of this profile, each with its own
 // key, allowlist and folders, running on this profile's sign-ins: created here,
 // started and stopped (with this agent, if their owner wants), and deleted. Uses
 // app.js helpers: $, el, api, toast, confirmDialog, avatar, icon, ICONS,
@@ -180,7 +180,7 @@ function renderWorkerProviders() {
   const more = WORKER_PROVIDERS.filter((p) => p !== "copilot" && !signedIn.has(p));
   const terminal = more.length
     ? el("span", { class: "muted small" }, `To use ${more.map(providerLabel).join(" or ")}, sign ${workerState.profile} in from a terminal: `,
-      el("span", { class: "mono", text: `p2pagents auth login ${more[0]} --profile ${workerState.profile}` }))
+      el("span", { class: "mono", text: `proofkin auth login ${more[0]} --profile ${workerState.profile}` }))
     : null;
   if (signedIn.has("copilot")) {
     if (terminal) box.append(terminal);
@@ -227,7 +227,7 @@ function renderWorkerFolders() {
       el("span", {}, el("strong", { text: f.name }), ` · at most ${(ACCESS_SHORT[f.max_access] ?? f.max_access).toLowerCase()}`,
         el("span", { class: "mono", text: ` ${f.path}` }))))
     : [el("span", { class: "muted small" }, "You share no folders besides your data folder. Share one with ",
-      el("span", { class: "mono", text: `p2pagents share add NAME PATH --profile ${workerState.profile}` }),
+      el("span", { class: "mono", text: `proofkin share add NAME PATH --profile ${workerState.profile}` }),
       ", or link a repository under GitHub.")]));
 }
 

@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use p2pagents::audit::{AuditLog, Outcome};
-use p2pagents::mcp::McpServer;
-use p2pagents::plan::{Plan, SquadStore, StepState, run_plan};
-use p2pagents::runs::{RunRecord, Verdict};
-use p2pagents::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
-use p2pagents::{
+use proofkin::audit::{AuditLog, Outcome};
+use proofkin::mcp::McpServer;
+use proofkin::plan::{Plan, SquadStore, StepState, run_plan};
+use proofkin::runs::{RunRecord, Verdict};
+use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
+use proofkin::{
     Access, Agent, AgentConfig, EndpointId, Event, Executor, LlmTask, Network, Provider, SecretKey,
     TaskContext, TrustStore, TrustedPeer,
 };
@@ -949,7 +949,7 @@ async fn peers_use_only_the_mcp_servers_a_folder_offers_them() {
         .unwrap_err();
     assert!(err.to_string().contains("is paused by its owner"), "{err}");
 
-    // Changes to the shares file (e.g. `p2pagents mcp resume` while the agent runs)
+    // Changes to the shares file (e.g. `proofkin mcp resume` while the agent runs)
     // reach the running agent and its peers.
     let file = dir.path().join("shares.json");
     shares.save(&file).unwrap();
@@ -1254,7 +1254,7 @@ async fn checks_run_by_the_worker_prove_results_and_failures_are_retried() {
 #[tokio::test]
 async fn built_in_spec_checks_prove_a_spec_package_with_read_only_access() {
     let dir = tempfile::tempdir().unwrap();
-    p2pagents::spec::init(dir.path(), "Wishlist", false).unwrap();
+    proofkin::spec::init(dir.path(), "Wishlist", false).unwrap();
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let mut boss = Node::new("boss");
     mutual(&mut worker, &mut boss);
@@ -1269,7 +1269,7 @@ async fn built_in_spec_checks_prove_a_spec_package_with_read_only_access() {
     boss.connect(worker.addr()).await.unwrap();
     wait_for_peers(&boss, 1).await;
 
-    let all: Vec<String> = p2pagents::spec::SPEC_CHECKS
+    let all: Vec<String> = proofkin::spec::SPEC_CHECKS
         .iter()
         .map(|c| (*c).to_owned())
         .collect();
@@ -1604,7 +1604,7 @@ async fn plans_save_verified_results_as_knowledge_and_use_it_later() {
     boss.connect(worker.addr()).await.unwrap();
     wait_for_peers(&boss, 1).await;
     let home = tempfile::tempdir().unwrap();
-    let kb = p2pagents::knowledge::KnowledgeBase::new(home.path());
+    let kb = proofkin::knowledge::KnowledgeBase::new(home.path());
 
     // A discovery run saves the worker's (signed, verified) result as a topic.
     let first = Plan::parse("arch @worker save=architecture map the services").unwrap();
@@ -1616,7 +1616,7 @@ async fn plans_save_verified_results_as_knowledge_and_use_it_later() {
     )
     .await;
     assert_eq!(
-        p2pagents::plan::save_knowledge(&kb, &first, &states, "run-1"),
+        proofkin::plan::save_knowledge(&kb, &first, &states, "run-1"),
         ["architecture"]
     );
     assert!(

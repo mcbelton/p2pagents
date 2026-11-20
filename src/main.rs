@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
-use p2pagents::audit::{AuditLog, Outcome};
-use p2pagents::auth::{LoginMethod, ProviderTools};
-use p2pagents::plan::{Plan, SquadStore, StepState, run_plan};
-use p2pagents::profile::DEFAULT_GITHUB_HOST;
-use p2pagents::trust::DEFAULT_TASKS_PER_HOUR;
-use p2pagents::{
+use proofkin::audit::{AuditLog, Outcome};
+use proofkin::auth::{LoginMethod, ProviderTools};
+use proofkin::plan::{Plan, SquadStore, StepState, run_plan};
+use proofkin::profile::DEFAULT_GITHUB_HOST;
+use proofkin::trust::DEFAULT_TASKS_PER_HOUR;
+use proofkin::{
     Access, Agent, AgentConfig, Event, Executor, ExecutorConfig, LlmTask, Network, Profile,
     Provider, SdkExecutor, TaskContext, Ticket, TrustedPeer,
 };
@@ -24,7 +24,7 @@ commands:
   /tasks                                list your running tasks
   /cancel <n>                           cancel your running task n (the peer stops it too)
   /plan <file>                          run a plan: steps on peers (@name) or squads (#squad), in dependency order
-  /runs                                 list saved evidence runs (p2pagents runs show <id> for a report)
+  /runs                                 list saved evidence runs (proofkin runs show <id> for a report)
   /approvals                            list approval requests waiting for you
   /approve <n> [note], /reject <n> <why>  answer approval request n (signed with your key)
   /squads                               list your squads and which members are online
@@ -34,10 +34,11 @@ commands:
   /quit                                 exit
 
 Each agent has its own identity (key) and Copilot/Claude/Codex accounts from its profile
-(--profile, default: --name). Peers must allowlist each other's keys:  p2pagents peers --help
-Sign a profile in to providers:  p2pagents auth --help";
+(--profile, default: --name). Peers must allowlist each other's keys:  proofkin peers --help
+Sign a profile in to providers:  proofkin auth --help";
 
-/// Run a peer-to-peer agent that can run and delegate LLM coding tasks.
+/// Proofkin: peer-to-peer agents that prove their work. Runs an agent that runs and
+/// delegates LLM coding tasks (with no command), or manages its profile.
 #[derive(Parser)]
 #[command(version, after_help = COMMANDS, args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct Cli {
@@ -84,7 +85,7 @@ enum Command {
     #[command(subcommand)]
     Playbook(PlaybookCommand),
     /// Skills: instructions agents follow in plan steps (skill=name). Built-in ones
-    /// ship with p2pagents; a profile's own replace or add to them.
+    /// ship with proofkin; a profile's own replace or add to them.
     #[command(subcommand)]
     Skill(SkillCommand),
     /// Agents: roles plan steps take (agent=name), with their instructions, the
@@ -93,7 +94,7 @@ enum Command {
     Agent(AgentCommand),
     /// Spec-driven development: check a feature's spec, REST API contract and UX
     /// prototype, its design and its review pack (the checks plan steps run as
-    /// verify=spec:api,design:threats,...).
+    /// verify=spec:api,design:threats,...), or import a Spec Kit or OpenSpec spec as a plan.
     #[command(subcommand)]
     Spec(SpecCommand),
     /// The design package (architecture, ADRs, diagrams, data dictionary, data flows,
@@ -118,10 +119,32 @@ enum Command {
     /// Operations: health report and incidents.
     #[command(subcommand)]
     Ops(OpsCommand),
+    /// Let other agents (VS Code, Claude Code, any MCP or A2A client on this computer)
+    /// hand work to this profile's peers: turns it on and shows the token and how to
+    /// set up clients. They run tasks and plans on peers, never on this computer.
+    #[command(after_help = "\
+The running agent serves them with its web UI (--ui): MCP at /mcp (Streamable HTTP;
+the 2026-07-28 revision and the initialize-based ones before it), A2A 1.0 at /a2a
+with its agent card at /.well-known/agent-card.json. Start the agent with --ui-port
+so their address stays the same. The token works only there, never for the web UI.
+examples:
+  proofkin connect --profile boss
+  proofkin connect --profile boss --new      (a new token; the old one stops working)
+  proofkin connect --profile boss --off")]
+    Connect {
+        #[command(flatten)]
+        profile: ProfileArg,
+        /// Make a new token (the old one stops working).
+        #[arg(long)]
+        new: bool,
+        /// Turn it off: the token stops working.
+        #[arg(long, conflicts_with = "new")]
+        off: bool,
+    },
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
-    /// Install the Claude/Codex bridge (Node packages) into ~/.p2pagents/bridge.
+    /// Install the Claude/Codex bridge (Node packages) into ~/.proofkin/bridge.
     /// Not needed for Copilot-only agents.
     Setup {
         /// npm registry/mirror to install from (default: your npm config, usually registry.npmjs.org).
@@ -161,9 +184,9 @@ enum WorkerCommand {
     /// Create a digital worker owned by --owner.
     #[command(after_help = "\
 examples:
-  p2pagents worker create tester --owner alice --role \"test engineer for the parser\" \\
+  proofkin worker create tester --owner alice --role \"test engineer for the parser\" \\
       --providers copilot --folder app --start-with-owner
-  p2pagents --name tester --providers copilot --serve        (or run it yourself)
+  proofkin --name tester --providers copilot --serve        (or run it yourself)
 The worker gets its own key, allowlist, shared folders and audit log, but no accounts:
 it always uses its owner's. Its owner is allowlisted on it (may give it tasks in its data
 folder and the --folder ones, which it shares as its owner does) and it is allowlisted
@@ -208,7 +231,7 @@ enum SquadCommand {
     /// Create or replace a squad of allowlisted peers.
     #[command(after_help = "\
 examples:
-  p2pagents squad create qa --member alice,tester --profile boss
+  proofkin squad create qa --member alice,tester --profile boss
 In a plan, `#qa` runs a step on the least busy online member of squad qa.")]
     Create {
         name: String,
@@ -301,9 +324,9 @@ enum RepoCommand {
     /// (a git worktree per task).
     #[command(after_help = "\
 examples:
-  p2pagents github login --gh-user alice --profile alice
-  p2pagents repo link acme/shop --access full --check test=\"npm test\" --check lint=\"npm run lint\" --profile alice
-  p2pagents peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
+  proofkin github login --gh-user alice --profile alice
+  proofkin repo link acme/shop --access full --check test=\"npm test\" --check lint=\"npm run lint\" --profile alice
+  proofkin peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
 Agents' tasks commit on p2p/... branches; review them with repo branches and open a
 pull request with repo pr.")]
     Link {
@@ -464,9 +487,9 @@ A spec package is:
   prototype/index.html  a self-contained clickable prototype; screens marked data-story/data-ac
   evidence/claims.json  a claim per acceptance criterion, proven later by tests
 examples:
-  p2pagents spec check
-  p2pagents spec check api --dir D:\\src\\shop
-  p2pagents spec check design")]
+  proofkin spec check
+  proofkin spec check api --dir D:\\src\\shop
+  proofkin spec check design")]
     Check {
         /// A check, a group (spec, design, review) or all.
         #[arg(default_value = "all")]
@@ -484,6 +507,34 @@ examples:
         /// Replace an existing spec package.
         #[arg(long)]
         force: bool,
+    },
+    /// Turn a Spec Kit feature or OpenSpec change into a plan: a claim per user story,
+    /// requirement and success criterion, proven by the folder's tests or a sign-off.
+    #[command(after_help = "\
+What it reads:
+  Spec Kit   specs/NNN-name/ (spec.md, plan.md, tasks.md; .specify/memory/constitution.md)
+             claims US-1.. (user stories), FR-001.. (requirements), SC-001.. (success criteria)
+  OpenSpec   openspec/changes/<id>/ (proposal.md, tasks.md, specs/<capability>/spec.md)
+             claims <capability>-1.. (added and modified requirements), ACCEPT
+Give a feature's folder, or a project folder with one feature. The spec is saved as
+knowledge topic spec-<feature> (openspec-<change>) in the profile; the plan's steps
+are given it, so peers need no copy. The plan goes to stdout (or --out): run it with
+/plan <file>, or paste it in the web UI's Plan mode (or pick the implement-speckit playbook).
+examples:
+  proofkin spec import D:\\src\\shop\\specs\\001-photo-albums --profile boss --set peer=alice > albums.plan
+  proofkin spec import ~/src/shop/openspec/changes/add-dark-mode --profile boss --set peer=alice --set reviewers=qa --out dark.plan")]
+    Import {
+        /// The feature's folder (or a project folder with one feature).
+        path: PathBuf,
+        /// Who and where: peer=NAME (required), folder=app, reviewers=qa (a squad),
+        /// test=test (the folder's check), approver=me.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// Write the plan to this file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        profile: ProfileArg,
     },
 }
 
@@ -505,7 +556,7 @@ It writes:
   review/product.md           product review deck (Marp)
   review/leadership.md        leadership review deck (Marp)
   review/customer-feedback.md customer feedback document
-Check them with: p2pagents spec check design (and review)")]
+Check them with: proofkin spec check design (and review)")]
     Init {
         /// The feature's title.
         title: String,
@@ -539,8 +590,8 @@ enum PlaybookCommand {
     /// Print a playbook as a plan, filled in with --set values.
     #[command(after_help = "\
 examples:
-  p2pagents playbook show discover --set peer=alice --set folder=app --set project=Shop > discover.plan
-  p2pagents playbook show sdlc --set peer=alice --set change=\"Add CSV export\" --set change_id=csv
+  proofkin playbook show discover --set peer=alice --set folder=app --set project=Shop > discover.plan
+  proofkin playbook show sdlc --set peer=alice --set change=\"Add CSV export\" --set change_id=csv
 Then run it in an agent with /plan <file>, or pick the playbook in the web UI's Plan mode.")]
     Show {
         name: String,
@@ -556,8 +607,8 @@ enum ScheduleCommand {
     #[command(after_help = "\
 when (local time): 'every 30m', 'every 2h', 'daily 09:00', 'weekdays 08:30', 'mon,fri 17:00'
 examples:
-  p2pagents schedule add nightly-learn --when \"daily 02:00\" --playbook learn --set peer=alice --set folder=app --profile boss
-  p2pagents schedule add smoke --when \"every 1h\" --plan smoke.plan --profile boss
+  proofkin schedule add nightly-learn --when \"daily 02:00\" --playbook learn --set peer=alice --set folder=app --profile boss
+  proofkin schedule add smoke --when \"every 1h\" --plan smoke.plan --profile boss
 Schedules run while the profile's agent runs (with or without --ui), never overlap
 themselves, and each run is saved as an evidence run. A run missed while the agent
 was off runs once when it starts again.")]
@@ -608,8 +659,8 @@ enum MonitorCommand {
     /// Add or replace a monitor (runs in this profile's agent while it is running).
     #[command(after_help = "\
 example:
-  p2pagents share add app D:\\src\\app --access full --check health=\"curl -fsS http://localhost:8080/health\" --check restart=\"pwsh -File restart.ps1\" --profile alice
-  p2pagents monitor add api --share app --check health --every 60 --slo 99.5 --profile alice")]
+  proofkin share add app D:\\src\\app --access full --check health=\"curl -fsS http://localhost:8080/health\" --check restart=\"pwsh -File restart.ps1\" --profile alice
+  proofkin monitor add api --share app --check health --every 60 --slo 99.5 --profile alice")]
     Add {
         name: String,
         /// Shared folder whose check to run (fixes run there too).
@@ -673,7 +724,7 @@ enum RunsCommand {
     },
     /// Re-check every signature in a run, from its run.json alone; exits 1 if any fails.
     #[command(after_help = "\
-Works on a run folder copied from someone else too:  p2pagents runs verify --dir <folder>")]
+Works on a run folder copied from someone else too:  proofkin runs verify --dir <folder>")]
     Verify {
         /// Run id (in the profile's runs folder).
         #[arg(required_unless_present = "dir")]
@@ -692,10 +743,10 @@ enum ShareCommand {
     /// Share a folder with peers (grant it per peer with `peers allow --share`).
     #[command(after_help = "\
 examples:
-  p2pagents share add myrepo D:\\src\\myrepo --access workspace-write --profile alice
-  p2pagents share add app D:\\src\\app --access full --worktrees --check test=\"cargo test\" --check lint=\"cargo clippy -- -D warnings\"
-  p2pagents peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
-Every profile also shares its own .p2pdata folder as 'data' (read-only); peers'
+  proofkin share add myrepo D:\\src\\myrepo --access workspace-write --profile alice
+  proofkin share add app D:\\src\\app --access full --worktrees --check test=\"cargo test\" --check lint=\"cargo clippy -- -D warnings\"
+  proofkin peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
+Every profile also shares its own data folder (.proofkin-data) as 'data' (read-only); peers'
 tasks run there unless they name another folder shared with them.
 Checks are commands you define; a peer's task can ask your agent to run them after the
 model (verify=test in a plan) as signed evidence. They run your folder's code with your
@@ -737,9 +788,9 @@ enum McpCommand {
     /// mcp=NAME in a plan step).
     #[command(after_help = "\
 examples:
-  p2pagents mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot -- npx @playwright/mcp@latest --headless
-  p2pagents mcp add app docs --url https://docs.example.com/mcp --header \"Authorization=Bearer <token>\"
-  p2pagents mcp add app tickets --plugin team-tools --set TICKETS_TOKEN=<token> --description \"Our ticket system\"
+  proofkin mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot -- npx @playwright/mcp@latest --headless
+  proofkin mcp add app docs --url https://docs.example.com/mcp --header \"Authorization=Bearer <token>\"
+  proofkin mcp add app tickets --plugin team-tools --set TICKETS_TOKEN=<token> --description \"Our ticket system\"
   plan step:  check @alice:app mcp=browser Open http://localhost:3000 and report what the home page shows
 The server runs on this machine with your rights; commands, variables, headers and
 URLs stay here (peers learn only the names they may use, and descriptions you give).
@@ -791,8 +842,8 @@ taken from environment variables of the same name.")]
     /// .vscode/mcp.json) in a shared folder.
     #[command(after_help = "\
 examples:
-  p2pagents mcp import .vscode/mcp.json --share app --server playwright --access read-only
-  p2pagents mcp import mcp.json --share app --set API_KEY=<key>
+  proofkin mcp import .vscode/mcp.json --share app --server playwright --access read-only
+  proofkin mcp import mcp.json --share app --set API_KEY=<key>
 ${workspaceFolder} becomes the shared folder. Values the servers need (${input:x},
 ${env:X}) come from --set, else environment variables of the same name. Disabled
 servers and WebSocket servers are left out.")]
@@ -851,11 +902,11 @@ enum PluginCommand {
     /// you can offer in a folder (mcp add --plugin).
     #[command(after_help = "\
 examples:
-  p2pagents plugin add ./team-tools
-  p2pagents plugin add octo-org/agent-plugins:plugins/reviewer
-  p2pagents plugin add octo-org/marketplace --plugin reviewer
-  p2pagents plugin add https://git.example.com/tools.git#plugins/qa --as qa-tools
-Private GitHub repositories use the profile's GitHub sign-in (p2pagents github login).")]
+  proofkin plugin add ./team-tools
+  proofkin plugin add octo-org/agent-plugins:plugins/reviewer
+  proofkin plugin add octo-org/marketplace --plugin reviewer
+  proofkin plugin add https://git.example.com/tools.git#plugins/qa --as qa-tools
+Private GitHub repositories use the profile's GitHub sign-in (proofkin github login).")]
     Add {
         /// A folder, owner/repo[:path], host/owner/repo[:path] or a git URL (#path for a folder in it).
         source: String,
@@ -916,9 +967,9 @@ enum PeersCommand {
     /// Allowlist a peer by its ticket or endpoint id.
     #[command(after_help = "\
 examples:
-  p2pagents peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate
-  p2pagents peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate --access workspace-write
-  p2pagents peers allow 5f2c...e9 --profile alice --name bob --tasks-per-hour 5
+  proofkin peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate
+  proofkin peers allow p2pa1eyJuYW1lIjoi... --profile alice --delegate --access workspace-write
+  proofkin peers allow 5f2c...e9 --profile alice --name bob --tasks-per-hour 5
 Both sides must allowlist each other. Only peers allowed with --delegate can make this
 agent run LLM tasks (on this profile's accounts), with at most their --access and the
 agent's own --access.")]
@@ -940,7 +991,7 @@ agent's own --access.")]
         /// full (also shell commands). Capped by each shared folder's maximum.
         #[arg(long, value_enum, default_value_t = Access::ReadOnly, requires = "delegate")]
         access: Access,
-        /// Shared folders this peer's tasks may use (see `p2pagents share`).
+        /// Shared folders this peer's tasks may use (see `proofkin share`).
         #[arg(
             long,
             value_delimiter = ',',
@@ -968,13 +1019,13 @@ enum AuthCommand {
     /// Sign a profile in to a provider.
     #[command(after_help = "\
 examples:
-  p2pagents auth login copilot --profile worker1 --gh-user alice
-  p2pagents auth login copilot --profile worker2 --gh-user bob --host mycorp.ghe.com
-  p2pagents auth login copilot --profile worker3 --token        (prompts for a GitHub token)
-  p2pagents auth login claude  --profile worker1                 (browser sign-in)
-  p2pagents auth login claude  --profile worker2 --api-key
-  p2pagents auth login codex   --profile worker1                 (browser sign-in)
-  p2pagents auth login codex   --profile worker2 --api-key
+  proofkin auth login copilot --profile worker1 --gh-user alice
+  proofkin auth login copilot --profile worker2 --gh-user bob --host mycorp.ghe.com
+  proofkin auth login copilot --profile worker3 --token        (prompts for a GitHub token)
+  proofkin auth login claude  --profile worker1                 (browser sign-in)
+  proofkin auth login claude  --profile worker2 --api-key
+  proofkin auth login codex   --profile worker1                 (browser sign-in)
+  proofkin auth login codex   --profile worker2 --api-key
 Secrets are read from a hidden prompt, or from stdin when piped.")]
     Login {
         #[arg(value_enum)]
@@ -1025,13 +1076,17 @@ struct ProfileArg {
 #[derive(ClapArgs)]
 struct BridgeArg {
     /// Node bridge script for the Claude and Codex SDKs (default: the one `setup` installed).
-    #[arg(long, env = "P2PAGENTS_BRIDGE")]
+    #[arg(long, env = "PROOFKIN_BRIDGE")]
     bridge: Option<PathBuf>,
 }
 
 impl BridgeArg {
     fn path(&self) -> PathBuf {
-        p2pagents::setup::resolve_bridge(self.bridge.clone())
+        proofkin::setup::resolve_bridge(
+            self.bridge
+                .clone()
+                .or_else(|| proofkin::profile::env_setting_os("BRIDGE").map(PathBuf::from)),
+        )
     }
 }
 
@@ -1060,7 +1115,7 @@ struct RunArgs {
     #[arg(long)]
     serve: bool,
     /// Folder your own tasks (/ask, "This agent" in the web UI) work in. Peers never
-    /// get it: their tasks run only in folders you share (see `p2pagents share`).
+    /// get it: their tasks run only in folders you share (see `proofkin share`).
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     /// Most your own tasks may do in --workspace: read-only, workspace-write (edit
@@ -1120,6 +1175,7 @@ async fn main() -> Result<()> {
         Some(Command::Monitor(command)) => run_monitor(command),
         Some(Command::Schedule(command)) => run_schedule(command),
         Some(Command::Ops(command)) => run_ops(command),
+        Some(Command::Connect { profile, new, off }) => run_connect(&profile.name, new, off),
         Some(Command::Profile(ProfileCommand::Delete { profile })) => {
             let profile = Profile::open(&profile.name)?;
             let name = profile.name.clone();
@@ -1134,15 +1190,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Setup { registry }) => {
-            let script = p2pagents::setup::install_bridge(registry.as_deref())?;
+            let script = proofkin::setup::install_bridge(registry.as_deref())?;
             println!("bridge installed: {}", script.display());
             println!(
-                "claude and codex providers are ready; sign a profile in with: p2pagents auth login claude --profile <name>"
+                "claude and codex providers are ready; sign a profile in with: proofkin auth login claude --profile <name>"
             );
             Ok(())
         }
         Some(Command::Doctor { bridge }) => {
-            if !p2pagents::setup::doctor(&bridge.path()).await? {
+            if !proofkin::setup::doctor(&bridge.path()).await? {
                 std::process::exit(1);
             }
             Ok(())
@@ -1220,7 +1276,7 @@ fn civil_date(days: u64) -> String {
 }
 
 fn run_worker(command: WorkerCommand) -> Result<()> {
-    use p2pagents::workers;
+    use proofkin::workers;
     match command {
         WorkerCommand::Create {
             name,
@@ -1231,7 +1287,7 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
             start_with_owner,
         } => {
             let owner = Profile::open(&owner)?;
-            let addr = p2pagents::EndpointAddr::new(owner.identity()?.public());
+            let addr = proofkin::EndpointAddr::new(owner.identity()?.public());
             let mut trust = owner.trust()?;
             let spec = workers::WorkerSpec {
                 name,
@@ -1265,7 +1321,7 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
                 );
             } else {
                 println!(
-                    "start it:  p2pagents --name {} --providers {} --serve",
+                    "start it:  proofkin --name {} --providers {} --serve",
                     worker.name,
                     if providers.is_empty() {
                         "copilot".to_owned()
@@ -1275,7 +1331,7 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
                 );
             }
             println!(
-                "share its ticket with peers:  p2pagents peers id --profile {}",
+                "share its ticket with peers:  proofkin peers id --profile {}",
                 worker.name
             );
             if owner.is_running() {
@@ -1312,11 +1368,11 @@ fn run_worker(command: WorkerCommand) -> Result<()> {
 
 /// Deletes digital worker `name` and takes it off its owner's allowlist and squads.
 fn remove_worker(name: &str) -> Result<()> {
-    use p2pagents::workers;
+    use proofkin::workers;
     let worker = Profile::open(name)?;
     let Some(owner) = worker.config.owner.clone() else {
         bail!(
-            "'{name}' isn't a digital worker; delete a profile with: p2pagents profile delete --profile {name}"
+            "'{name}' isn't a digital worker; delete a profile with: proofkin profile delete --profile {name}"
         );
     };
     let owner = Profile::open(&owner)?;
@@ -1342,7 +1398,7 @@ fn remove_worker(name: &str) -> Result<()> {
 }
 
 /// `; checks: test, lint; worktrees` for a share listing.
-fn share_extras(share: &p2pagents::shares::Share) -> String {
+fn share_extras(share: &proofkin::shares::Share) -> String {
     let mut extras = String::new();
     if !share.checks.is_empty() {
         extras += &format!(
@@ -1370,7 +1426,7 @@ fn share_extras(share: &p2pagents::shares::Share) -> String {
 /// Runs the profile's scheduled plans in the background while the agent runs (the
 /// web UI runs its own, so their steps show up there).
 fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
-    use p2pagents::schedule::{Launch, Outcome, Schedule, ScheduleStore, Scheduler};
+    use proofkin::schedule::{Launch, Outcome, Schedule, ScheduleStore, Scheduler};
     let store = ScheduleStore::load(&profile.schedules_path())?;
     if !store.schedules.is_empty() {
         println!(
@@ -1390,7 +1446,7 @@ fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
     }
     let (agent, owner) = (agent.clone(), profile.clone());
     let launch: Launch = Arc::new(move |s: Schedule| {
-        let ready = p2pagents::plan::start(&agent, &owner, &s.plan)?;
+        let ready = proofkin::plan::start(&agent, &owner, &s.plan)?;
         let agent = agent.clone();
         Ok(Box::pin(async move {
             println!("=== scheduled plan '{}' started ({}) ===", s.name, s.when);
@@ -1407,8 +1463,7 @@ fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
             }
         }))
     });
-    let tick = std::env::var("P2PAGENTS_SCHEDULE_TICK_SECS")
-        .ok()
+    let tick = proofkin::profile::env_setting("SCHEDULE_TICK_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
     Scheduler::new(profile.schedules_path(), launch).spawn(Duration::from_secs(tick));
@@ -1422,7 +1477,7 @@ fn start_monitors(
     agent: &Agent,
     executor: Option<Arc<dyn Executor>>,
 ) -> Result<()> {
-    use p2pagents::ops::{IncidentEvent, IncidentKind, MonitorStore, Ops};
+    use proofkin::ops::{IncidentEvent, IncidentKind, MonitorStore, Ops};
     let monitors = MonitorStore::load(&profile.monitors_path())?.monitors;
     if monitors.is_empty() {
         return Ok(());
@@ -1492,15 +1547,15 @@ fn start_monitors(
 
 /// The profile's ops report for the last `hours`.
 fn ops_report(profile: &Profile, hours: u64) -> Result<String> {
-    use p2pagents::ops::{MonitorStore, report};
+    use proofkin::ops::{MonitorStore, report};
     let monitors = MonitorStore::load(&profile.monitors_path())?.monitors;
-    let since_ms = p2pagents::runs::unix_now().saturating_sub(hours * 3600) * 1000;
+    let since_ms = proofkin::runs::unix_now().saturating_sub(hours * 3600) * 1000;
     let audit: Vec<_> = AuditLog::read(&profile.audit_path(), usize::MAX)
         .unwrap_or_default()
         .into_iter()
         .filter(|e| e.ts_ms >= since_ms)
         .collect();
-    let runs = p2pagents::runs::RunRecord::list(&profile.runs_dir()).unwrap_or_default();
+    let runs = proofkin::runs::RunRecord::list(&profile.runs_dir()).unwrap_or_default();
     Ok(report(
         &profile.name,
         hours,
@@ -1623,7 +1678,7 @@ fn run_github(command: GithubCommand) -> Result<()> {
                 Err(e) => println!("{e:#}"),
             }
             println!("GitHub CLI accounts on this machine:");
-            for (login, host, active) in p2pagents::github::gh_accounts() {
+            for (login, host, active) in proofkin::github::gh_accounts() {
                 println!("  {login}@{host}{}", if active { " (active)" } else { "" });
             }
         }
@@ -1637,7 +1692,7 @@ fn run_github(command: GithubCommand) -> Result<()> {
 }
 
 async fn run_repo(command: RepoCommand) -> Result<()> {
-    use p2pagents::github::{RepoStore, link, task_branches, unlink};
+    use proofkin::github::{RepoStore, link, task_branches, unlink};
     match command {
         RepoCommand::Link {
             repo,
@@ -1647,7 +1702,7 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
-            let checks = p2pagents::shares::parse_checks(&checks)?;
+            let checks = proofkin::shares::parse_checks(&checks)?;
             let (repo, _) = link(&profile, &repo, name.as_deref(), access, checks).await?;
             println!(
                 "profile '{}': linked {} ({}) as folder '{}' at {} (at most {access}, a worktree per task)",
@@ -1658,7 +1713,7 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
                 repo.path.display()
             );
             println!(
-                "grant it to a peer: p2pagents peers allow <peer> --profile {} --delegate --access {access} --share data,{}",
+                "grant it to a peer: proofkin peers allow <peer> --profile {} --delegate --access {access} --share data,{}",
                 profile.name, repo.name
             );
         }
@@ -1687,7 +1742,7 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
                 println!(
                     "  {:<36} {}  {}",
                     b.name,
-                    p2pagents::runs::utc(b.unix),
+                    proofkin::runs::utc(b.unix),
                     b.subject
                 );
             }
@@ -1741,7 +1796,7 @@ fn read_input(file: &std::path::Path) -> Result<String> {
 
 /// The built-in checks `part` names: a check (full or short name), a group or all.
 fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
-    use p2pagents::spec::BUILT_IN_CHECKS;
+    use proofkin::spec::BUILT_IN_CHECKS;
     let group = |prefix: &str| -> Vec<&'static str> {
         BUILT_IN_CHECKS
             .iter()
@@ -1756,7 +1811,7 @@ fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
                 if dir.join(folder).is_dir() {
                     names.extend(group(prefix));
                 } else {
-                    println!("{folder}/: not started (p2pagents design init writes a starter)");
+                    println!("{folder}/: not started (proofkin design init writes a starter)");
                 }
             }
             // A rehearsal is optional: the rehearse playbook writes it.
@@ -1791,8 +1846,61 @@ fn spec_checks(part: &str, dir: &std::path::Path) -> Result<Vec<&'static str>> {
     })
 }
 
+/// Turns connecting other agents on (or off), and says how to set up clients.
+fn run_connect(profile: &str, new: bool, off: bool) -> Result<()> {
+    let profile = Profile::open(profile)?;
+    if off {
+        profile.delete_integration_token()?;
+        println!(
+            "profile '{}': other agents can no longer connect (their token stopped working).",
+            profile.name
+        );
+        return Ok(());
+    }
+    let token = match profile.integration_token()? {
+        Some(token) if !new => token,
+        _ => profile.new_integration_token()?,
+    };
+    // The running agent's web UI port, if it has one.
+    let port = profile
+        .is_running()
+        .then(|| std::fs::read_to_string(profile.ui_port_path()).ok())
+        .flatten()
+        .and_then(|p| p.trim().parse::<u16>().ok());
+    let base = match port {
+        Some(port) => format!("http://127.0.0.1:{port}"),
+        None => "http://127.0.0.1:<port>".to_owned(),
+    };
+    let mcp = format!("{base}/mcp");
+    let vscode = serde_json::json!({
+        "inputs": [{ "type": "promptString", "id": "proofkin-token", "description": "Proofkin integration token", "password": true }],
+        "servers": { "proofkin": { "type": "http", "url": mcp, "headers": { "Authorization": "Bearer ${input:proofkin-token}" } } },
+    });
+    println!(
+        "profile '{}': other agents can connect (MCP and A2A) with this token:\n  {token}\n\
+         MCP server:  {mcp}\n\
+         A2A agent:   {base}/.well-known/agent-card.json\n\
+         Set up a client:\n  \
+         VS Code    add to .vscode/mcp.json (VS Code asks for the token):\n             {vscode}\n  \
+         Claude     claude mcp add --transport http proofkin {mcp} --header \"Authorization: Bearer {token}\"\n  \
+         A2A        the agent card above, with headers Authorization: Bearer <token> and A2A-Version: 1.0\n\
+         They run tasks and plans on this profile's peers, never on this computer.",
+        profile.name
+    );
+    if port.is_none() {
+        println!(
+            "The agent serves them with its web UI: start it with --ui --ui-port 7420 (any fixed port), then use that port above."
+        );
+    }
+    println!(
+        "Turn it off: proofkin connect --off --profile {}",
+        profile.name
+    );
+    Ok(())
+}
+
 fn run_spec(command: SpecCommand) -> Result<()> {
-    use p2pagents::spec;
+    use proofkin::spec;
     match command {
         SpecCommand::Check { part, dir } => {
             let names = spec_checks(part.trim(), &dir)?;
@@ -1822,25 +1930,53 @@ fn run_spec(command: SpecCommand) -> Result<()> {
                 println!("created {path}");
             }
             println!(
-                "Edit them, then: p2pagents spec check --dir {}\n\
+                "Edit them, then: proofkin spec check --dir {}\n\
                  Or let peers write them: pick the 'spec' playbook in Plan mode.",
                 dir.display()
             );
+        }
+        SpecCommand::Import {
+            path,
+            set,
+            out,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let mut vars = set_vars(&set)?;
+            vars.insert("spec".into(), path.display().to_string());
+            let rendered =
+                proofkin::playbooks::render_full(proofkin::playbooks::SPEC_IMPORT, &vars)?;
+            rendered.save_knowledge(&profile.knowledge())?;
+            for note in &rendered.notes {
+                eprintln!("{note}");
+            }
+            match out {
+                Some(file) => {
+                    std::fs::write(&file, &rendered.text)
+                        .with_context(|| format!("writing {}", file.display()))?;
+                    eprintln!(
+                        "Wrote the plan to {0}. Run it with /plan {0} in the agent of profile '{1}', or paste it in the web UI's Plan mode.",
+                        file.display(),
+                        profile.name
+                    );
+                }
+                None => print!("{}", rendered.text),
+            }
         }
     }
     Ok(())
 }
 
 fn run_design(command: DesignCommand) -> Result<()> {
-    use p2pagents::{design, preview};
+    use proofkin::{design, preview};
     match command {
         DesignCommand::Init { title, dir, force } => {
             for path in design::init(&dir, &title, force)? {
                 println!("created {path}");
             }
             println!(
-                "Edit them, then: p2pagents spec check design --dir {0} (and review)\n\
-                 See the review pack: p2pagents design render --dir {0}\n\
+                "Edit them, then: proofkin spec check design --dir {0} (and review)\n\
+                 See the review pack: proofkin design render --dir {0}\n\
                  Or let peers write them: pick the 'design' playbook in Plan mode.",
                 dir.display()
             );
@@ -1850,7 +1986,7 @@ fn run_design(command: DesignCommand) -> Result<()> {
             let sources = preview::sources_from_dir(&dir);
             if preview::label(&sources) != Some("review pack") {
                 bail!(
-                    "{} has no review/ decks or design/ documents to render (p2pagents design init writes a starter)",
+                    "{} has no review/ decks or design/ documents to render (proofkin design init writes a starter)",
                     dir.display()
                 );
             }
@@ -1901,7 +2037,7 @@ fn run_skill(command: SkillCommand) -> Result<()> {
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
-            let (found, text) = p2pagents::skills::read_skill_file(&path)?;
+            let (found, text) = proofkin::skills::read_skill_file(&path)?;
             let name = rename.unwrap_or(found);
             let skills = profile.skills();
             let replaces = skills.list().into_iter().find(|s| s.name == name);
@@ -1922,7 +2058,7 @@ fn run_skill(command: SkillCommand) -> Result<()> {
 }
 
 fn run_agent_command(command: AgentCommand) -> Result<()> {
-    let uses = |a: &p2pagents::skills::AgentDef| {
+    let uses = |a: &proofkin::skills::AgentDef| {
         [("skills", &a.skills), ("MCP servers", &a.mcp)]
             .into_iter()
             .filter(|(_, v)| !v.is_empty())
@@ -1938,7 +2074,7 @@ fn run_agent_command(command: AgentCommand) -> Result<()> {
                     "no agents yet: add one with agent add FILE, or import a plugin that has some"
                 );
             }
-            let from = |a: &p2pagents::skills::AgentDef| {
+            let from = |a: &proofkin::skills::AgentDef| {
                 a.plugin
                     .as_deref()
                     .map(|p| format!("plugin {p}"))
@@ -1990,7 +2126,7 @@ fn run_agent_command(command: AgentCommand) -> Result<()> {
                 .trim_end_matches(".agent")
                 .to_owned();
             let name = rename
-                .or_else(|| p2pagents::skills::front_matter_name(&text))
+                .or_else(|| proofkin::skills::front_matter_name(&text))
                 .unwrap_or(fallback);
             let a = profile.skills().add_agent(&name, &text)?;
             println!(
@@ -2011,7 +2147,7 @@ fn run_agent_command(command: AgentCommand) -> Result<()> {
 }
 
 fn run_playbook(command: PlaybookCommand) -> Result<()> {
-    use p2pagents::playbooks;
+    use proofkin::playbooks;
     match command {
         PlaybookCommand::List => {
             for (name, description) in playbooks::list() {
@@ -2048,7 +2184,7 @@ fn run_playbook(command: PlaybookCommand) -> Result<()> {
                 println!("  - {need}");
             }
             println!(
-                "\nFill it in: p2pagents playbook show {name} --set peer=<peer> ... > {name}.plan, then /plan {name}.plan"
+                "\nFill it in: proofkin playbook show {name} --set peer=<peer> ... > {name}.plan, then /plan {name}.plan"
             );
         }
         PlaybookCommand::Show { name, set } => {
@@ -2071,7 +2207,7 @@ fn set_vars(set: &[String]) -> Result<std::collections::BTreeMap<String, String>
 }
 
 fn run_schedule(command: ScheduleCommand) -> Result<()> {
-    use p2pagents::schedule::{Schedule, ScheduleStore};
+    use proofkin::schedule::{Schedule, ScheduleStore};
     let when = |s: &Schedule| {
         s.next_run()
             .map(|t| t.format("%a %Y-%m-%d %H:%M").to_string())
@@ -2094,7 +2230,7 @@ fn run_schedule(command: ScheduleCommand) -> Result<()> {
                     file.display().to_string(),
                 ),
                 (None, Some(book)) => (
-                    p2pagents::playbooks::render(&book, &set_vars(&set)?)?,
+                    proofkin::playbooks::render(&book, &set_vars(&set)?)?,
                     format!("playbook {book}"),
                 ),
                 _ => bail!("give the plan to run: --plan FILE or --playbook NAME (with --set)"),
@@ -2143,7 +2279,7 @@ fn run_schedule(command: ScheduleCommand) -> Result<()> {
 }
 
 fn set_enabled(name: &str, profile: &str, enabled: bool) -> Result<()> {
-    use p2pagents::schedule::ScheduleStore;
+    use proofkin::schedule::ScheduleStore;
     let profile = Profile::open(profile)?;
     ScheduleStore::update(&profile.schedules_path(), |store| {
         store
@@ -2165,7 +2301,7 @@ fn set_enabled(name: &str, profile: &str, enabled: bool) -> Result<()> {
 }
 
 fn run_monitor(command: MonitorCommand) -> Result<()> {
-    use p2pagents::ops::{Monitor, MonitorStore};
+    use proofkin::ops::{Monitor, MonitorStore};
     match command {
         MonitorCommand::Add {
             name,
@@ -2221,11 +2357,11 @@ fn run_ops(command: OpsCommand) -> Result<()> {
             print!("{}", ops_report(&Profile::open(&profile.name)?, hours)?)
         }
         OpsCommand::Incidents { hours, profile } => {
-            let since = p2pagents::runs::unix_now().saturating_sub(hours * 3600);
+            let since = proofkin::runs::unix_now().saturating_sub(hours * 3600);
             for e in Profile::open(&profile.name)?.ops_store().incidents(since) {
                 println!(
                     "{}  {:<10} {:<10} {}",
-                    p2pagents::runs::utc(e.ts),
+                    proofkin::runs::utc(e.ts),
                     e.monitor,
                     format!("{:?}", e.kind).to_lowercase(),
                     e.text.lines().next().unwrap_or_default()
@@ -2237,7 +2373,7 @@ fn run_ops(command: OpsCommand) -> Result<()> {
 }
 
 fn run_runs(command: RunsCommand) -> Result<()> {
-    use p2pagents::runs::{RunRecord, utc};
+    use proofkin::runs::{RunRecord, utc};
     match command {
         RunsCommand::List { profile } => {
             let profile = Profile::open(&profile.name)?;
@@ -2316,7 +2452,7 @@ fn run_squad(command: SquadCommand) -> Result<()> {
             let trust = profile.trust()?;
             if let Some(unknown) = member.iter().find(|m| trust.get_by_name(m).is_none()) {
                 bail!(
-                    "'{unknown}' is not on profile '{}''s allowlist; add it with: p2pagents peers allow <ticket> --profile {}",
+                    "'{unknown}' is not on profile '{}''s allowlist; add it with: proofkin peers allow <ticket> --profile {}",
                     profile.name,
                     profile.name
                 );
@@ -2362,13 +2498,13 @@ fn run_share(command: ShareCommand) -> Result<()> {
         } => {
             let profile = Profile::open(&profile.name)?;
             let mut shares = profile.shares()?;
-            let checks = p2pagents::shares::parse_checks(&checks)?;
+            let checks = proofkin::shares::parse_checks(&checks)?;
             let share = shares
                 .add_with(&name, &path, access, checks, worktrees)?
                 .clone();
             shares.save(&profile.shares_path())?;
             println!(
-                "profile '{}': sharing {} as '{name}' (at most {access}){}. Grant it to a peer with: p2pagents peers allow <peer> --profile {} --delegate --share data,{name}",
+                "profile '{}': sharing {} as '{name}' (at most {access}){}. Grant it to a peer with: proofkin peers allow <peer> --profile {} --delegate --share data,{name}",
                 profile.name,
                 share.path.display(),
                 share_extras(&share),
@@ -2401,8 +2537,8 @@ fn run_share(command: ShareCommand) -> Result<()> {
 }
 
 fn run_mcp(command: McpCommand) -> Result<()> {
-    use p2pagents::mcp::{Fill, McpServer, McpTemplate, parse_config, parse_pairs, server_name};
-    use p2pagents::shares::McpOffer;
+    use proofkin::mcp::{Fill, McpServer, McpTemplate, parse_config, parse_pairs, server_name};
+    use proofkin::shares::McpOffer;
     let tools_text = |tools: &[String]| {
         if tools.is_empty() {
             "all".to_owned()
@@ -2602,7 +2738,7 @@ fn run_mcp(command: McpCommand) -> Result<()> {
 /// Fills values a server template needs, not given with --set, from environment
 /// variables of the same name.
 fn values_from_env(
-    template: &p2pagents::mcp::McpTemplate,
+    template: &proofkin::mcp::McpTemplate,
     values: &mut std::collections::BTreeMap<String, String>,
 ) {
     for input in &template.inputs {
@@ -2637,7 +2773,7 @@ fn set_mcp_paused(share: &str, name: &str, profile: &str, paused: bool) -> Resul
 }
 
 async fn run_plugin(command: PluginCommand) -> Result<()> {
-    use p2pagents::plugins::{Inspection, Source, fetch, inspect};
+    use proofkin::plugins::{Inspection, Source, fetch, inspect};
     let print_changes = |lines: &[String]| {
         for line in lines {
             println!("  {line}");
@@ -2665,7 +2801,7 @@ async fn run_plugin(command: PluginCommand) -> Result<()> {
                         for e in &plugins {
                             println!("  {:<24} {}", e.name, e.description);
                         }
-                        bail!("pick one: p2pagents plugin add {source} --plugin NAME");
+                        bail!("pick one: proofkin plugin add {source} --plugin NAME");
                     };
                     let entry = plugins
                         .iter()
@@ -2686,7 +2822,7 @@ async fn run_plugin(command: PluginCommand) -> Result<()> {
             );
             if let Some((server, _)) = installed.mcp.iter().next() {
                 println!(
-                    "Offer its MCP servers in a shared folder: p2pagents mcp add <folder> {server} --plugin {} [--set NAME=VALUE]",
+                    "Offer its MCP servers in a shared folder: proofkin mcp add <folder> {server} --plugin {} [--set NAME=VALUE]",
                     installed.name
                 );
             }
@@ -2696,7 +2832,7 @@ async fn run_plugin(command: PluginCommand) -> Result<()> {
             let plugins = profile.plugins().list()?;
             if plugins.is_empty() {
                 println!(
-                    "profile '{}' has no plugins: p2pagents plugin add <source>",
+                    "profile '{}' has no plugins: proofkin plugin add <source>",
                     profile.name
                 );
             }
@@ -2774,7 +2910,7 @@ fn set_plugin_enabled(name: &str, profile: &str, enabled: bool) -> Result<()> {
 }
 
 /// Prints what plugin `p` contains and where its MCP servers are offered.
-fn print_plugin(p: &p2pagents::plugins::Plugin, profile: &Profile) -> Result<()> {
+fn print_plugin(p: &proofkin::plugins::Plugin, profile: &Profile) -> Result<()> {
     println!(
         "{} {}({}, {})",
         p.name,
@@ -2880,7 +3016,7 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             );
             println!("  ticket:      {}", ticket.encode());
             println!(
-                "Give the ticket to peers (they run: p2pagents peers allow <ticket>). A running"
+                "Give the ticket to peers (they run: proofkin peers allow <ticket>). A running"
             );
             println!("agent prints a fuller ticket with its current addresses (/ticket).");
         }
@@ -2898,14 +3034,14 @@ fn run_peers(command: PeersCommand) -> Result<()> {
             let name = name
                 .or_else(|| Some(ticket.name.clone()).filter(|n| !n.is_empty()))
                 .context("a bare endpoint id has no name; pass --name")?;
-            p2pagents::profile::validate_name(&name).context("invalid peer name")?;
+            proofkin::profile::validate_name(&name).context("invalid peer name")?;
             if ticket.addr.id == profile.identity()?.public() {
                 bail!("that is this profile's own id");
             }
             let shared = profile.shares()?;
             if let Some(missing) = share.iter().find(|s| shared.get(s).is_none()) {
                 bail!(
-                    "profile '{}' shares no folder named '{missing}'; add it first: p2pagents share add {missing} <folder> --profile {}",
+                    "profile '{}' shares no folder named '{missing}'; add it first: proofkin share add {missing} <folder> --profile {}",
                     profile.name,
                     profile.name
                 );
@@ -3012,7 +3148,7 @@ async fn run_auth(command: AuthCommand) -> Result<()> {
             };
             if names.is_empty() {
                 println!(
-                    "no profiles yet; create one with: p2pagents auth login copilot --profile <name> --gh-user <login>"
+                    "no profiles yet; create one with: proofkin auth login copilot --profile <name> --gh-user <login>"
                 );
             }
             let tools = ProviderTools::new(&bridge.path());
@@ -3134,7 +3270,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
     let allowed = profile.trust()?.peers.len();
     if allowed == 0 {
         println!(
-            "no allowlisted peers yet: p2pagents peers allow <their-ticket> --profile {}",
+            "no allowlisted peers yet: proofkin peers allow <their-ticket> --profile {}",
             profile.name
         );
     } else {
@@ -3184,10 +3320,10 @@ async fn run_agent(args: RunArgs) -> Result<()> {
     // Digital workers this profile owns: started by this agent, which stops them
     // when it stops (a digital worker can't own workers).
     let workers = match (profile.config.owner.is_none(), std::env::current_exe()) {
-        (true, Ok(exe)) => Some(p2pagents::workers::Supervisor::new(
+        (true, Ok(exe)) => Some(proofkin::workers::Supervisor::new(
             profile.clone(),
             agent.clone(),
-            p2pagents::workers::Launch {
+            proofkin::workers::Launch {
                 exe,
                 network: args.network,
                 ip: args.listen.map(|a| a.ip()),
@@ -3206,7 +3342,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
     }
 
     if args.ui {
-        let info = p2pagents::ui::UiInfo {
+        let info = proofkin::ui::UiInfo {
             profile: profile.clone(),
             network: args.network,
             serving: args.serve,
@@ -3221,7 +3357,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         };
         let local = executor.clone().map(|e| e as Arc<dyn Executor>);
         let bind = SocketAddr::from(([127, 0, 0, 1], args.ui_port));
-        let server = p2pagents::ui::start(agent.clone(), events, info, local, bind).await?;
+        let server = proofkin::ui::start(agent.clone(), events, info, local, bind).await?;
         println!("web UI: {}", server.url);
         println!("(the link includes a private access token; press Ctrl+C to stop the agent)");
         if !args.no_open {
@@ -3348,7 +3484,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let squads = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                 if squads.squads.is_empty() {
                     println!(
-                        "no squads; create one with: p2pagents squad create <name> --member a,b --profile {}",
+                        "no squads; create one with: proofkin squad create <name> --member a,b --profile {}",
                         profile.name
                     );
                 }
@@ -3378,13 +3514,8 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 let squads_now = SquadStore::load(&profile.squads_path()).unwrap_or_default();
                 let parsed = text.and_then(|text| {
                     let plan = Plan::parse(&text)?;
-                    let problems = p2pagents::plan::preflight(
-                        &plan,
-                        &agent.peers(),
-                        &squads_now,
-                        &kb,
-                        &skills,
-                    );
+                    let problems =
+                        proofkin::plan::preflight(&plan, &agent.peers(), &squads_now, &kb, &skills);
                     for p in &problems {
                         println!(
                             "  {} {}{}",
@@ -3411,9 +3542,9 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                         let n = tasks.spawn(
                             format!("plan {file} ({} steps)", plan.steps.len()),
                             async move {
-                                let started = p2pagents::runs::unix_now();
+                                let started = proofkin::runs::unix_now();
                                 let states = run_plan(&agent, &squads, &ready, print_step).await;
-                                let mut run = p2pagents::runs::RunRecord::new(
+                                let mut run = proofkin::runs::RunRecord::new(
                                     agent.name(),
                                     &agent.id().to_string(),
                                     &text,
@@ -3421,7 +3552,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                                     &states,
                                     started,
                                 );
-                                run.peer_ids = p2pagents::runs::peer_ids(&agent);
+                                run.peer_ids = proofkin::runs::peer_ids(&agent);
                                 println!("=== plan finished: {} ===", run.verdict_line());
                                 for claim in run.claim_results() {
                                     println!(
@@ -3436,7 +3567,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                                     Err(e) => eprintln!("could not save the run: {e:#}"),
                                 }
                                 let saved =
-                                    p2pagents::plan::save_knowledge(&kb, &plan, &states, &run.id);
+                                    proofkin::plan::save_knowledge(&kb, &plan, &states, &run.id);
                                 if !saved.is_empty() {
                                     println!("  knowledge saved: {}", saved.join(", "));
                                 }
@@ -3446,7 +3577,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     }
                 }
             }
-            "/runs" => match p2pagents::runs::RunRecord::list(&profile.runs_dir()) {
+            "/runs" => match proofkin::runs::RunRecord::list(&profile.runs_dir()) {
                 Ok(runs) if runs.is_empty() => println!("no evidence runs yet"),
                 Ok(runs) => {
                     for run in runs.iter().take(10) {
@@ -3572,7 +3703,7 @@ fn pick_peer(
     agent: &Agent,
     task: &LlmTask,
     name: Option<String>,
-) -> Result<(LlmTask, p2pagents::PeerInfo)> {
+) -> Result<(LlmTask, proofkin::PeerInfo)> {
     let peer = match name {
         Some(name) => agent
             .peers()
@@ -3634,7 +3765,7 @@ impl RunningTasks {
 }
 
 /// ` [digital worker of alice: role]`-style suffix for a peer.
-fn peer_kind(peer: &p2pagents::PeerInfo) -> String {
+fn peer_kind(peer: &proofkin::PeerInfo) -> String {
     match (&peer.owner, &peer.role) {
         (Some(owner), Some(role)) => format!(" [digital worker of {owner}: {role}]"),
         (Some(owner), None) => format!(" [digital worker of {owner}]"),
@@ -3675,7 +3806,7 @@ fn print_step(id: &str, state: &StepState) {
     }
 }
 
-fn print_evidence(evidence: Option<&p2pagents::evidence::Evidence>, verified: bool) {
+fn print_evidence(evidence: Option<&proofkin::evidence::Evidence>, verified: bool) {
     if let Some(e) = evidence {
         println!(
             "  evidence: signed by {} ({}) {}",
@@ -3709,7 +3840,7 @@ mod tests {
 
     #[test]
     fn runs_verify_takes_a_folder_alone_or_an_id_with_a_profile() {
-        let parse = |args: &[&str]| Cli::try_parse_from([&["p2pagents"], args].concat()).is_ok();
+        let parse = |args: &[&str]| Cli::try_parse_from([&["proofkin"], args].concat()).is_ok();
         assert!(parse(&["runs", "verify", "--dir", "some/run"]));
         assert!(parse(&[
             "runs",

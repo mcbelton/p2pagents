@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use p2pagents::audit::{AuditEntry, AuditLog};
-use p2pagents::shares::ShareStore;
-use p2pagents::ui::{self, UiInfo};
-use p2pagents::{
+use proofkin::audit::{AuditEntry, AuditLog};
+use proofkin::shares::ShareStore;
+use proofkin::ui::{self, UiInfo};
+use proofkin::{
     Access, Agent, AgentConfig, Executor, LlmTask, Network, Profile, Provider, SecretKey,
     TaskContext, TrustedPeer,
 };
@@ -638,7 +638,7 @@ async fn ui_runs_plans_and_shows_squads() {
 
 #[tokio::test]
 async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
-    use p2pagents::ops::{IncidentEvent, IncidentKind, Monitor, MonitorStore, Sample};
+    use proofkin::ops::{IncidentEvent, IncidentKind, Monitor, MonitorStore, Sample};
     let home = tempfile::tempdir().unwrap();
     let profile = Profile::open_in(home.path(), "solo").unwrap();
     let app = tempfile::tempdir().unwrap();
@@ -678,7 +678,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             false,
         )
         .unwrap();
-    let now = p2pagents::runs::unix_now();
+    let now = proofkin::runs::unix_now();
     let store = profile.ops_store();
     for ok in [true, false] {
         store
@@ -784,6 +784,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             "spec",
             "design",
             "implement-spec",
+            "implement-speckit",
             "rehearse"
         ]
     );
@@ -934,7 +935,7 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
 async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
     let home = tempfile::tempdir().unwrap();
     let app = tempfile::tempdir().unwrap();
-    p2pagents::spec::init(app.path(), "Wishlist", false).unwrap();
+    proofkin::spec::init(app.path(), "Wishlist", false).unwrap();
     let mut shares = ShareStore::with_data(home.path().join("data"));
     shares
         .add_with(
@@ -945,7 +946,7 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
             false,
         )
         .unwrap();
-    let mut browser = p2pagents::mcp::McpServer::local("npx", vec!["@playwright/mcp".into()]);
+    let mut browser = proofkin::mcp::McpServer::local("npx", vec!["@playwright/mcp".into()]);
     browser
         .env
         .insert("API_TOKEN".into(), "mcp-secret-6620".into());
@@ -1076,7 +1077,7 @@ async fn ui_previews_prototypes_and_review_packs_in_a_sandbox_by_capability() {
 
     // With a design package, the folder previews as a review pack: decks as slide
     // shows, design documents as pages, the prototype, all in the same sandbox.
-    p2pagents::design::init(app.path(), "Wishlist", false).unwrap();
+    proofkin::design::init(app.path(), "Wishlist", false).unwrap();
     let made = request(
         port,
         "POST",
@@ -1647,6 +1648,7 @@ async fn the_page_follows_the_ux_guidelines() {
     assert!(page.contains(r#"<script src="/plan-text.js" defer>"#));
     assert!(page.contains(r#"<script src="/plan-builder.js" defer>"#));
     assert!(page.contains(r#"<script src="/workers.js" defer>"#));
+    assert!(page.contains(r#"<script src="/connect.js" defer>"#));
     for id in [
         "confirm-dialog",
         "plan-editor",
@@ -1659,6 +1661,8 @@ async fn the_page_follows_the_ux_guidelines() {
         "plan-builder",
         "worker-list",
         "worker-dialog",
+        "connect",
+        "connect-toggle",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -1691,6 +1695,7 @@ async fn the_page_follows_the_ux_guidelines() {
         "/plan-text.js",
         "/plan-builder.js",
         "/workers.js",
+        "/connect.js",
     ] {
         let js = request(port, "GET", script, &host, None, None).await;
         assert_eq!(js.status, 200, "{script}");

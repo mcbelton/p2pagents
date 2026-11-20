@@ -180,9 +180,9 @@ impl Worktree {
             &self.hooks,
             &[
                 "-c",
-                "user.name=p2pagents",
+                "user.name=proofkin",
                 "-c",
-                "user.email=p2pagents@localhost",
+                "user.email=proofkin@localhost",
                 "commit",
                 "--no-verify",
                 "-q",

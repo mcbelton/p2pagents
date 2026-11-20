@@ -5,20 +5,20 @@ each worker on its OWN Copilot instance and account, real Copilot delegation, di
 
 Needs a built binary (cargo build), internet access, and the GitHub CLI signed in to at
 least one account (`gh auth login`); with two accounts each worker uses a different one.
-Profiles live in a temporary P2PAGENTS_HOME (with their own keyring namespace) and are
+Profiles live in a temporary PROOFKIN_HOME (with their own keyring namespace) and are
 deleted afterwards, so your real profiles are untouched.
 Run: .\\scripts\\p2p.ps1 live-test
 """
-import json, os, re, shutil, subprocess, sys, tempfile, threading, time
+import json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.request
 
 # Agents print UTF-8 (e.g. check marks); keep logs readable on any console or file.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(REPO, "target", "debug", "p2pagents.exe" if os.name == "nt" else "p2pagents")
+EXE = os.path.join(REPO, "target", "debug", "proofkin.exe" if os.name == "nt" else "proofkin")
 HOME = tempfile.mkdtemp(prefix="p2p-live-home-")
 # Schedules are checked every 2 seconds (default 30) so a due one runs right away.
-ENV = {**os.environ, "P2PAGENTS_HOME": HOME, "P2PAGENTS_SCHEDULE_TICK_SECS": "2"}
+ENV = {**os.environ, "PROOFKIN_HOME": HOME, "PROOFKIN_SCHEDULE_TICK_SECS": "2"}
 MCP_LOG = os.path.join(HOME, "echo-mcp.log")
 results = []
 
@@ -82,7 +82,7 @@ def cli(*args):
 ws = tempfile.mkdtemp(prefix="p2p-live-")
 svc = None
 agents = []
-PROFILES = ("worker1", "worker2", "boss", "intruder", "helper")
+PROFILES = ("worker1", "worker2", "boss", "intruder", "helper", "editor")
 try:
     accounts = gh_accounts()
     if not accounts:
@@ -104,6 +104,9 @@ try:
         _, out = cli("peers", "id", "--profile", profile)
         ids[profile] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
     check("4 distinct endpoint ids", len(set(ids.values())) == 4)
+    # 'editor' runs a web UI that other agents (an MCP client, an A2A agent) connect to.
+    _, out = cli("peers", "id", "--profile", "editor")
+    ids["editor"] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
 
     print("== allowlists by endpoint id only (no IPs/ports: must be found over the internet)")
     def allow(profile, peer, delegate=False, access=None, shares=None):
@@ -181,6 +184,7 @@ try:
         allow("worker2", "boss", delegate=True, access="full", shares="data,code,app"), allow("worker2", "worker1"),
         allow("boss", "worker1"), allow("boss", "worker2"),
         allow("intruder", "worker1"),  # worker1 does NOT allow intruder
+        allow("worker1", "editor", delegate=True, shares="data,repo"), allow("editor", "worker1"),
     ])
     check("allowlists written", ok)
     print("== GitHub: worker1 signs in with its GitHub CLI account and links a public repository")
@@ -190,7 +194,7 @@ try:
         # A small public repository that stays public, so the check doesn't depend on this one's visibility.
         code, out = cli("repo", "link", "octocat/Hello-World", "--as", "p2pclone", "--profile", "worker1")
         print(f"  {out.strip()}")
-        clone = os.path.join(HOME, ".p2prepos", "worker1", "p2pclone")
+        clone = os.path.join(HOME, ".proofkin-repos", "worker1", "p2pclone")
         config = open(os.path.join(clone, ".git", "config")).read() if os.path.isdir(clone) else ""
         sync_code, sync_out = cli("repo", "sync", "p2pclone", "--profile", "worker1")
         print(f"  {sync_out.strip()}")
@@ -208,13 +212,13 @@ try:
     ids["helper"] = re.search(r"endpoint id: ([0-9a-f]{64})", out).group(1)
     allow("helper", "boss", delegate=True)
     allow("boss", "helper")
-    # Something worker1's owner chose to share with peers, in its .p2pdata folder.
-    data1 = os.path.join(HOME, ".p2pdata", "worker1")
+    # Something worker1's owner chose to share with peers, in its data folder (.proofkin-data).
+    data1 = os.path.join(HOME, ".proofkin-data", "worker1")
     os.makedirs(data1, exist_ok=True)
     with open(os.path.join(data1, "notes.md"), "w") as f:
         f.write("# Status\nThe weekly status token is p2pdata-token-7731.\n")
 
-    print("== start worker1 (internet, own Copilot instance; peers get its .p2pdata folder and 'repo', read-only)")
+    print("== start worker1 (internet, own Copilot instance; peers get its data folder and 'repo', read-only)")
     w1 = Agent("worker1", ["--providers", "copilot", "--serve"])
     agents.append(w1)
     check("worker1 online with a ticket", w1.wait_for(r"^ticket: p2pa1", 90))
@@ -300,12 +304,12 @@ try:
         state = os.path.join(HOME, "profiles", profile, "copilot", "session-state")
         check(f"{profile}'s Copilot instance used its own COPILOT_HOME", os.path.isdir(state) and os.listdir(state), state)
 
-    print("== shared folders: by default a peer's task runs in the worker's .p2pdata folder only")
+    print("== shared folders: by default a peer's task runs in the worker's data folder only")
     boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
     boss.send("/delegate copilot@worker1 Read notes.md in the current folder and reply with only the status token it contains.")
     boss.wait_for(r"=== copilot on worker1 ===", 300)
     time.sleep(1)
-    check("boss's task ran in worker1's .p2pdata folder", any("p2pdata-token-7731" in l for l in boss.lines[boss.cursor:]))
+    check("boss's task ran in worker1's data folder", any("p2pdata-token-7731" in l for l in boss.lines[boss.cursor:]))
     boss.send("/delegate copilot@worker1:code hi")
     check("worker1 refused a folder it did not share with boss",
           boss.wait_for(r"worker1 has not shared a folder named 'code' with boss", 60))
@@ -320,7 +324,7 @@ try:
     time.sleep(1)
     check("secret never reached boss", not any("live-outside-secret-0451" in l for l in boss.lines))
     denied = w1.wait_for(r"copilot: denied read .*outside-secret\.txt", 1)
-    print(f"  (stopped by {'the p2pagents path policy' if denied else 'the model declining before any tool call'})")
+    print(f"  (stopped by {'the proofkin path policy' if denied else 'the model declining before any tool call'})")
 
     print("== cancel: boss stops a long Copilot task running on worker1")
     boss.cursor, w1.cursor = len(boss.lines), len(w1.lines)
@@ -536,6 +540,55 @@ try:
     check("kb learn wrote the ops summary into the knowledge base", code == 0 and "## Health" in summary and "| db |" in summary)
     _, kb_list = cli("kb", "list", "--profile", "worker2")
     print("\n".join("  " + l for l in kb_list.splitlines()))
+
+    print("== other agents: an MCP client and an A2A agent hand work to worker1 through editor's agent")
+    code, out = cli("connect", "--profile", "editor")
+    token = re.search(r"^\s+(pfk_[0-9a-f]{64})\s*$", out, re.M)
+    check("connect turned on with a token and client setups",
+          code == 0 and token and "claude mcp add --transport http proofkin" in out, out)
+    token = token.group(1) if token else ""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        ui_port = s.getsockname()[1]
+    editor = Agent("editor", ["--ui", "--ui-port", str(ui_port), "--no-open"])
+    agents.append(editor)
+    editor.wait_for(r"^web UI: http://127\.0\.0\.1", 60)
+    def post(path, body, headers):
+        req = urllib.request.Request(f"http://127.0.0.1:{ui_port}{path}", data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}", **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=420) as r:
+                return json.loads(r.read())
+        except Exception as e:  # refused or no answer: the checks below fail and say so
+            print(f"  [http] {path}: {e!r}")
+            return {}
+    def mcp(tool, arguments):
+        meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments, "_meta": meta}}
+        return post("/mcp", body, {"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call", "Mcp-Name": tool}).get("result", {})
+    peers = {}
+    for _ in range(120):
+        peers = mcp("list_peers", {}).get("structuredContent", {})
+        if any(p["name"] == "worker1" and "copilot" in p["providers"] for p in peers.get("peers", [])):
+            break
+        time.sleep(1)
+    print(f"  [mcp] list_peers: {[p['name'] for p in peers.get('peers', [])]}")
+    done = mcp("delegate", {"prompt": "Reply with exactly: MCP-LIVE-OK", "peer": "worker1", "wait_seconds": 300})
+    result = done.get("structuredContent", {})
+    print(f"  [mcp] delegate: {result.get('state')} {str(result.get('output'))[:120]!r} evidence={result.get('evidence')}")
+    check("an MCP client's task ran on a peer with real Copilot, signed by it",
+          result.get("state") == "completed" and "MCP-LIVE-OK" in str(result.get("output")) and result.get("evidence") == "verified",
+          result)
+    message = {"messageId": "live-1", "role": "ROLE_USER", "parts": [{"text": "Reply with exactly: A2A-LIVE-OK"}],
+               "metadata": {"peer": "worker1"}}
+    sent = post("/a2a", {"jsonrpc": "2.0", "id": 2, "method": "SendMessage", "params": {"message": message}},
+                {"A2A-Version": "1.0"})
+    task = sent.get("result", {}).get("task", {})
+    text = " ".join(p.get("text", "") for a in task.get("artifacts", []) for p in a.get("parts", []))
+    print(f"  [a2a] SendMessage: {task.get('status', {}).get('state')} {text[:120]!r}")
+    check("an A2A agent's task ran on a peer with real Copilot",
+          task.get("status", {}).get("state") == "TASK_STATE_COMPLETED" and "A2A-LIVE-OK" in text, sent)
+    editor.stop()
 
     print("== worker2 leaves")
     w2.stop()

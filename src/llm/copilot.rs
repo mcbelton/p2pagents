@@ -295,7 +295,7 @@ impl SessionHooks for McpSpotlight {
         _ctx: HookContext,
     ) -> Option<PostToolUseOutput> {
         let tool = input.tool_name.strip_prefix("mcp-")?;
-        if std::env::var_os("P2PAGENTS_DEBUG_PERMISSIONS").is_some() {
+        if crate::profile::env_setting_os("DEBUG_PERMISSIONS").is_some() {
             eprintln!(
                 "  copilot: MCP result of {}: {}",
                 input.tool_name, input.tool_result
@@ -539,7 +539,7 @@ impl PermissionHandler for AccessPolicy {
         data: PermissionRequestData,
     ) -> PermissionResult {
         let req = Value::from(&data);
-        if std::env::var_os("P2PAGENTS_DEBUG_PERMISSIONS").is_some() {
+        if crate::profile::env_setting_os("DEBUG_PERMISSIONS").is_some() {
             eprintln!("  copilot: permission request {req}");
         }
         let reason = if data.managed_approval_required == Some(true) {
@@ -553,7 +553,7 @@ impl PermissionHandler for AccessPolicy {
             None => PermissionResult::approve_once(),
             Some(reason) => {
                 eprintln!("  copilot: denied {} ({reason})", short(&req));
-                PermissionResult::reject(Some(format!("denied by p2pagents: {reason}")))
+                PermissionResult::reject(Some(format!("denied by proofkin: {reason}")))
             }
         }
     }

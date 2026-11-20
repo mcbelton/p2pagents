@@ -11,7 +11,7 @@
 //! - **pending**: the run stopped before its steps finished.
 //!
 //! The run passes only if every claim is proven. Anyone with `run.json` can
-//! re-check every signature (`p2pagents runs verify`), without trusting the boss.
+//! re-check every signature (`proofkin runs verify`), without trusting the boss.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

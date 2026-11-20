@@ -58,7 +58,7 @@ impl Bridge {
     pub fn spawn_node(script: &Path, env: Vec<(String, OsString)>) -> Result<Self> {
         if !script.is_file() {
             return Err(anyhow!(
-                "bridge script {} not found; run `p2pagents setup` (needed for claude and codex)",
+                "bridge script {} not found; run `proofkin setup` (needed for claude and codex)",
                 script.display()
             ));
         }

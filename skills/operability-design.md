@@ -20,4 +20,4 @@ Read `design/architecture.md`, the spec's non-functional requirements and the kn
 | --- | --- | --- | --- |
 
    Alert on symptoms users feel (error budget burn, latency), not on every cause. Every alert's Action names a runbook.
-5. **Runbook**: one `###` section per alert: how to confirm, the likely causes in order, the fix for each, and how to check it worked. Write them so they can become TSGs (`p2pagents kb add`) with monitors (`p2pagents monitor add`).
+5. **Runbook**: one `###` section per alert: how to confirm, the likely causes in order, the fix for each, and how to check it worked. Write them so they can become TSGs (`proofkin kb add`) with monitors (`proofkin monitor add`).

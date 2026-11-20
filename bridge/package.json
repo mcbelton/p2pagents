@@ -1,8 +1,8 @@
 {
-  "name": "p2pagents-bridge",
+  "name": "proofkin-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Bridges p2pagents to the official Claude Agent SDK and OpenAI Codex SDK",
+  "description": "Bridges Proofkin to the official Claude Agent SDK and OpenAI Codex SDK",
   "type": "module",
   "main": "index.mjs",
   "engines": {

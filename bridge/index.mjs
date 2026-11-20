@@ -1,4 +1,4 @@
-// Bridge between p2pagents (Rust) and the official Claude Agent SDK and OpenAI Codex SDK.
+// Bridge between proofkin (Rust) and the official Claude Agent SDK and OpenAI Codex SDK.
 //
 // Protocol: one JSON object per line.
 //   stdin : {"id":1,"provider":"claude"|"codex","prompt":"...","cwd":"...","access":"read-only"|"workspace-write"|"full","model":null,
@@ -27,7 +27,7 @@ const CODEX_SANDBOX = {
 };
 
 // Same rules as src/llm/policy.rs.
-const SENSITIVE_DIRS = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".p2pagents", ".copilot"];
+const SENSITIVE_DIRS = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".proofkin", ".p2pagents", ".copilot"];
 const SENSITIVE_FILES = [
   ".env", ".envrc", ".npmrc", ".yarnrc.yml", ".pypirc", ".netrc", "_netrc", ".pgpass",
   ".git-credentials", ".htpasswd", "credentials", "credentials.json", "secrets.json",
@@ -137,7 +137,7 @@ export function toolRefusal(cwd, access, tool, input = {}, mcp = {}) {
 
 // Same list as HOME_SECRETS in src/llm/policy.rs.
 const HOME_SECRETS = [
-  ".ssh", ".aws", ".azure", ".gnupg", ".kube", ".docker", ".p2pagents", ".copilot",
+  ".ssh", ".aws", ".azure", ".gnupg", ".kube", ".docker", ".proofkin", ".p2pagents", ".copilot",
   ".config/gh", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
 ];
 
@@ -145,7 +145,7 @@ const HOME_SECRETS = [
 const mcpName = (name) => String(name).replace(/[^a-zA-Z0-9_-]/g, "_");
 
 /**
- * The server and tool of Claude tool name `mcp__<server>__<tool>`. p2pagents' server
+ * The server and tool of Claude tool name `mcp__<server>__<tool>`. Proofkin's server
  * names have no `__` and don't start or end with `_`, so the first `__` after
  * `mcp__` ends the server's name.
  */
@@ -221,8 +221,8 @@ export function claudeSandbox(access) {
   if (access !== "full") return undefined;
   const home = homedir();
   const denyRead = HOME_SECRETS.map((rel) => join(home, rel)).filter((p) => existsSync(p));
-  if (process.env.P2PAGENTS_HOME && existsSync(process.env.P2PAGENTS_HOME)) {
-    denyRead.push(process.env.P2PAGENTS_HOME);
+  for (const root of [process.env.PROOFKIN_HOME, process.env.P2PAGENTS_HOME]) {
+    if (root && existsSync(root)) denyRead.push(root);
   }
   return {
     enabled: true,
@@ -245,7 +245,7 @@ async function runClaude({ prompt, cwd, model, access, mcp }, abortController) {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
-        permissionDecisionReason: `denied by p2pagents: ${reason}`,
+        permissionDecisionReason: `denied by proofkin: ${reason}`,
       },
     };
   };
@@ -295,7 +295,7 @@ async function runCodex({ prompt, cwd, model, access, mcp }, abortController) {
   if (Object.keys(mcp ?? {}).length > 0) throw new Error("Codex tasks can't use MCP servers here");
   const { Codex } = await import("@openai/codex-sdk");
   codex ??= new Codex({
-    // Credentials live in this agent's own CODEX_HOME (set by p2pagents), never the OS keyring.
+    // Credentials live in this agent's own CODEX_HOME (set by proofkin), never the OS keyring.
     config: { cli_auth_credentials_store: "file" },
   });
   const thread = codex.startThread({
@@ -347,8 +347,8 @@ async function handle(line) {
   }
 }
 
-// Tests import this module for its policy functions and set P2PAGENTS_BRIDGE_IMPORT_ONLY.
-if (!process.env.P2PAGENTS_BRIDGE_IMPORT_ONLY) {
+// Tests import this module for its policy functions and set PROOFKIN_BRIDGE_IMPORT_ONLY.
+if (!process.env.PROOFKIN_BRIDGE_IMPORT_ONLY && !process.env.P2PAGENTS_BRIDGE_IMPORT_ONLY) {
   createInterface({ input: process.stdin }).on("line", (line) => {
     if (line.trim()) handle(line);
   });

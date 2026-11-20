@@ -1,9 +1,9 @@
 //! Folders an agent shares with its peers. Peer tasks run only inside a shared
 //! folder the owner granted to that peer; the agent's own working folder is never
 //! exposed. Every profile has a built-in read-only `data` share, its own
-//! `.p2pdata/<profile>` folder, for information the owner wants peers to see.
+//! `.proofkin-data/<profile>` folder, for information the owner wants peers to see.
 //! Other folders (e.g. a repository for coding tasks) are shared explicitly with
-//! `p2pagents share add`, each with the most access any peer's task may get there.
+//! `proofkin share add`, each with the most access any peer's task may get there.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use crate::llm::Access;
 use crate::mcp::McpServer;
 use crate::profile::validate_name;
 
-/// Name of the built-in share (the profile's `.p2pdata` folder).
+/// Name of the built-in share (the profile's `.proofkin-data` folder).
 pub const DATA_SHARE: &str = "data";
 
 /// A folder shared with peers.
@@ -174,7 +174,7 @@ impl ShareStore {
     ) -> Result<&Share> {
         validate_name(name).context("invalid share name")?;
         if name == DATA_SHARE {
-            bail!("'{DATA_SHARE}' is the built-in share (the profile's .p2pdata folder)");
+            bail!("'{DATA_SHARE}' is the built-in share (the profile's .proofkin-data folder)");
         }
         let path = std::fs::canonicalize(path)
             .with_context(|| format!("{} is not an existing folder", path.display()))?;
@@ -342,7 +342,7 @@ mod tests {
         assert!(
             worker
                 .data_folder()
-                .ends_with(Path::new(".p2pdata").join("worker"))
+                .ends_with(Path::new(".proofkin-data").join("worker"))
         );
         assert!(!worker.data_folder().starts_with(&worker.dir));
         // Providers deny tasks the profiles folder, so task worktrees live outside it.

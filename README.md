@@ -1,4 +1,6 @@
-# p2pagents
+# Proofkin
+
+**Peer-to-peer agents that prove their work.** (Code name: *Murmuration*.)
 
 Peer-to-peer agents in Rust that run and delegate LLM coding tasks **over the internet**.
 Agents connect with [iroh](https://iroh.computer) (encrypted QUIC, NAT hole punching, relay
@@ -26,9 +28,9 @@ An agent never uses the machine's global Copilot/Claude/Codex sign-in. See
 
 Prebuilt binaries for Windows (x64, ARM64), Linux (x64, ARM64) and macOS (Apple Silicon) are published as
 [GitHub releases](https://github.com/mcbelton/p2pagents/releases). Everything an agent
-needs at runtime is in the one `p2pagents` executable, except the provider CLIs below.
+needs at runtime is in the one `proofkin` executable, except the provider CLIs below.
 
-**1. Install p2pagents**
+**1. Install Proofkin**
 
 ```powershell
 # Windows (PowerShell)
@@ -40,17 +42,17 @@ irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 |
 curl -fsSL https://github.com/mcbelton/p2pagents/releases/latest/download/install.sh | sh
 ```
 
-The installer puts `p2pagents` in `%LOCALAPPDATA%\p2pagents\bin` (Windows) or
+The installer puts `proofkin` in `%LOCALAPPDATA%\proofkin\bin` (Windows) or
 `~/.local/bin`, and adds it to `PATH`; open a new terminal afterwards. You can also
 download the archive for your platform from the
-[releases page](https://github.com/mcbelton/p2pagents/releases) and put `p2pagents`
+[releases page](https://github.com/mcbelton/p2pagents/releases) and put `proofkin`
 anywhere on `PATH`. To install a specific version on Windows, download `install.ps1` and
-run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `P2PAGENTS_VERSION=v0.1.2 sh install.sh`).
+run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `PROOFKIN_VERSION=v0.1.2 sh install.sh`).
 
 > **Forks or private copies:** for a private repo, the installers download through the
 > GitHub CLI. If `gh` has several accounts, pick one with access:
 > `.\install.ps1 -Repo <owner>/<repo> -GhUser <login>` (Linux/macOS:
-> `P2PAGENTS_REPO=<owner>/<repo> P2PAGENTS_GH_USER=<login> sh install.sh`). GitHub shows
+> `PROOFKIN_REPO=<owner>/<repo> PROOFKIN_GH_USER=<login> sh install.sh`). GitHub shows
 > private repos as "not found" to accounts without access.
 
 **2. Install what your agent uses**
@@ -59,23 +61,33 @@ run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `P2PAGENTS_VERSION=v0.1.2 sh i
 | --- | --- |
 | Run Copilot tasks | Copilot CLI: `winget install GitHub.Copilot` (or `npm install -g @github/copilot`) and a GitHub account with Copilot |
 | Sign agents in to GitHub accounts easily | GitHub CLI: `winget install GitHub.cli`, then `gh auth login` per account |
-| Run Claude or Codex tasks | Node.js 18+, then `p2pagents setup` (installs the Claude Agent SDK and Codex SDK into `~/.p2pagents/bridge`; add `--registry <mirror>` if public npm is blocked) |
+| Run Claude or Codex tasks | Node.js 18+, then `proofkin setup` (installs the Claude Agent SDK and Codex SDK into `~/.proofkin/bridge`; add `--registry <mirror>` if public npm is blocked) |
 | Only delegate tasks to others | Nothing else |
 
 **3. Check, sign in, connect**
 
 ```powershell
-p2pagents doctor                                         # checks CLIs, bridge, internet relay, profiles
-p2pagents auth login copilot --profile me --gh-user <github-login>
-p2pagents peers id --profile me                          # send your ticket to your peers
-p2pagents peers allow <their-ticket> --profile me [--delegate]
-p2pagents --name me --providers copilot --serve
-p2pagents --name me --providers copilot --serve --ui     # same, in a browser UI (light/dark)
+proofkin doctor                                         # checks CLIs, bridge, internet relay, profiles
+proofkin auth login copilot --profile me --gh-user <github-login>
+proofkin peers id --profile me                          # send your ticket to your peers
+proofkin peers allow <their-ticket> --profile me [--delegate]
+proofkin --name me --providers copilot --serve
+proofkin --name me --providers copilot --serve --ui     # same, in a browser UI (light/dark)
 ```
 
 See [Internet P2P](#internet-p2p) for how peers find each other, [Web UI](#web-ui) for the browser app, and
 [Accounts and profiles](#accounts-and-profiles) for sign-in options. Building from source
 is described in the rest of this README.
+
+> **Renamed from p2pagents.** The program is now `proofkin` (the GitHub repository keeps
+> its name). Installs from before keep working as they are: while there is no
+> `~/.proofkin`, profiles stay in `~/.p2pagents`, the data, repository and worktree
+> folders keep their old names (`.p2pdata`, ...), every `P2PAGENTS_*` setting still
+> applies when its `PROOFKIN_*` name is unset, and secrets stored under `p2pagents` in the
+> OS credential store are read and copied forward, so identities (endpoint ids),
+> allowlists and sign-ins stay the same. The wire protocol is unchanged too (tickets
+> still start with `p2pa1`), so peers on either version work together. Remove the old
+> `p2pagents` executable when you like (`%LOCALAPPDATA%\p2pagents\bin` on Windows).
 
 ## Quick start (Windows, after setup)
 
@@ -100,7 +112,7 @@ finishing. Type `/quit` in each window to exit.
 `demo` signs the `worker` profile in to Copilot with your first GitHub CLI account and
 allowlists `worker` and `boss` to each other. To pick the account yourself:
 `.\scripts\p2p.ps1 agent auth login copilot --profile worker --gh-user <login>`.
-To run any p2pagents command through the script: `.\scripts\p2p.ps1 agent <args>`, e.g.
+To run any Proofkin command through the script: `.\scripts\p2p.ps1 agent <args>`, e.g.
 `.\scripts\p2p.ps1 agent auth status`.
 If PowerShell refuses to run the script, use
 `powershell -ExecutionPolicy Bypass -File .\scripts\p2p.ps1 doctor`.
@@ -193,7 +205,7 @@ gh auth login --hostname mycorp.ghe.com   # e.g. a GitHub Enterprise Cloud accou
 ```
 
 You don't need to sign in to the `copilot` CLI itself; each agent signs in its own instance
-(see [Accounts and profiles](#accounts-and-profiles)). p2pagents finds `copilot` on `PATH`;
+(see [Accounts and profiles](#accounts-and-profiles)). Proofkin finds `copilot` on `PATH`;
 set `COPILOT_CLI_PATH` to use a different binary.
 
 ### 4. Open a new terminal
@@ -220,7 +232,7 @@ npm install
 ```
 
 (From a source checkout the bridge is used in place. Installed binaries use
-`p2pagents setup` instead, which writes the same bridge to `~/.p2pagents/bridge`.)
+`proofkin setup` instead, which writes the same bridge to `~/.proofkin/bridge`.)
 
 ## Releasing
 
@@ -240,7 +252,7 @@ Each agent runs under a **profile**: `--profile <name>`, default the agent's `--
 profile is a private identity:
 
 ```text
-%USERPROFILE%\.p2pagents\profiles\<profile>\     (or $P2PAGENTS_HOME/profiles/<profile>)
+%USERPROFILE%\.proofkin\profiles\<profile>\     (or $PROOFKIN_HOME/profiles/<profile>)
   profile.json   how each provider is signed in (no secrets)
   copilot\       COPILOT_HOME for this agent's own Copilot CLI instance
   claude\        CLAUDE_CONFIG_DIR for this agent's own Claude instance (+ its login)
@@ -248,10 +260,10 @@ profile is a private identity:
 ```
 
 Tokens and API keys are stored in the OS credential store (Windows Credential Manager,
-macOS Keychain, Linux Secret Service) under `p2pagents` / `<profile>/<provider>`, next to
+macOS Keychain, Linux Secret Service) under `proofkin` / `<profile>/<provider>`, next to
 the profile's identity key (`<profile>/identity`). Where no OS credential store is
-available (headless Linux, WSL, containers), or with `P2PAGENTS_SECRET_STORE=file`, they
-are kept in owner-only files (`0600`) in `<profile>\secrets\` instead; `p2pagents doctor`
+available (headless Linux, WSL, containers), or with `PROOFKIN_SECRET_STORE=file`, they
+are kept in owner-only files (`0600`) in `<profile>\secrets\` instead; `proofkin doctor`
 shows which store is used. The allowlist is `<profile>\peers.json`.
 
 **Isolation guarantees**
@@ -273,38 +285,38 @@ shows which store is used. The allowlist is `<profile>\peers.json`.
 
 | Provider | Command | What it does |
 | --- | --- | --- |
-| `copilot` | `p2pagents auth login copilot --profile P --gh-user <login> [--host <ghe-host>]` | Uses that GitHub CLI account's token (fetched from `gh` each time the agent starts) |
-| `copilot` | `p2pagents auth login copilot --profile P --token [--host <ghe-host>]` | Prompts for a GitHub token (fine-grained PAT with *Copilot Requests*, or a `gho_` OAuth token) and stores it in the OS credential store |
-| `claude` | `p2pagents auth login claude --profile P` | Browser sign-in (`claude auth login`) into the profile's own Claude config dir |
-| `claude` | `p2pagents auth login claude --profile P --api-key` | Prompts for an Anthropic API key |
-| `claude` | `p2pagents auth login claude --profile P --token` | Prompts for a long-lived OAuth token from `claude setup-token` |
-| `codex` | `p2pagents auth login codex --profile P` | Browser sign-in (`codex login`) into the profile's own `CODEX_HOME` |
-| `codex` | `p2pagents auth login codex --profile P --api-key` | Prompts for an OpenAI API key (saved by `codex login --with-api-key`) |
+| `copilot` | `proofkin auth login copilot --profile P --gh-user <login> [--host <ghe-host>]` | Uses that GitHub CLI account's token (fetched from `gh` each time the agent starts) |
+| `copilot` | `proofkin auth login copilot --profile P --token [--host <ghe-host>]` | Prompts for a GitHub token (fine-grained PAT with *Copilot Requests*, or a `gho_` OAuth token) and stores it in the OS credential store |
+| `claude` | `proofkin auth login claude --profile P` | Browser sign-in (`claude auth login`) into the profile's own Claude config dir |
+| `claude` | `proofkin auth login claude --profile P --api-key` | Prompts for an Anthropic API key |
+| `claude` | `proofkin auth login claude --profile P --token` | Prompts for a long-lived OAuth token from `claude setup-token` |
+| `codex` | `proofkin auth login codex --profile P` | Browser sign-in (`codex login`) into the profile's own `CODEX_HOME` |
+| `codex` | `proofkin auth login codex --profile P --api-key` | Prompts for an OpenAI API key (saved by `codex login --with-api-key`) |
 
 Secrets are read from a hidden prompt, or from stdin when piped. Every login is verified
 right away; if verification fails, that provider is signed out again.
 
 ```powershell
-p2pagents auth status                    # every profile: which account each provider uses
-p2pagents auth status --profile worker1
-p2pagents auth logout codex --profile worker1
+proofkin auth status                    # every profile: which account each provider uses
+proofkin auth status --profile worker1
+proofkin auth logout codex --profile worker1
 ```
 
 ### Example: two workers on two accounts
 
 ```powershell
-p2pagents auth login copilot --profile worker1 --gh-user alice
-p2pagents auth login copilot --profile worker2 --gh-user alice-corp --host mycorp.ghe.com
-p2pagents auth login claude  --profile worker2 --api-key
+proofkin auth login copilot --profile worker1 --gh-user alice
+proofkin auth login copilot --profile worker2 --gh-user alice-corp --host mycorp.ghe.com
+proofkin auth login claude  --profile worker2 --api-key
 # allowlist them to each other (see Internet P2P), then:
-p2pagents --name worker1 --providers copilot --serve
-p2pagents --name worker2 --providers copilot,claude --serve
+proofkin --name worker1 --providers copilot --serve
+proofkin --name worker2 --providers copilot,claude --serve
 ```
 
 Several agents can share one identity by passing the same `--profile`. Each still runs its
 own provider processes.
 
-`p2pagents profile delete --profile P` removes a profile: its identity key, stored
+`proofkin profile delete --profile P` removes a profile: its identity key, stored
 credentials, allowlist and provider sign-ins (not while an agent runs with it; a profile
 runs in one agent at a time).
 
@@ -314,11 +326,11 @@ A **digital worker** is an autonomous agent with no identity of its own: it work
 accounts of the person (profile) who created it, its **owner**.
 
 ```powershell
-p2pagents worker create tester --owner alice --role "test engineer for the parser" `
+proofkin worker create tester --owner alice --role "test engineer for the parser" `
     --providers copilot --folder app --start-with-owner   # alice's agent runs it
-p2pagents --name tester --providers copilot --serve     # or run it yourself, on alice's Copilot sign-in
-p2pagents worker list --owner alice
-p2pagents worker remove tester                           # delete it
+proofkin --name tester --providers copilot --serve     # or run it yourself, on alice's Copilot sign-in
+proofkin worker list --owner alice
+proofkin worker remove tester                           # delete it
 ```
 
 In alice's [web UI](#web-ui), **Digital workers** does the same: **New worker** names it,
@@ -374,23 +386,23 @@ Agents connect with [iroh](https://iroh.computer):
 
 ```powershell
 # Alice (machine A), runs a worker that serves Copilot
-p2pagents auth login copilot --profile alice --gh-user alice
-p2pagents peers id --profile alice          # prints alice's endpoint id + ticket; send it to Bob
+proofkin auth login copilot --profile alice --gh-user alice
+proofkin peers id --profile alice          # prints alice's endpoint id + ticket; send it to Bob
 
 # Bob (machine B, anywhere on the internet)
-p2pagents peers id --profile bob            # send bob's ticket to Alice
-p2pagents peers allow <alice-ticket> --profile bob
+proofkin peers id --profile bob            # send bob's ticket to Alice
+proofkin peers allow <alice-ticket> --profile bob
 
 # Alice allowlists Bob and lets him delegate up to 10 tasks per hour
-p2pagents peers allow <bob-ticket> --profile alice --delegate --tasks-per-hour 10
+proofkin peers allow <bob-ticket> --profile alice --delegate --tasks-per-hour 10
 
 # start both; they find each other by key, no IPs or --peer needed
-p2pagents --name alice --providers copilot --serve        # machine A
-p2pagents --name bob                                      # machine B
+proofkin --name alice --providers copilot --serve        # machine A
+proofkin --name bob                                      # machine B
 ```
 
 Then on Bob's agent: `/delegate copilot@alice <prompt>`. It runs in Alice's shared
-`.p2pdata` folder, read-only; see [Shared folders](#shared-folders) to share a repository.
+`.proofkin-data` folder, read-only; see [Shared folders](#shared-folders) to share a repository.
 
 A ticket (`p2pa1...`) contains the endpoint id, a suggested name and known addresses. A
 bare endpoint id works too (add `--name`). A running agent prints its ticket at startup and
@@ -398,11 +410,11 @@ with `/ticket`.
 
 | Peers command | Description |
 | --- | --- |
-| `p2pagents peers id --profile P` | Show P's endpoint id and ticket |
-| `p2pagents peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
-| `p2pagents share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
-| `p2pagents peers list --profile P` | List allowlisted peers and their rights |
-| `p2pagents peers remove <name-or-id> --profile P` | Remove a peer |
+| `proofkin peers id --profile P` | Show P's endpoint id and ticket |
+| `proofkin peers allow <ticket-or-id> --profile P [--name N] [--delegate [--access LEVEL] [--share data,FOLDER]] [--tasks-per-hour N]` | Allowlist a peer (re-run to change its rights) |
+| `proofkin share add <name> <folder> --profile P [--access LEVEL] [--worktrees] [--check NAME=COMMAND ...]`, `share list`, `share remove <name>` | Folders peers' tasks may use ([Shared folders](#shared-folders)), with optional per-task git worktrees and checks ([EDD with agents](#evidence-driven-development-with-agents)) |
+| `proofkin peers list --profile P` | List allowlisted peers and their rights |
+| `proofkin peers remove <name-or-id> --profile P` | Remove a peer |
 
 **LAN or VPN without internet services:** `--network local --listen <IP:PORT>` uses direct
 IP connections only (no relays, no DNS lookup); exchange tickets from running agents
@@ -497,7 +509,7 @@ got, outcome (`done`, `failed`, `cancelled`, `refused`), duration and any error.
 stored, only its SHA-256 and length, so the log holds no peer content.
 
 ```text
-> p2pagents audit --profile worker
+> proofkin audit --profile worker
 time (UTC)           peer            task provider access           outcome   seconds  prompt
 2026-11-15 18:39:55  boss               1 copilot  read-only        done          7.0  43 chars, sha256 7a9139bee1be
 ```
@@ -522,9 +534,9 @@ A boss (a person, or itself a digital worker) groups peers into **squads** and r
 order, in parallel where possible.
 
 ```powershell
-p2pagents squad create qa --member alice,tester --profile boss
-p2pagents squad list --profile boss
-p2pagents squad remove qa --profile boss
+proofkin squad create qa --member alice,tester --profile boss
+proofkin squad list --profile boss
+proofkin squad remove qa --profile boss
 ```
 
 A plan is a text file with one step per line (`//` starts a comment):
@@ -557,10 +569,10 @@ weekday-morning review of what changed, an hourly end-to-end check through a pee
 run is an ordinary [evidence run](#evidence-driven-development-with-agents).
 
 ```powershell
-p2pagents schedule add nightly-learn --when "daily 02:00" --playbook learn --set peer=alice --profile boss
-p2pagents schedule add smoke --when "every 1h" --plan smoke.plan --profile boss
-p2pagents schedule list --profile boss          # next run and the last verdict
-p2pagents schedule pause smoke --profile boss   # resume / remove
+proofkin schedule add nightly-learn --when "daily 02:00" --playbook learn --set peer=alice --profile boss
+proofkin schedule add smoke --when "every 1h" --plan smoke.plan --profile boss
+proofkin schedule list --profile boss          # next run and the last verdict
+proofkin schedule pause smoke --profile boss   # resume / remove
 ```
 
 | `--when` (local time) | Runs |
@@ -599,9 +611,9 @@ teammate's sign-off, each signed with the key of the agent that produced it.
 linters. Peers see only the check names, never the commands.
 
 ```powershell
-p2pagents share add app D:\src\app --access full --worktrees `
+proofkin share add app D:\src\app --access full --worktrees `
   --check test="cargo test --locked" --check lint="cargo clippy --all-targets -- -D warnings" --profile alice
-p2pagents peers allow <boss-ticket> --profile alice --delegate --access full --share data,app
+proofkin peers allow <boss-ticket> --profile alice --delegate --access full --share data,app
 ```
 
 **2. The boss writes a plan with claims.**
@@ -641,7 +653,7 @@ option that takes a list adds to it: `skill=adr skill=api-contract` is
   (credentials, git and editor config, agent settings).
 - **Worktrees** (`share add --worktrees`, for a git repository): each editing task runs on
   its own branch `p2p/<peer>/<task>-<time>` in its own worktree under
-  `~/.p2pworktrees/<profile>`, with git hooks disabled. The work is committed there and
+  `~/.proofkin-worktrees/<profile>`, with git hooks disabled. The work is committed there and
   returned as a patch whose hash is signed. Your checkout is never touched and parallel
   tasks never collide. Review or merge the branch (`git log p2p/boss/...`) when you're
   happy. Removed worktrees keep their branch.
@@ -663,10 +675,10 @@ A run **passes** only if every claim is proven. Runs are saved in the boss's pro
 `runs/<id>/`: `run.json`, a Markdown `report.md`, and `<step>.patch` for each commit.
 
 ```powershell
-p2pagents runs list --profile boss
-p2pagents runs show <id> --profile boss       # the report
-p2pagents runs verify <id> --profile boss     # re-check every signature and patch hash
-p2pagents runs verify --dir \\share\runs\<id> # ... from a run folder anyone sent you
+proofkin runs list --profile boss
+proofkin runs show <id> --profile boss       # the report
+proofkin runs verify <id> --profile boss     # re-check every signature and patch hash
+proofkin runs verify --dir \\share\runs\<id> # ... from a run folder anyone sent you
 ```
 
 Share a run folder with your team as the evidence for a change. `runs verify` doesn't take
@@ -693,13 +705,13 @@ cancellation everything it started is killed.
 **Playbooks** are ready-made plans for each stage. Fill one in, review it and run it:
 
 ```powershell
-p2pagents playbook list
-p2pagents playbook show bootstrap --set peer=alice --set project=Shop > bootstrap.plan  # fresh project
-p2pagents playbook show discover  --set peer=alice --set folder=repo > discover.plan   # existing project
-p2pagents playbook show sdlc --set peer=alice --set change="Add CSV export" --set change_id=csv > csv.plan
-p2pagents playbook show learn --set peer=alice > learn.plan                           # learn from operations
-p2pagents playbook show spec --set peer=alice --set change="Wishlist" --set change_id=wish > wish.plan  # spec first
-p2pagents playbook show design --set peer=alice --set change="Wishlist" --set change_id=wish > design.plan  # then design and reviews
+proofkin playbook list
+proofkin playbook show bootstrap --set peer=alice --set project=Shop > bootstrap.plan  # fresh project
+proofkin playbook show discover  --set peer=alice --set folder=repo > discover.plan   # existing project
+proofkin playbook show sdlc --set peer=alice --set change="Add CSV export" --set change_id=csv > csv.plan
+proofkin playbook show learn --set peer=alice > learn.plan                           # learn from operations
+proofkin playbook show spec --set peer=alice --set change="Wishlist" --set change_id=wish > wish.plan  # spec first
+proofkin playbook show design --set peer=alice --set change="Wishlist" --set change_id=wish > design.plan  # then design and reviews
 ```
 
 In the web UI: **Plan** mode, **Start from a playbook…**: each playbook with what it is
@@ -715,6 +727,7 @@ where, and the plan is filled in and checked.
 | `spec` | Spec-driven: a feature's spec (user stories, testable acceptance criteria, security and privacy), its REST API contract with examples, a clickable UX prototype and a claim per criterion. Each is proven by built-in checks, then the product owner (who clicks through the prototype) and the tech lead accept it. See [Spec-driven development](#spec-driven-development) |
 | `design` | The SDLC design of an accepted spec: architecture with context, component, UML and workflow diagrams, ADRs, data dictionary and data flows, threat model, test and operations plans, then a review pack with a deck per audience and a customer feedback document. Each is proven by built-in checks, then the tech lead, security and privacy champions, product owner and leadership review it. See [Design and reviews](#design-and-reviews) |
 | `implement-spec` | The accepted spec (and design) built as specified, with a test proving each acceptance criterion (`test`, `lint`, `spec:api`, `spec:trace`), verified by a reviewer squad, then signed off |
+| `implement-speckit` | A Spec Kit feature or OpenSpec change built as specified: a claim per user story, requirement and success criterion, a test per claim (`test`), verified by a reviewer squad, then signed off ([Spec Kit and OpenSpec](#spec-kit-and-openspec)) |
 | `rehearse` | The feature's reviews rehearsed before they happen: agents play the tech lead, security and privacy champions, product owner, leadership and a customer in parallel, then a synthesis (`review:rehearsal`) of actions and prepared answers, and your decision. See [Rehearse the reviews first](#rehearse-the-reviews-first) |
 
 Checks the playbooks name (`build`, `test`, `lint`, `secscan`, `licenses`, `secrets`) are
@@ -740,10 +753,10 @@ put in the step's prompt, so every peer and provider works the same way. Built-i
 Add your team's own, or replace a built-in one with the same name:
 
 ```powershell
-p2pagents skill list --profile boss
-p2pagents skill show security-review --profile boss
-p2pagents skill add security-review .\our-security-checklist.md --profile boss   # front matter: name, description
-p2pagents skill import .\skills\release-notes --profile boss                      # a SKILL.md or its folder; named by its front matter
+proofkin skill list --profile boss
+proofkin skill show security-review --profile boss
+proofkin skill add security-review .\our-security-checklist.md --profile boss   # front matter: name, description
+proofkin skill import .\skills\release-notes --profile boss                      # a SKILL.md or its folder; named by its front matter
 ```
 
 In the web UI, **Plugins & tools › Skills** adds a skill (pasted, or loaded from a
@@ -767,10 +780,10 @@ Report each finding with its file, line, severity and the fix.
 ```
 
 ```powershell
-p2pagents agent add .\sec-reviewer.agent.md --profile boss   # named by its front matter (or --as NAME); - reads stdin
-p2pagents agent list --profile boss                          # yours, then your plugins'
-p2pagents agent show sec-reviewer --profile boss
-p2pagents agent remove sec-reviewer --profile boss
+proofkin agent add .\sec-reviewer.agent.md --profile boss   # named by its front matter (or --as NAME); - reads stdin
+proofkin agent list --profile boss                          # yours, then your plugins'
+proofkin agent show sec-reviewer --profile boss
+proofkin agent remove sec-reviewer --profile boss
 ```
 
 - A step `review @alice:app agent=sec-reviewer Review the diff` gets the agent's
@@ -801,19 +814,19 @@ connected. A plan with errors is not started, and every reason is listed. The we
 checks plans as you type and shows the problems under the editor.
 
 **GitHub repositories.** Sign a profile in with one of your GitHub CLI accounts, then link
-repositories. Each is cloned with that account into `~/.p2prepos/<profile>/<name>` and
+repositories. Each is cloned with that account into `~/.proofkin-repos/<profile>/<name>` and
 shared as a folder with a worktree per task. The token is fetched from `gh` when needed.
 It reaches git only as an HTTP header in the environment: never on a command line or in
 the clone's config.
 
 ```powershell
 gh auth login                                           # once, if you haven't
-p2pagents github login --gh-user alice --profile alice  # github status / logout
-p2pagents repo link acme/shop --access full --check test="npm test" --check lint="npm run lint" --profile alice
-p2pagents peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
-p2pagents repo sync shop --profile alice                # fetch + fast-forward
-p2pagents repo branches shop --profile alice            # p2p/... branches agents' tasks committed
-p2pagents repo pr shop p2p/boss/12-1794781234 --title "Add CSV export" --profile alice
+proofkin github login --gh-user alice --profile alice  # github status / logout
+proofkin repo link acme/shop --access full --check test="npm test" --check lint="npm run lint" --profile alice
+proofkin peers allow <boss-ticket> --profile alice --delegate --access full --share data,shop
+proofkin repo sync shop --profile alice                # fetch + fast-forward
+proofkin repo branches shop --profile alice            # p2p/... branches agents' tasks committed
+proofkin repo pr shop p2p/boss/12-1794781234 --title "Add CSV export" --profile alice
 ```
 
 `repo pr` pushes the task branch (only `p2p/...` branches) and opens a pull request into
@@ -831,16 +844,16 @@ branch. Digital workers use their owner's GitHub account.
 So reverse-engineered architecture, risks, designs and insights build up across runs.
 
 ```powershell
-p2pagents kb list | show <topic> | add <topic> <file.md> | remove <topic> | search <words> --profile boss
+proofkin kb list | show <topic> | add <topic> <file.md> | remove <topic> | search <words> --profile boss
 ```
 
 **Operations.** On the machine where a service runs, its owner adds monitors. A monitor
 runs one of the folder's checks on a schedule, while that profile's agent runs:
 
 ```powershell
-p2pagents share add svc D:\svc --access full --check health="curl -fsS http://localhost:8080/health" `
+proofkin share add svc D:\svc --access full --check health="curl -fsS http://localhost:8080/health" `
   --check restart="pwsh -File restart.ps1" --profile alice
-p2pagents monitor add api --share svc --check health --every 60 --fail-after 3 --slo 99.5 --profile alice
+proofkin monitor add api --share svc --check health --every 60 --fail-after 3 --slo 99.5 --profile alice
 ```
 
 - Every run is a **metric** (ok, latency, exit code) in the profile's `ops/metrics.jsonl`.
@@ -851,7 +864,7 @@ p2pagents monitor add api --share svc --check health --every 60 --fail-after 3 -
   agent restarts, so the same failure never alerts or runs the debugging agent twice.
 - A monitor whose folder or check no longer exists **can't run**: it is skipped (no
   samples, no incidents) and the report and **Health** panel say what to fix, or to
-  `p2pagents monitor remove` it. Monitors use the folder's checks as they are now.
+  `proofkin monitor remove` it. Monitors use the folder's checks as they are now.
 - **Auto-fix with TSGs.** A troubleshooting guide is a knowledge topic with front matter
   (`tsg`, `monitor`, `match`, `fix`, `verify`, `status`). The fix check of every active
   guide whose monitor matches, and whose `match` text appears in the failure, is run, then
@@ -867,9 +880,9 @@ p2pagents monitor add api --share svc --check health --every 60 --fail-after 3 -
   else.
 
 ```powershell
-p2pagents ops report --hours 24 --profile alice    # availability vs SLO, p50/p95, incidents, tasks, runs
-p2pagents ops incidents --profile alice
-p2pagents kb learn --profile alice                 # ops report -> knowledge topic ops-summary
+proofkin ops report --hours 24 --profile alice    # availability vs SLO, p50/p95, incidents, tasks, runs
+proofkin ops incidents --profile alice
+proofkin kb learn --profile alice                 # ops report -> knowledge topic ops-summary
 ```
 
 **Learning.** Agents with monitors refresh `ops-summary` in the knowledge base every hour.
@@ -881,7 +894,7 @@ monitors against their SLOs, open incidents, the incident log and task statistic
 ### Spec-driven development
 
 Write down and agree on what to build before anyone builds it: a **spec**, a **REST API
-contract** and a clickable **UX prototype**, each checked by p2pagents and accepted by
+contract** and a clickable **UX prototype**, each checked by Proofkin and accepted by
 people. Development then starts from evidence, with one claim per acceptance criterion.
 
 A **spec package** lives in the project folder:
@@ -896,8 +909,8 @@ A **spec package** lives in the project folder:
 Start from a working example, edit it, and check it as you go:
 
 ```powershell
-p2pagents spec init "Wishlist" --dir D:\src\shop    # a starter package that passes every check
-p2pagents spec check --dir D:\src\shop              # or: spec check api|spec|ux|trace
+proofkin spec init "Wishlist" --dir D:\src\shop    # a starter package that passes every check
+proofkin spec check --dir D:\src\shop              # or: spec check api|spec|ux|trace
 ```
 
 Or let agents write it. The `spec` playbook runs four steps on a peer, each in the
@@ -931,12 +944,45 @@ accepts the spec and prototype, and the tech lead accepts the API contract.
   someone signs off.
 
 ```powershell
-p2pagents share add shop D:\src\shop --access full --worktrees --check test="npm test" --check lint="npm run lint" --profile alice
-p2pagents playbook explain spec
-p2pagents playbook show spec --set peer=alice --set folder=shop --set change="Shoppers save items to a wishlist" `
+proofkin share add shop D:\src\shop --access full --worktrees --check test="npm test" --check lint="npm run lint" --profile alice
+proofkin playbook explain spec
+proofkin playbook show spec --set peer=alice --set folder=shop --set change="Shoppers save items to a wishlist" `
   --set change_id=wish --set product_owner=carol --set tech_lead=me > wish.plan
-p2pagents playbook show implement-spec --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > build.plan
+proofkin playbook show implement-spec --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > build.plan
 ```
+
+### Spec Kit and OpenSpec
+
+Already writing specs with [Spec Kit](https://github.com/github/spec-kit) or
+[OpenSpec](https://github.com/Fission-AI/OpenSpec)? Import a feature as an evidence plan:
+its requirements become the plan's claims, and peers implement it with a test per claim.
+
+| You give | Claims (proven by the folder's tests) | Signed off |
+| --- | --- | --- |
+| A Spec Kit feature, `specs/NNN-name/` (`spec.md`, `plan.md`, `tasks.md`; the project's `.specify/memory/constitution.md`) | `US-1`... per user story (*each of its acceptance scenarios passes*), `FR-001`... per functional requirement | `SC-001`... per success criterion |
+| An OpenSpec change, `openspec/changes/<id>/` (`proposal.md`, `tasks.md`, `design.md`, deltas in `specs/<capability>/spec.md`) | `<capability>-1`... per ADDED or MODIFIED requirement (REMOVED and RENAMED ones become instructions) | `ACCEPT`: it does what the proposal says |
+| An OpenSpec capability, `openspec/specs/<capability>/` | `<capability>-1`... per requirement | `ACCEPT` |
+
+The plan has three steps: **impl** on the peer you pick (`implement-change` skill, the
+folder's `test` check, up to 3 attempts, the tasks done in order and ticked off),
+**verify** by a reviewer squad on its own copy of the commit, and **signoff** of what
+tests can't prove. The spec itself (condensed to fit a prompt, the constitution included)
+is saved as knowledge topic `spec-<feature>` (or `openspec-<change>`) and given to both
+model steps, so peers need no copy of it. Open questions (`[NEEDS CLARIFICATION]`), a
+missing `plan.md` or `tasks.md`, and stories without acceptance scenarios are flagged as
+warnings at the top of the plan. Only regular files inside the feature's folder (and the
+project's `.specify`) are read, at most 1 MB each: links out of it, devices and pipes are
+refused, since what is imported goes to peers.
+
+```powershell
+proofkin spec import D:\src\shop\specs\001-photo-albums --profile boss --set peer=alice --set reviewers=qa > albums.plan
+proofkin spec import D:\src\shop --profile boss --set peer=alice     # a project with one feature (or it lists them)
+proofkin spec import ~/shop/openspec/changes/add-dark-mode --profile boss --set peer=alice --out dark.plan
+```
+
+In the web UI, pick the **implement-speckit** playbook in Plan mode and give the feature's
+folder; for a folder with several features it offers them to pick from. Other agents can
+import too, with the `import_spec` MCP tool ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
 
 ### Design and reviews
 
@@ -971,12 +1017,12 @@ slides separated by `---`, speaker notes in `<!-- -->` comments.
 Start from a working example, or let agents write it:
 
 ```powershell
-p2pagents spec init "Wishlist" --dir D:\src\shop
-p2pagents design init "Wishlist" --dir D:\src\shop     # design/ and review/ starters that pass every check
-p2pagents spec check design --dir D:\src\shop          # or: spec check (everything present), threats, review
-p2pagents design render --dir D:\src\shop              # review/html/index.html: decks as slide shows, documents as pages
+proofkin spec init "Wishlist" --dir D:\src\shop
+proofkin design init "Wishlist" --dir D:\src\shop     # design/ and review/ starters that pass every check
+proofkin spec check design --dir D:\src\shop          # or: spec check (everything present), threats, review
+proofkin design render --dir D:\src\shop              # review/html/index.html: decks as slide shows, documents as pages
 npx @marp-team/marp-cli D:\src\shop\review\leadership.md --pptx   # a PowerPoint, if your reviewers want one
-p2pagents playbook show design --set peer=alice --set folder=shop --set change="Wishlist" --set change_id=wish `
+proofkin playbook show design --set peer=alice --set folder=shop --set change="Wishlist" --set change_id=wish `
   --set tech_lead=bob --set security_champion=sam --set privacy_approver=pat --set product_owner=carol --set leader=lee > design.plan
 ```
 
@@ -1034,7 +1080,7 @@ The built-in check `review:rehearsal` proves the rehearsal is usable:
 `spec check` runs it once a rehearsal exists, and `design init` includes an example.
 
 ```powershell
-p2pagents playbook show rehearse --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > rehearse.plan
+proofkin playbook show rehearse --set peer=alice --set folder=shop --set change="Wishlist" --set reviewers=qa > rehearse.plan
 ```
 
 ### Options
@@ -1050,26 +1096,27 @@ p2pagents playbook show rehearse --set peer=alice --set folder=shop --set change
 | `--serve` | off | Run tasks that allowlisted peers with delegation rights send |
 | `--workspace <DIR>` | `.` | Folder **your own** tasks (`/ask`, *This agent* in the UI) work in. Never given to peers |
 | `--access <MODE>` | `read-only` | Most your own tasks may do there: `read-only`, `workspace-write` (edit files) or `full` (also shell). Peers' access is set per peer and folder ([Shared folders](#shared-folders)) |
-| `--bridge <PATH>` | `bridge/index.mjs` in this repo (env `P2PAGENTS_BRIDGE`) | Node bridge script |
+| `--bridge <PATH>` | `bridge/index.mjs` in this repo (env `PROOFKIN_BRIDGE`) | Node bridge script |
 | `--ui` | off | Open the [web UI](#web-ui) instead of the terminal prompt |
 | `--ui-port <PORT>` | random | Port for the web UI on 127.0.0.1 (needs `--ui`) |
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
-Subcommands: `p2pagents auth login|status|logout`, `p2pagents peers id|allow|list|remove`,
-`p2pagents share add|list|remove`, `p2pagents mcp add|import|list|pause|resume|remove`,
-`p2pagents plugin add|list|show|update|enable|disable|remove`, `p2pagents worker create|list|remove`,
-`p2pagents squad create|list|remove`, `p2pagents runs list|show|verify`, `p2pagents kb list|show|add|remove|search|learn`,
-`p2pagents playbook list|explain|show`, `p2pagents schedule add|list|pause|resume|remove`, `p2pagents skill list|show|add|import|remove`, `p2pagents agent list|show|add|remove`, `p2pagents github login|status|logout`,
-`p2pagents repo link|list|sync|branches|pr|unlink`, `p2pagents monitor add|list|remove`, `p2pagents ops report|incidents`, `p2pagents audit`, `p2pagents profile delete`. `P2PAGENTS_HOME` moves the profiles folder
-(and uses a separate credential store namespace). `P2PAGENTS_SCHEDULE_TICK_SECS` sets how
-often an agent looks for due schedules (default 30).
+Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|remove`,
+`proofkin share add|list|remove`, `proofkin mcp add|import|list|pause|resume|remove`,
+`proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
+`proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
+`proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|status|logout`,
+`proofkin repo link|list|sync|branches|pr|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
+(and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
+often an agent looks for due schedules (default 30). Each setting also works under its
+name from before the rename (`P2PAGENTS_HOME`, ...).
 
 ## Web UI
 
 Add `--ui` to any agent to drive it from a browser instead of the terminal prompt:
 
 ```powershell
-p2pagents --name me --providers copilot --serve --ui
+proofkin --name me --providers copilot --serve --ui
 # web UI: http://127.0.0.1:53817/#t=3f9c…   (opens in your default browser)
 ```
 
@@ -1121,6 +1168,10 @@ p2pagents --name me --providers copilot --serve --ui
   [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks) in your shared
   folders (by hand, from an MCP configuration file or from a plugin), and add or remove
   your own skills and agents.
+- **Connect other agents**: let agents on this computer (VS Code, Claude Code, any MCP or
+  A2A client) hand work to your peers: turn it on or off, copy the addresses and ready-made
+  client setups, show or replace the token ([Connect other agents](#connect-other-agents-mcp-and-a2a)).
+  Their tasks show up under **Tasks**, marked *asked by another agent*.
 - **Squads**: create, view (members, who is online, running tasks) and remove squads.
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
@@ -1147,6 +1198,63 @@ Pages are served with a strict Content-Security-Policy and all peer text is rend
 text, never HTML. Restarting the agent invalidates old links; use the new link it prints.
 Press Ctrl+C in the terminal to stop the agent.
 
+## Connect other agents (MCP and A2A)
+
+Other agents on your computer can hand work to your peers too: your editor's agent (VS
+Code, Claude Code, any MCP client) or any A2A agent. They delegate tasks and run evidence
+plans like you do in the web UI, and their work shows up under **Tasks** (marked *asked by
+another agent*). They never run anything on your computer: work goes to connected peers,
+whose results come back signed.
+
+Turn it on in the web UI (**Connect other agents**, **Turn on**), or:
+
+```powershell
+proofkin connect --profile boss          # turns it on; prints the token and how to set up clients
+proofkin connect --profile boss --new    # a new token (the old one stops working)
+proofkin connect --profile boss --off
+```
+
+The running agent serves both with its web UI, so start it with `--ui` and a fixed
+`--ui-port` to keep the address:
+
+```powershell
+proofkin --name boss --ui --ui-port 7420
+```
+
+| Client | Setup |
+| --- | --- |
+| VS Code | `.vscode/mcp.json`: `{"servers": {"proofkin": {"type": "http", "url": "http://127.0.0.1:7420/mcp", "headers": {"Authorization": "Bearer ${input:proofkin-token}"}}}, "inputs": [{"type": "promptString", "id": "proofkin-token", "password": true, "description": "Proofkin integration token"}]}` (VS Code asks for the token) |
+| Claude Code | `claude mcp add --transport http proofkin http://127.0.0.1:7420/mcp --header "Authorization: Bearer <token>"` |
+| Any MCP client | Streamable HTTP at `http://127.0.0.1:7420/mcp`, header `Authorization: Bearer <token>` |
+| A2A agents | Agent card at `http://127.0.0.1:7420/.well-known/agent-card.json`; headers `Authorization: Bearer <token>` and `A2A-Version: 1.0` |
+
+**MCP tools:** `list_peers` (who can take work: providers, shared folders and their
+checks, squads), `delegate` (a task on a peer, in a folder it shares), `get_task` (waits for
+the result, up to `wait_seconds`), `cancel_task`, `check_plan`, `run_plan` (an evidence
+plan), `get_run` (its evidence report) and `import_spec` ([Spec Kit and
+OpenSpec](#spec-kit-and-openspec)). The server speaks the stateless 2026-07-28 revision (the
+version in each request's `_meta`, which the `MCP-Protocol-Version`, `Mcp-Method` and
+`Mcp-Name` headers must match; `server/discover`) and the `initialize`-based revisions
+2025-03-26 to 2025-11-25. It keeps no sessions, so `GET /mcp` answers 405.
+
+**A2A 1.0:** `SendMessage` with the work as text (a plan if it parses as one, else a task
+for a peer; say where in the message's `metadata` or a data part: `peer`, `folder`,
+`provider`, `mcp`, and `kind` to force `task` or `plan`). It waits for the result unless
+`configuration.returnImmediately` is set; the task's artifacts are the peer's output, each
+step's output and the evidence verdict. `GetTask`, `ListTasks` and `CancelTask` work on the
+tasks other agents started. Streaming and push notifications aren't offered (use
+`GetTask`); work that can't start (an unknown peer, a plan with problems) comes back as a
+`TASK_STATE_REJECTED` task saying why.
+
+**Security.** The token is per profile, kept in the profile's secret store, and works only
+for `/mcp` and `/a2a`; the web UI's own token doesn't work there, and the integration token
+doesn't work for the web UI's API. Requests from web pages of other sites (an `Origin`
+header) are refused, as are other `Host`s (DNS rebinding). The server listens on
+127.0.0.1 only. Turning it off, or a new token, takes effect within seconds, also when done
+with `proofkin connect` while the agent runs. Agents with the token act with your peers'
+trust in you: give it only to agents you would let delegate in your name. Digital workers
+can't be connected to; they take work from their owner only.
+
 ## Security model
 
 - Connections are encrypted and authenticated (QUIC/TLS with each agent's ed25519 key).
@@ -1155,7 +1263,7 @@ Press Ctrl+C in the terminal to stop the agent.
   from peers allowlisted with `--delegate`, within their hourly limit, and at most 2 at a
   time (others queue).
 - Peers' tasks run **only in folders you shared with that peer** (see
-  [Shared folders](#shared-folders)), by default your profile's `.p2pdata` folder, read-only.
+  [Shared folders](#shared-folders)), by default your profile's `.proofkin-data` folder, read-only.
   Your `--workspace` and every other folder stay private. A peer cannot choose a path or
   raise its access: each task gets the **lower** of the peer's grant
   (`peers allow ... --delegate --access <level>`, default `read-only`) and the folder's
@@ -1168,17 +1276,17 @@ Press Ctrl+C in the terminal to stop the agent.
 
 A worker decides exactly what each peer can see:
 
-- Every profile has a **data folder**, `~/.p2pdata/<profile>` (created when the agent starts
-  with `--serve`; under `$P2PAGENTS_HOME/.p2pdata` if that is set). It is the built-in share
+- Every profile has a **data folder**, `~/.proofkin-data/<profile>` (created when the agent starts
+  with `--serve`; under `$PROOFKIN_HOME/.proofkin-data` if that is set). It is the built-in share
   `data`, always **read-only**. Put there what you want peers' tasks to see, e.g. a status
   note your manager's agent can summarize. Peers' tasks run there unless they name another
   folder.
 - To let a peer work on code, share the folder by name with a maximum access, and grant it:
 
   ```powershell
-  p2pagents share add myrepo D:\src\myrepo --access workspace-write --profile alice
-  p2pagents peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
-  p2pagents share list --profile alice
+  proofkin share add myrepo D:\src\myrepo --access workspace-write --profile alice
+  proofkin peers allow <bob-ticket> --profile alice --delegate --access workspace-write --share data,myrepo
+  proofkin share list --profile alice
   ```
 
   Bob then runs `/delegate copilot@alice:myrepo Add tests for the parser`. In the web UI,
@@ -1189,7 +1297,7 @@ A worker decides exactly what each peer can see:
 
 | | `data` (built in) | A folder you add |
 | --- | --- | --- |
-| Where | `~/.p2pdata/<profile>` | Any existing folder |
+| Where | `~/.proofkin-data/<profile>` | Any existing folder |
 | Most a task can do | read-only | what you set with `share add --access` |
 | Who can use it | peers granted `data` (the default for `peers allow`) | peers you list in `--share` |
 
@@ -1209,7 +1317,7 @@ Always enforced, at every level and for local tasks too:
   `.env.example` are fine), `*.pem`, `*.key`, `*.pfx`, `*.p12`, SSH keys (`id_rsa`,
   `id_ed25519`, ...), `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `credentials*`,
   `secrets.*`, and anything under `.ssh`, `.aws`, `.azure`, `.kube`, `.docker`, `.gnupg`,
-  `.p2pagents`, `.copilot`.
+  `.proofkin` (and `.proofkin`), `.copilot`.
 - **No writes that would run code later**: `.git/` (hooks, config), `.vscode/`, `.idea/`,
   `.claude/`, `.codex/`, `.copilot/`, `.cursor/`, `.github/hooks/`, `.mcp.json`, `.gitmodules`.
 - **No web, memory or sub-agents**: web fetch/search, Copilot memory, sub-agents and skills
@@ -1248,15 +1356,15 @@ on a shared folder, like its checks:
 
 ```powershell
 # a local server (stdio): only two of its tools, for any peer with access to 'app'
-p2pagents mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot `
+proofkin mcp add app browser --access read-only --tool browser_navigate --tool browser_snapshot `
   --description "A headless browser for checking pages" --profile alice -- npx @playwright/mcp@latest --headless
 # a remote server (https): all its tools, for peers with full access; the header stays on this machine
-p2pagents mcp add app docs --url https://docs.example.com/mcp --header "Authorization=Bearer <token>" --profile alice
+proofkin mcp add app docs --url https://docs.example.com/mcp --header "Authorization=Bearer <token>" --profile alice
 # the servers of an MCP configuration file (mcp.json, .mcp.json, .vscode/mcp.json); ${workspaceFolder} becomes the folder
-p2pagents mcp import .vscode\mcp.json --share app --server playwright --access read-only --profile alice
-p2pagents mcp list --profile alice     # values of variables and headers are hidden
-p2pagents mcp pause app docs --profile alice    # offered to no task until you resume it
-p2pagents mcp remove app docs --profile alice
+proofkin mcp import .vscode\mcp.json --share app --server playwright --access read-only --profile alice
+proofkin mcp list --profile alice     # values of variables and headers are hidden
+proofkin mcp pause app docs --profile alice    # offered to no task until you resume it
+proofkin mcp remove app docs --profile alice
 ```
 
 Changes take effect for a running agent's peers within seconds, also when made from the
@@ -1295,14 +1403,14 @@ folder of `skills/*/SKILL.md`, `agents/*.md` and `.mcp.json`. A marketplace (`ma
 several; pick one with `--plugin`.
 
 ```powershell
-p2pagents plugin add .\team-tools --profile alice                          # a folder
-p2pagents plugin add octo-org/agent-plugins:plugins/reviewer --profile alice  # GitHub (private ones with the profile's GitHub sign-in)
-p2pagents plugin add octo-org/marketplace --plugin reviewer --profile alice   # from a marketplace
-p2pagents plugin show reviewer --profile alice     # its skills, agents, MCP servers, the values they need, where they're offered
+proofkin plugin add .\team-tools --profile alice                          # a folder
+proofkin plugin add octo-org/agent-plugins:plugins/reviewer --profile alice  # GitHub (private ones with the profile's GitHub sign-in)
+proofkin plugin add octo-org/marketplace --plugin reviewer --profile alice   # from a marketplace
+proofkin plugin show reviewer --profile alice     # its skills, agents, MCP servers, the values they need, where they're offered
 # offer one of its MCP servers in a shared folder, with the values it needs
-p2pagents mcp add app tickets --plugin reviewer --set TICKETS_TOKEN=<token> --access read-only --profile alice
-p2pagents plugin update reviewer --profile alice   # fetch it again
-p2pagents plugin disable reviewer --profile alice  # enable / remove
+proofkin mcp add app tickets --plugin reviewer --set TICKETS_TOKEN=<token> --access read-only --profile alice
+proofkin plugin update reviewer --profile alice   # fetch it again
+proofkin plugin disable reviewer --profile alice  # enable / remove
 ```
 
 - **Importing runs nothing.** The plugin's files are copied into the profile. Commands,
@@ -1340,12 +1448,12 @@ Claude's sandbox runtime (on Windows a separate low-rights user) for Claude:
   nothing downloaded. Builds work when their dependencies are already cached.
 - **No way out**: requests to run a command outside the sandbox are refused.
 - **Credential folders unreadable** (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gh`,
-  `~/.p2pagents`, ...): for Copilot wherever the sandbox reports the `denied_paths`
+  `~/.proofkin`, ...): for Copilot wherever the sandbox reports the `denied_paths`
   capability (Linux, macOS, and Windows with Copilot CLI 1.0.112+ on a current Windows
   build), and on every platform for Claude.
 - **Fails closed**: if a host has no sandbox, Copilot tasks drop the shell tool (printed
   as `copilot: no OS sandbox on this host`) and Claude tasks fail rather than run
-  unsandboxed. Run `copilot update` so p2pagents can check sandbox support at startup.
+  unsandboxed. Run `copilot update` so Proofkin can check sandbox support at startup.
 
 On top of the sandbox, commands that name a URL, a path outside the workspace, the home
 folder (`~`, `$HOME`, `$env:USERPROFILE`, `%APPDATA%`, ...) or a credential file are refused
@@ -1366,7 +1474,7 @@ Limits to know:
   reads outside the workspace (and on Windows the sandbox is limited). Serve Codex only to
   peers you trust, or run that agent under a separate OS account or in a container.
 - Denied requests are printed in the agent's terminal (`copilot: denied ...`,
-  `claude: denied ...`). Set `P2PAGENTS_DEBUG_PERMISSIONS=1` to print every Copilot
+  `claude: denied ...`). Set `PROOFKIN_DEBUG_PERMISSIONS=1` to print every Copilot
   permission request.
 
 - Each agent uses only its own profile's accounts and provider instances (see
@@ -1389,10 +1497,10 @@ endpoints on localhost in local mode, so they need no internet.
 
 ## Evidence-driven development
 
-This section is about how p2pagents itself is built. To run EDD on your own projects with
+This section is about how Proofkin itself is built. To run EDD on your own projects with
 a team of agents, see [Evidence-driven development with agents](#evidence-driven-development-with-agents).
 
-Every behavior p2pagents promises is written down as a **claim** in
+Every behavior Proofkin promises is written down as a **claim** in
 [evidence/claims.json](evidence/claims.json), with the evidence that proves it: unit and
 integration tests, and checks from the live internet test. For example:
 
@@ -1436,13 +1544,13 @@ Workflow for a change:
 | `Copilot CLI not found` | Install the Copilot CLI and open a new terminal, or set `COPILOT_CLI_PATH`. |
 | `bridge script ... not found` / `Cannot find package '@anthropic-ai/claude-agent-sdk'` | Run `npm install` in `bridge\`, or pass `--bridge`. |
 | `npm install` fails with `ERR_SSL_..._HANDSHAKE_FAILURE` | Your network blocks the public npm registry. Use your internal feed, e.g. `npm install --registry <feed-url>`. |
-| `Not logged in · Please run /login` (claude) | Sign the agent's profile in: `p2pagents auth login claude --profile <profile>`. |
-| `401 Unauthorized` (codex) | Sign the agent's profile in: `p2pagents auth login codex --profile <profile>`. |
+| `Not logged in · Please run /login` (claude) | Sign the agent's profile in: `proofkin auth login claude --profile <profile>`. |
+| `401 Unauthorized` (codex) | Sign the agent's profile in: `proofkin auth login codex --profile <profile>`. |
 | `<provider> is not signed in for profile '<p>'` | The agent's profile has no account for that provider; run the printed `auth login` command. Agents never borrow the machine's global sign-in. |
 | `no GitHub CLI token for <user> on <host>` | Sign that account in to gh: `gh auth login --hostname <host>`, then check `gh auth status`. |
 | `Copilot rejected this profile's token` | The token is invalid, expired, or the account has no Copilot access. Sign in again with `auth login copilot`. |
 | Windows Firewall prompt on first run | Allow it for direct (faster) connections; if blocked, agents still connect through the relays. |
-| `! refused connection from <id>` | That key is not on this profile's allowlist. If it should be: `p2pagents peers allow <id> --profile <p> --name <n>`. |
+| `! refused connection from <id>` | That key is not on this profile's allowlist. If it should be: `proofkin peers allow <id> --profile <p> --name <n>`. |
 | `<id> is not on the allowlist` when dialing | Allowlist the peer first; agents only dial allowlisted keys. |
 | Peers never connect (`+ name` doesn't appear) | Both sides must allowlist each other; check `peers list` on both. Check `warning: no relay reachable` at startup: the network must allow outbound HTTPS to `*.iroh.link` (or UDP). On an isolated LAN use `--network local`. |
 | `does not accept tasks from <name> (not allowed to delegate)` | The worker's owner must allow you with `peers allow ... --delegate`. |
@@ -1464,7 +1572,7 @@ Workflow for a change:
 - [bridge/index.mjs](bridge/index.mjs): Node bridge calling the Claude Agent SDK and Codex SDK
 - [src/setup.rs](src/setup.rs): `setup` (installs the embedded bridge) and `doctor`
 - [src/audit.rs](src/audit.rs): per-profile audit log of peers' tasks (`audit.jsonl`, no prompt text)
-- [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.p2pdata` folder, named shares with a maximum access, their checks and MCP servers)
+- [src/shares.rs](src/shares.rs): shared folders (built-in read-only `.proofkin-data` folder, named shares with a maximum access, their checks and MCP servers)
 - [src/mcp.rs](src/mcp.rs): owner-defined MCP servers (validation, access rule, secrets hidden from listings, provider config), MCP configuration files and server templates with placeholders
 - [src/plugins.rs](src/plugins.rs): plugins (sources, fetching for review, the Copilot CLI, Claude Code and Agent Plugins layouts, marketplaces, the profile's plugin store, offers made from templates)
 - [src/store.rs](src/store.rs): atomic writes and file locks for the profile's JSON files
@@ -1476,7 +1584,7 @@ Workflow for a change:
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification
 - [src/knowledge.rs](src/knowledge.rs): the knowledge base (topics, context for prompts, troubleshooting guides)
-- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec and rehearse plan templates
+- [src/playbooks.rs](src/playbooks.rs) and [playbooks/](playbooks): bootstrap, discover, sdlc, learn, spec, design, implement-spec, implement-speckit and rehearse plan templates; [src/spec_import.rs](src/spec_import.rs): Spec Kit and OpenSpec specs as claims, knowledge and plans
 - [src/spec.rs](src/spec.rs) and [spec-starter/](spec-starter): the built-in spec checks (`spec:spec`, `spec:api`, `spec:ux`, `spec:trace`) and the `spec init` starter package
 - [src/design.rs](src/design.rs) and [design-starter/](design-starter): the design and review checks (`design:arch`, `design:data`, `design:threats`, `design:tests`, `design:ops`, `review:decks`, `review:rehearsal`) and the `design init` starter
 - [src/render.rs](src/render.rs): Markdown to self-contained HTML: Marp decks as slide shows, documents as pages, without raw HTML
@@ -1488,12 +1596,12 @@ Workflow for a change:
 - [evidence/claims.json](evidence/claims.json), [scripts/evidence.py](scripts/evidence.py): claims and the evidence harness (see [Evidence-driven development](#evidence-driven-development))
 - [install.ps1](install.ps1), [install.sh](install.sh): install prebuilt binaries from GitHub releases
 - [src/main.rs](src/main.rs): interactive CLI
-- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API; [src/ui/workers.rs](src/ui/workers.rs): its digital workers API
-- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card
+- [src/ui.rs](src/ui.rs): web UI server (`--ui`): loopback-only, token-guarded JSON API and Server-Sent Events; [src/ui/tools.rs](src/ui/tools.rs): its plugins, MCP servers and skills API; [src/ui/workers.rs](src/ui/workers.rs): its digital workers API; [src/ui/connect.rs](src/ui/connect.rs): the MCP server and A2A agent other agents connect to
+- [ui/](ui/): the web app (HTML/CSS/JS, embedded in the binary), light and dark themes; [ui/tools.js](ui/tools.js) is the Plugins & tools dialog, [ui/workers.js](ui/workers.js) the Digital workers card, [ui/connect.js](ui/connect.js) the Connect other agents card
 - [docs/ux-guidelines.md](docs/ux-guidelines.md): the UI's design guidelines and definition of done
 - [scripts/p2p.ps1](scripts/p2p.ps1): doctor / build / test / demo / live-test helper
 - [scripts/live_test.py](scripts/live_test.py): live internet test: 4 agents found by key, allowlist, 2 accounts, real Copilot
-- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run) for the tests
+- [tests/](tests/): multi-agent (iroh on localhost), allowlist, delegation-rights, bridge and credential-isolation tests; [tests/fixtures/echo_mcp.py](tests/fixtures/echo_mcp.py) is a tiny MCP server and [tests/fixtures/plugin/](tests/fixtures/plugin) a Claude Code style plugin (a skill, an MCP server, a hook that must never run), [tests/fixtures/speckit/](tests/fixtures/speckit) and [tests/fixtures/openspec/](tests/fixtures/openspec) a Spec Kit feature and an OpenSpec change for the tests; [tests/connect.rs](tests/connect.rs) drives the MCP and A2A endpoints like other agents do
 - [vendor/iroh/](vendor/iroh/): iroh 1.4.1 without its `cdylib` crate type (Windows GNU link fix)
 
 ## License

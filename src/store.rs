@@ -80,7 +80,7 @@ impl FileLock {
             }
         }
         bail!(
-            "{} is being changed by another p2pagents process; try again",
+            "{} is being changed by another proofkin process; try again",
             target.display()
         )
     }

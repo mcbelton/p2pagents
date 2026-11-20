@@ -29,6 +29,7 @@ pub mod setup;
 pub mod shares;
 pub mod skills;
 pub mod spec;
+pub mod spec_import;
 pub mod store;
 pub mod trust;
 pub mod ui;

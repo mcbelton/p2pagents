@@ -349,7 +349,7 @@ pub fn report(
         utc(unix_now())
     );
     if monitors.is_empty() {
-        md += "No monitors. Add one with `p2pagents monitor add`.\n";
+        md += "No monitors. Add one with `proofkin monitor add`.\n";
     } else {
         md += "| Monitor | Availability | SLO | p50 | p95 | Now |\n| --- | --- | --- | --- | --- | --- |\n";
         // Incidents opened before the window may still be open.
@@ -837,7 +837,7 @@ impl Ops {
         if let Some(why) = problem(m, &(self.shares)()) {
             if !state.cant_run {
                 eprintln!(
-                    "monitor {} can't run: {why}; fix it, or remove the monitor (p2pagents monitor remove {})",
+                    "monitor {} can't run: {why}; fix it, or remove the monitor (proofkin monitor remove {})",
                     m.name, m.name
                 );
             }

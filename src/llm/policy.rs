@@ -13,6 +13,7 @@ const SENSITIVE_DIRS: &[&str] = &[
     ".azure",
     ".kube",
     ".docker",
+    ".proofkin",
     ".p2pagents",
     ".copilot",
 ];
@@ -56,6 +57,7 @@ const HOME_SECRETS: &[&str] = &[
     ".gnupg",
     ".kube",
     ".docker",
+    ".proofkin",
     ".p2pagents",
     ".copilot",
     ".config/gh",

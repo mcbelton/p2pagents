@@ -1,0 +1,13 @@
+// Import a spec written with Spec Kit or OpenSpec: {{spec}}
+// A Spec Kit feature (specs/NNN-name: spec.md, plan.md, tasks.md) or an OpenSpec change
+// (openspec/changes/<id>: proposal.md, tasks.md, spec deltas) becomes the claims: one
+// per user story, functional requirement and success criterion (or per added and
+// modified requirement), each proven by the folder's tests or a sign-off. The spec is
+// saved as knowledge the steps are given, so the peers need no copy of it.
+// Vars: spec (the feature's folder), peer, folder, reviewers (a squad), test, approver
+claim: STORIES Every user story works as its acceptance scenarios say
+claim: RULES Every functional requirement holds, each proven by a test named after it
+claim: OUTCOMES The success criteria are met
+impl @{{peer}}:{{folder}} skill=implement-change verify={{test}} attempts=3 claims=STORIES,RULES Implement the feature as its spec, plan and tasks say (the tasks in order, ticked off as they are done), with a test for every acceptance scenario and requirement named after its claim id.
+verify after impl #{{reviewers}}:{{folder}} skill=code-review apply=impl verify={{test}} claims=STORIES,RULES Review the change against the spec: does every acceptance scenario and requirement have a test that really proves it? Report each gap.
+signoff after verify approve @{{approver}} claims=OUTCOMES Accept the feature: its success criteria are met.

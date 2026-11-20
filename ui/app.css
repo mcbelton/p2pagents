@@ -1,4 +1,4 @@
-/* p2pagents UI. Light theme by default, dark via [data-theme="dark"] (set by app.js
+/* Proofkin UI. Light theme by default, dark via [data-theme="dark"] (set by app.js
    from the System/Light/Dark switch) or the OS setting before the script loads. */
 
 /* `hidden` must win over component display rules (e.g. .field-inline's inline-flex). */
@@ -179,6 +179,24 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+/* Connect other agents: addresses, the token and client setups to copy. */
+.connect-row { display: grid; grid-template-columns: 3.2em minmax(0, 1fr) auto; gap: 6px; align-items: center; margin: 6px 0; }
+.connect-label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.connect-value {
+  font-size: 12px; overflow-wrap: anywhere; padding: 3px 6px; border-radius: var(--radius-sm);
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.connect-setup { margin-top: 8px; font-size: 13px; }
+.connect-setup summary { cursor: pointer; }
+.connect-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; }
+.connect-actions .connect-row { flex: 1 1 100%; margin: 0; }
+.connect-snippet { margin-top: 10px; }
+.connect-snippet-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.connect-snippet pre {
+  margin: 4px 0 0; padding: 6px 8px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border);
+}
 
 /* Buttons and fields */
 .btn {
@@ -366,6 +384,7 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .pick-name { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--text); }
 .pick-desc { font-size: 12.5px; color: var(--text); }
 .pick-meta { font-size: 11.5px; color: var(--muted); }
+.spec-picks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .playbook-detail { border-left: 1px solid var(--border); padding: 0 4px 0 16px; font-size: 13px; }
 .playbook-detail h3 { margin: 0; font-family: var(--mono); font-size: 15px; }
 .playbook-detail > p { margin: 4px 0 0; }

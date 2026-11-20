@@ -5,13 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" id="theme-color" content="#f5f6f8">
-  <title>p2pagents</title>
+  <title>Proofkin</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/plan-text.js" defer></script>
 <script src="/app.js" defer></script>
   <script src="/tools.js" defer></script>
 <script src="/plan-builder.js" defer></script>
 <script src="/workers.js" defer></script>
+<script src="/connect.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#composer-input">Skip to message box</a>
@@ -22,7 +23,7 @@
         <circle cx="8" cy="10" r="4"></circle><circle cx="24" cy="10" r="4"></circle><circle cx="16" cy="24" r="4"></circle>
         <path d="M11.5 11.5 L20.5 11.5 M10 13.5 L14 20.5 M22 13.5 L18 20.5"></path>
       </svg>
-      <span class="brand-name">p2pagents</span>
+      <span class="brand-name">Proofkin</span>
     </div>
     <div class="me" aria-label="This agent">
       <span class="me-name" id="me-name">…</span>
@@ -100,6 +101,14 @@
         <p class="muted small" id="tools-summary">Skills, MCP servers and plugins for your agents and your peers' tasks.</p>
       </section>
 
+      <section class="card" aria-labelledby="connect-h">
+        <div class="card-head">
+          <h2 id="connect-h">Connect other agents</h2>
+          <button type="button" class="btn small" id="connect-toggle" hidden>Turn on</button>
+        </div>
+        <div id="connect"></div>
+      </section>
+
       <section class="card" aria-labelledby="ticket-h">
         <div class="card-head"><h2 id="ticket-h">Your ticket</h2></div>
         <p class="muted small">Give this to peers so they can allowlist this agent.</p>
@@ -116,7 +125,7 @@
     </aside>
 
     <main class="main" id="main">
-      <h1 class="visually-hidden">p2pagents</h1>
+      <h1 class="visually-hidden">Proofkin</h1>
       <div class="feed" id="feed" role="log" aria-live="polite" aria-label="Activity" tabindex="0"></div>
 
       <form class="composer" id="composer" autocomplete="off">
@@ -262,7 +271,7 @@
       <fieldset class="field" id="shares-field" hidden>
         <legend>Folders their tasks may use</legend>
         <div id="add-shares" class="share-checks"></div>
-        <span class="muted small">Share more folders with <span class="mono">p2pagents share add</span>. Each folder caps the access above.</span>
+        <span class="muted small">Share more folders with <span class="mono">proofkin share add</span>. Each folder caps the access above.</span>
       </fieldset>
       <p class="form-error" id="add-error" role="alert"></p>
       <div class="dialog-actions">
@@ -487,7 +496,7 @@
   <dialog id="github-dialog" aria-labelledby="github-dialog-h">
     <form method="dialog" id="github-form" novalidate>
       <h2 id="github-dialog-h">Sign in to GitHub</h2>
-      <p class="muted small">Pick an account of the GitHub CLI on this machine. Its token is fetched from <span class="mono">gh</span> when needed and never stored by p2pagents. Add accounts with <span class="mono">gh auth login</span>.</p>
+      <p class="muted small">Pick an account of the GitHub CLI on this machine. Its token is fetched from <span class="mono">gh</span> when needed and never stored by Proofkin. Add accounts with <span class="mono">gh auth login</span>.</p>
       <fieldset class="field"><legend>Account</legend><div id="github-accounts" class="share-checks"></div></fieldset>
       <p class="form-error" id="github-error" role="alert"></p>
       <div class="dialog-actions">

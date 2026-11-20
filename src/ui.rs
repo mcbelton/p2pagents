@@ -1,4 +1,4 @@
-//! Local web UI (`p2pagents --name me --ui`): a single-page app served on
+//! Local web UI (`proofkin --name me --ui`): a single-page app served on
 //! 127.0.0.1 only, guarded by a random access token and a Host check, with live
 //! updates over Server-Sent Events.
 
@@ -34,6 +34,7 @@ use crate::profile::{Profile, validate_name};
 use crate::runs::RunRecord;
 use crate::trust::{Ticket, TrustedPeer};
 
+mod connect;
 mod tools;
 mod workers;
 
@@ -44,7 +45,11 @@ const TOOLS_JS: &str = include_str!("../ui/tools.js");
 const PLAN_TEXT_JS: &str = include_str!("../ui/plan-text.js");
 const PLAN_BUILDER_JS: &str = include_str!("../ui/plan-builder.js");
 const WORKERS_JS: &str = include_str!("../ui/workers.js");
+const CONNECT_JS: &str = include_str!("../ui/connect.js");
 const FEED_LIMIT: usize = 500;
+/// Most tasks kept for the page (and for other agents' lookups), besides running ones:
+/// the oldest finished ones go first, a plan's steps together once the plan has ended.
+const TASK_LIMIT: usize = 500;
 
 /// What the UI shows about this agent besides live state.
 pub struct UiInfo {
@@ -89,6 +94,9 @@ struct TaskView {
     preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview_label: Option<&'static str>,
+    /// Started by another agent ("MCP" or "A2A"), not in this UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    via: Option<&'static str>,
 }
 
 impl TaskView {
@@ -114,6 +122,12 @@ struct Shared {
     previews: crate::preview::Previews,
     scheduler: std::sync::OnceLock<crate::schedule::Scheduler>,
     staging: tools::Staging,
+    /// Fires whenever a task changes (for waiting on one to finish).
+    changed: tokio::sync::Notify,
+    /// Other agents connected over MCP and A2A: their token and the work they started.
+    connect: connect::Connect,
+    /// Started with --ui-port: the address other agents use stays the same.
+    fixed_port: bool,
 }
 
 type AppState = Arc<Shared>;
@@ -283,6 +297,13 @@ impl Shared {
         json!(shares)
     }
 
+    /// Adds a task to the list, letting the oldest finished ones go.
+    fn add_task(&self, view: TaskView) {
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.push(view);
+        prune_tasks(&mut tasks, TASK_LIMIT);
+    }
+
     fn update_task(&self, id: u64, f: impl FnOnce(&mut TaskView)) {
         let task = {
             let mut tasks = self.tasks.lock().unwrap();
@@ -293,6 +314,7 @@ impl Shared {
             task.clone()
         };
         self.send(json!({ "type": "task", "task": task }));
+        self.changed.notify_waiters();
     }
 
     fn save_trust(&self) -> Result<(), ApiError> {
@@ -306,6 +328,44 @@ impl Shared {
                 )
             })
     }
+}
+
+/// Lets the oldest finished tasks go until at most `limit` are left (running ones always
+/// stay); a plan's steps go together, once every one of them has finished.
+fn prune_tasks(tasks: &mut Vec<TaskView>, limit: usize) {
+    if tasks.len() <= limit {
+        return;
+    }
+    let running: std::collections::HashSet<u64> = tasks
+        .iter()
+        .filter(|t| !t.finished())
+        .filter_map(|t| t.plan)
+        .collect();
+    let mut gone = std::collections::HashSet::new();
+    let mut left = tasks.len();
+    for t in tasks.iter() {
+        if left <= limit {
+            break;
+        }
+        if !t.finished() || gone.contains(&t.id) {
+            continue;
+        }
+        match t.plan {
+            None => {
+                gone.insert(t.id);
+                left -= 1;
+            }
+            Some(plan) if running.contains(&plan) => {}
+            Some(plan) => {
+                for step in tasks.iter().filter(|s| s.plan == Some(plan)) {
+                    if gone.insert(step.id) {
+                        left -= 1;
+                    }
+                }
+            }
+        }
+    }
+    tasks.retain(|t| !gone.contains(&t.id));
 }
 
 /// A running UI server.
@@ -340,6 +400,9 @@ pub async fn start(
         previews: crate::preview::Previews::default(),
         scheduler: std::sync::OnceLock::new(),
         staging: tools::Staging::default(),
+        changed: tokio::sync::Notify::new(),
+        connect: connect::Connect::default(),
+        fixed_port: bind.port() != 0,
     });
     start_scheduler(&shared);
     watch_workers(&shared);
@@ -480,11 +543,30 @@ pub async fn start(
         .route("/api/workers/{name}/start", post(workers::start))
         .route("/api/workers/{name}/stop", post(workers::stop))
         .route("/api/sign-in/copilot", post(workers::sign_in_copilot))
+        .route(
+            "/api/connect",
+            get(connect::state)
+                .post(connect::turn_on)
+                .delete(connect::turn_off),
+        )
         .route("/api/trust", post(allow_peer))
         .route("/api/trust/{id}", delete(remove_peer))
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             require_token,
+        ));
+    // Other agents (MCP, A2A): their own token, never the web UI's.
+    let integrations = Router::new()
+        .route(
+            "/mcp",
+            post(connect::mcp)
+                .get(connect::mcp_no_stream)
+                .delete(connect::mcp_no_stream),
+        )
+        .route("/a2a", post(connect::a2a))
+        .route_layer(middleware::from_fn_with_state(
+            shared.clone(),
+            connect::require_integration_token,
         ));
     let app = Router::new()
         .route(
@@ -515,12 +597,19 @@ pub async fn start(
             "/workers.js",
             get(|| async { asset("text/javascript; charset=utf-8", WORKERS_JS) }),
         )
+        .route(
+            "/connect.js",
+            get(|| async { asset("text/javascript; charset=utf-8", CONNECT_JS) }),
+        )
+        // The A2A agent card is public (to this machine), like any agent's.
+        .route("/.well-known/agent-card.json", get(connect::agent_card))
         // Outside the token check: the unguessable capability in the path is the
         // authorization, and the content runs in a CSP sandbox (see crate::preview).
         .route("/preview/{cap}", get(preview_root))
         .route("/preview/{cap}/", get(preview_index))
         .route("/preview/{cap}/{*path}", get(preview_file))
         .merge(api)
+        .merge(integrations)
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_local_host,
@@ -532,6 +621,8 @@ pub async fn start(
         .context("binding the UI server")?;
     let port = listener.local_addr()?.port();
     shared.port.store(port, Ordering::Relaxed);
+    // Tells `proofkin connect` where other agents reach this agent.
+    let _ = std::fs::write(shared.info.profile.ui_port_path(), port.to_string());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -795,6 +886,16 @@ async fn create_task(
     State(s): State<AppState>,
     Json(body): Json<TaskBody>,
 ) -> Result<Json<Value>, ApiError> {
+    start_task(&s, body, None).map(|view| Json(json!(view)))
+}
+
+/// Starts a task on this agent or a peer; it shows up as a task, updated live.
+/// `via`: another agent started it (over MCP or A2A).
+fn start_task(
+    s: &AppState,
+    body: TaskBody,
+    via: Option<&'static str>,
+) -> Result<TaskView, ApiError> {
     let prompt = body.prompt.trim().to_owned();
     if prompt.is_empty() {
         return Err(bad_request("prompt is empty"));
@@ -860,8 +961,9 @@ async fn create_task(
         evidence: None,
         preview: None,
         preview_label: None,
+        via,
     };
-    s.tasks.lock().unwrap().push(view.clone());
+    s.add_task(view.clone());
     s.send(json!({ "type": "task", "task": view }));
 
     let shared = s.clone();
@@ -909,7 +1011,7 @@ async fn create_task(
             running.insert(id, handle.abort_handle());
         }
     }
-    Ok(Json(json!(view)))
+    Ok(view)
 }
 
 /// Cancels a running task, or the whole plan a step belongs to. Dropping a
@@ -918,6 +1020,12 @@ async fn cancel_task(
     State(s): State<AppState>,
     Path(id): Path<u64>,
 ) -> Result<Json<Value>, ApiError> {
+    cancel_running(&s, id, "Cancelled by you.")?;
+    Ok(Json(json!({ "cancelled": id })))
+}
+
+/// Cancels running task `id` (its whole plan, for a step), saying `why`.
+fn cancel_running(s: &Shared, id: u64, why: &str) -> Result<(), ApiError> {
     let handle = s.running.lock().unwrap().remove(&id).ok_or_else(|| {
         (
             StatusCode::CONFLICT,
@@ -948,10 +1056,10 @@ async fn cancel_task(
         s.update_task(id, |t| {
             t.finished_ms = Some(now_ms());
             t.status = "cancelled";
-            t.output = Some("Cancelled by you.".into());
+            t.output = Some(why.into());
         });
     }
-    Ok(Json(json!({ "cancelled": id })))
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -965,7 +1073,7 @@ async fn create_plan(
     State(s): State<AppState>,
     Json(body): Json<PlanBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let started = start_plan(&s, body.text).map_err(bad_request)?;
+    let started = start_plan(&s, body.text, None).map_err(bad_request)?;
     Ok(Json(
         json!({ "plan": started.plan, "steps": started.steps }),
     ))
@@ -979,7 +1087,12 @@ struct StartedPlan {
     done: tokio::task::JoinHandle<crate::schedule::Outcome>,
 }
 
-fn start_plan(s: &AppState, text: String) -> Result<StartedPlan, String> {
+/// Starts plan `text` (`via`: another agent started it, over MCP or A2A).
+fn start_plan(
+    s: &AppState,
+    text: String,
+    via: Option<&'static str>,
+) -> Result<StartedPlan, String> {
     let plan = Plan::parse(&text).map_err(|e| format!("{e:#}"))?;
     let kb = s.info.profile.knowledge();
     let skills = s.info.profile.skills();
@@ -1025,8 +1138,9 @@ fn start_plan(s: &AppState, text: String) -> Result<StartedPlan, String> {
             evidence: None,
             preview: None,
             preview_label: None,
+            via,
         };
-        s.tasks.lock().unwrap().push(view.clone());
+        s.add_task(view.clone());
         s.send(json!({ "type": "task", "task": view }));
     }
     let squads = s.squads.lock().unwrap().clone();
@@ -1141,13 +1255,13 @@ fn start_plan(s: &AppState, text: String) -> Result<StartedPlan, String> {
 }
 
 /// Runs the profile's scheduled plans like plans started here, so their steps show
-/// up as tasks. Checks every 30 seconds (`P2PAGENTS_SCHEDULE_TICK_SECS` overrides it).
+/// up as tasks. Checks every 30 seconds (`PROOFKIN_SCHEDULE_TICK_SECS` overrides it).
 fn start_scheduler(shared: &AppState) {
     use crate::schedule::{Launch, Outcome, Schedule, Scheduler};
     let weak = Arc::downgrade(shared);
     let launch: Launch = Arc::new(move |schedule: Schedule| {
         let s = weak.upgrade().context("the agent stopped")?;
-        let started = start_plan(&s, schedule.plan.clone()).map_err(|e| anyhow!(e))?;
+        let started = start_plan(&s, schedule.plan.clone(), None).map_err(|e| anyhow!(e))?;
         s.system(
             "task",
             format!(
@@ -1170,8 +1284,7 @@ fn start_scheduler(shared: &AppState) {
             }
         }),
     );
-    let tick = std::env::var("P2PAGENTS_SCHEDULE_TICK_SECS")
-        .ok()
+    let tick = crate::profile::env_setting("SCHEDULE_TICK_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
     scheduler.spawn(Duration::from_secs(tick));
@@ -1474,13 +1587,19 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
 /// Parses a plan and checks it against the connected peers, their folders and
 /// checks, squads, knowledge and skills, without running it.
 async fn check_plan(State(s): State<AppState>, Json(body): Json<PlanBody>) -> Json<Value> {
-    let plan = match Plan::parse(&body.text) {
+    Json(plan_check(&s, &body.text))
+}
+
+/// What's wrong with plan `text` before it runs: its syntax, and the peers, folders,
+/// checks, squads, skills and knowledge it uses.
+fn plan_check(s: &Shared, text: &str) -> Value {
+    let plan = match Plan::parse(text) {
         Ok(plan) => plan,
         Err(e) => {
-            return Json(json!({
+            return json!({
                 "ok": false,
                 "problems": [{ "step": null, "error": true, "message": format!("{e:#}") }],
-            }));
+            });
         }
     };
     let squads = s.squads.lock().unwrap().clone();
@@ -1491,12 +1610,12 @@ async fn check_plan(State(s): State<AppState>, Json(body): Json<PlanBody>) -> Js
         &s.info.profile.knowledge(),
         &s.info.profile.skills(),
     );
-    Json(json!({
+    json!({
         "ok": !problems.iter().any(|p| p.error),
         "problems": problems,
         "steps": plan.steps.len(),
         "claims": plan.claims.len(),
-    }))
+    })
 }
 
 /// GitHub: the profile's account, the GitHub CLI accounts it could use, and the
@@ -1738,17 +1857,41 @@ struct PlaybookBody {
     vars: std::collections::BTreeMap<String, String>,
 }
 
+/// Fills in a playbook. The implement-speckit playbook also saves the spec it imports
+/// as knowledge; a folder with several specs lists them (`candidates`) to pick from.
 async fn render_playbook(
+    State(s): State<AppState>,
     Path(name): Path<String>,
     Json(body): Json<PlaybookBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let vars = body
+    let vars: std::collections::BTreeMap<String, String> = body
         .vars
         .into_iter()
         .filter(|(_, v)| !v.trim().is_empty())
         .collect();
-    let text = crate::playbooks::render(&name, &vars).map_err(|e| bad_request(format!("{e:#}")))?;
-    Ok(Json(json!({ "text": text })))
+    let kb = s.info.profile.knowledge();
+    // An imported spec's files are read (and a project searched for one): that blocks.
+    let done = tokio::task::spawn_blocking(move || {
+        let rendered = crate::playbooks::render_full(&name, &vars)?;
+        let saved = rendered.save_knowledge(&kb)?;
+        anyhow::Ok((rendered, saved))
+    })
+    .await
+    .map_err(internal)?;
+    let (rendered, saved) = done.map_err(|e| {
+        let mut body = json!({ "error": format!("{e:#}") });
+        if let Some(several) = e.downcast_ref::<crate::spec_import::SeveralSpecs>() {
+            body["candidates"] = json!(several.0);
+        }
+        (StatusCode::BAD_REQUEST, Json(body))
+    })?;
+    if !saved.is_empty() {
+        // The knowledge list is part of the ops view.
+        s.send(json!({ "type": "ops" }));
+    }
+    Ok(Json(
+        json!({ "text": rendered.text, "notes": rendered.notes, "knowledge": saved }),
+    ))
 }
 
 async fn kb_topic(
@@ -1785,13 +1928,19 @@ async fn get_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let dir = s.info.profile.runs_dir();
-    let run = RunRecord::load(&dir, &id).map_err(|e| {
+    run_details(&s, &id).map(Json).map_err(|e| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("{e:#}") })),
         )
-    })?;
+    })
+}
+
+/// Saved run `id`: its summary, verdict, Markdown report, re-checked signatures and
+/// the steps with something to preview.
+fn run_details(s: &Shared, id: &str) -> Result<Value> {
+    let dir = s.info.profile.runs_dir();
+    let run = RunRecord::load(&dir, id)?;
     let (run, checks) = run.reverified(Some(&dir.join(&run.id)));
     let checks: Vec<Value> = checks
         .into_iter()
@@ -1812,13 +1961,13 @@ async fn get_run(
             Some(json!({ "step": step, "label": label }))
         })
         .collect();
-    Ok(Json(json!({
+    Ok(json!({
         "summary": run.summary(),
         "verdict": run.verdict_line(),
         "report": run.render_markdown(),
         "signatures": checks,
         "previews": previews,
-    })))
+    }))
 }
 
 fn approvals_json(s: &Shared) -> Value {
@@ -1977,4 +2126,50 @@ async fn remove_peer(
     );
     s.broadcast_peers();
     Ok(Json(json!({ "removed": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: u64, status: &'static str, plan: Option<u64>) -> TaskView {
+        TaskView {
+            id,
+            provider: Provider::Copilot,
+            prompt: String::new(),
+            target: String::new(),
+            status,
+            output: None,
+            started_ms: 0,
+            finished_ms: None,
+            plan,
+            step: None,
+            after: Vec::new(),
+            approval: false,
+            evidence: None,
+            preview: None,
+            preview_label: None,
+            via: None,
+        }
+    }
+
+    #[test]
+    fn the_oldest_finished_tasks_go_first_and_a_plans_steps_together() {
+        let mut tasks = vec![
+            task(1, "running", None),
+            task(2, "done", Some(10)),
+            task(3, "failed", Some(10)),
+            task(4, "done", None),
+            task(5, "done", Some(20)),
+            task(6, "running", Some(20)),
+            task(7, "cancelled", None),
+        ];
+        prune_tasks(&mut tasks, 4);
+        let ids: Vec<u64> = tasks.iter().map(|t| t.id).collect();
+        // Plan 10 has ended (both its steps go), then task 4; plan 20 still runs.
+        assert_eq!(ids, [1, 5, 6, 7]);
+        prune_tasks(&mut tasks, 1);
+        let ids: Vec<u64> = tasks.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [1, 5, 6], "running tasks and running plans stay");
+    }
 }

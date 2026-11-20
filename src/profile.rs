@@ -3,8 +3,13 @@
 //! accounts and never fall back to the machine-wide sign-in.
 //!
 //! Layout: `<root>/profiles/<name>/{profile.json, copilot/, claude/, codex/}` where
-//! `<root>` is `$P2PAGENTS_HOME` or `~/.p2pagents`. Secrets (GitHub tokens, Anthropic
-//! keys) live in the OS credential store under service `p2pagents`, user `<name>/<provider>`.
+//! `<root>` is `$PROOFKIN_HOME` or `~/.proofkin`. Secrets (GitHub tokens, Anthropic
+//! keys) live in the OS credential store under service `proofkin`, user `<name>/<provider>`.
+//!
+//! Installs from before the rename keep working: `~/.p2pagents` stays the root while
+//! there is no `~/.proofkin`, `P2PAGENTS_*` settings still apply when the `PROOFKIN_*`
+//! one is unset, and secrets stored under service `p2pagents` are read (and copied
+//! forward), so agent identities and their endpoint ids don't change.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -42,15 +47,15 @@ pub enum SecretStore {
     /// Linux Secret Service).
     Keyring,
     /// Owner-only files in `<profile>/secrets/`: used when no OS credential store is
-    /// available (headless Linux, WSL, containers) or `P2PAGENTS_SECRET_STORE=file`.
+    /// available (headless Linux, WSL, containers) or `PROOFKIN_SECRET_STORE=file`.
     Files,
 }
 
 impl SecretStore {
     pub fn current() -> Self {
-        match std::env::var("P2PAGENTS_SECRET_STORE").as_deref() {
-            Ok("file") => Self::Files,
-            Ok("keyring") => Self::Keyring,
+        match env_setting("SECRET_STORE").as_deref() {
+            Some("file") => Self::Files,
+            Some("keyring") => Self::Keyring,
             _ if keyring::Entry::store_status().is_ok() => Self::Keyring,
             _ => Self::Files,
         }
@@ -90,15 +95,32 @@ fn write_private_file(path: &Path, value: &str) -> Result<()> {
     }
 }
 
-/// OS credential store service name. Profiles under a custom `P2PAGENTS_HOME` get
+/// Setting `PROOFKIN_<name>` from the environment, or `P2PAGENTS_<name>` (its name
+/// before the rename) when that's unset. Empty values count as unset.
+pub fn env_setting(name: &str) -> Option<String> {
+    env_setting_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// [`env_setting`] for values that may not be Unicode (paths).
+pub fn env_setting_os(name: &str) -> Option<OsString> {
+    [format!("PROOFKIN_{name}"), format!("P2PAGENTS_{name}")]
+        .iter()
+        .find_map(|var| std::env::var_os(var).filter(|v| !v.is_empty()))
+}
+
+/// OS credential store service names: the current one, and the one secrets were
+/// stored under before the rename. Profiles under a custom `PROOFKIN_HOME` get
 /// their own namespace so they never collide with the default profiles.
-fn keyring_service() -> String {
-    match std::env::var("P2PAGENTS_HOME") {
-        Ok(root) if !root.is_empty() => format!("p2pagents:{root}"),
-        _ => "p2pagents".to_owned(),
+fn keyring_services() -> [String; 2] {
+    match env_setting("HOME") {
+        Some(root) => [format!("proofkin:{root}"), format!("p2pagents:{root}")],
+        None => ["proofkin".to_owned(), "p2pagents".to_owned()],
     }
 }
 pub const DEFAULT_GITHUB_HOST: &str = "github.com";
+
+/// Secret store key of the integration token (see [`Profile::integration_token`]).
+const INTEGRATION_TOKEN: &str = "integration-token";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "kebab-case")]
@@ -195,14 +217,28 @@ impl fmt::Debug for CopilotCredentials {
     }
 }
 
-/// Root folder for profiles and the installed bridge: `$P2PAGENTS_HOME` or `~/.p2pagents`.
+/// Root folder for profiles and the installed bridge: `$PROOFKIN_HOME`, else
+/// `~/.proofkin` (or `~/.p2pagents`, from before the rename, while that's all there is).
 pub fn data_root() -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os("P2PAGENTS_HOME") {
+    if let Some(root) = env_setting_os("HOME") {
         return Ok(PathBuf::from(root));
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .context("cannot find the home directory; set P2PAGENTS_HOME")?;
-    Ok(PathBuf::from(home).join(".p2pagents"))
+        .context("cannot find the home directory; set PROOFKIN_HOME")?;
+    Ok(current_or_legacy(
+        Path::new(&home).join(".proofkin"),
+        Path::new(&home).join(".p2pagents"),
+    ))
+}
+
+/// `current`, unless only `legacy` (its name before the rename) exists: existing
+/// installs keep their folders, and the absolute paths saved in them stay valid.
+fn current_or_legacy(current: PathBuf, legacy: PathBuf) -> PathBuf {
+    if !current.exists() && legacy.exists() {
+        legacy
+    } else {
+        current
+    }
 }
 
 pub fn profiles_root() -> Result<PathBuf> {
@@ -284,7 +320,7 @@ impl Profile {
     }
 
     pub fn login_hint(&self, provider: Provider) -> String {
-        format!("p2pagents auth login {provider} --profile {}", self.name)
+        format!("proofkin auth login {provider} --profile {}", self.name)
     }
 
     /// Digital workers can't be signed in: they always use their owner's accounts.
@@ -308,11 +344,19 @@ impl Profile {
 
     fn secret_get(&self, key: &str) -> Result<Option<String>> {
         match SecretStore::current() {
-            SecretStore::Keyring => match self.keyring_entry(key)?.get_password() {
-                Ok(v) => Ok(Some(v)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(e).context("reading the OS credential store"),
-            },
+            SecretStore::Keyring => {
+                let [current, legacy] = keyring_services();
+                if let Some(value) = self.keyring_get(&current, key)? {
+                    return Ok(Some(value));
+                }
+                // Stored before the rename: copy it forward, so the profile keeps its
+                // identity (endpoint id) and sign-ins. A failed copy is retried next time.
+                let value = self.keyring_get(&legacy, key)?;
+                if let Some(value) = &value {
+                    let _ = self.keyring_entry(&current, key)?.set_password(value);
+                }
+                Ok(value)
+            }
             SecretStore::Files => {
                 let path = self.secret_file(key);
                 match std::fs::read_to_string(&path) {
@@ -324,10 +368,18 @@ impl Profile {
         }
     }
 
+    fn keyring_get(&self, service: &str, key: &str) -> Result<Option<String>> {
+        match self.keyring_entry(service, key)?.get_password() {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e).context("reading the OS credential store"),
+        }
+    }
+
     fn secret_set(&self, key: &str, value: &str) -> Result<()> {
         match SecretStore::current() {
             SecretStore::Keyring => self
-                .keyring_entry(key)?
+                .keyring_entry(&keyring_services()[0], key)?
                 .set_password(value)
                 .context("saving to the OS credential store"),
             SecretStore::Files => write_private_file(&self.secret_file(key), value),
@@ -336,10 +388,15 @@ impl Profile {
 
     fn secret_delete(&self, key: &str) -> Result<()> {
         match SecretStore::current() {
-            SecretStore::Keyring => match self.keyring_entry(key)?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(e).context("deleting from the OS credential store"),
-            },
+            SecretStore::Keyring => {
+                for service in keyring_services() {
+                    match self.keyring_entry(&service, key)?.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => {}
+                        Err(e) => return Err(e).context("deleting from the OS credential store"),
+                    }
+                }
+                Ok(())
+            }
             SecretStore::Files => match std::fs::remove_file(self.secret_file(key)) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -348,8 +405,8 @@ impl Profile {
         }
     }
 
-    fn keyring_entry(&self, key: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(&keyring_service(), &format!("{}/{key}", self.name))
+    fn keyring_entry(&self, service: &str, key: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(service, &format!("{}/{key}", self.name))
             .context("opening the OS credential store")
     }
 
@@ -391,6 +448,34 @@ impl Profile {
 
     pub fn delete_identity(&self) -> Result<()> {
         self.secret_delete("identity")
+    }
+
+    /// The token other agents use to connect to this profile's agent over MCP and A2A
+    /// (`proofkin connect`), if connecting is on.
+    pub fn integration_token(&self) -> Result<Option<String>> {
+        self.secret_get(INTEGRATION_TOKEN)
+    }
+
+    /// Turns connecting other agents on with a new token (the old one stops working).
+    pub fn new_integration_token(&self) -> Result<String> {
+        if self.config.owner.is_some() {
+            bail!("a digital worker takes work from its owner only");
+        }
+        let bytes = iroh::SecretKey::generate().to_bytes();
+        let token = format!("pfk_{}", data_encoding::HEXLOWER.encode(&bytes));
+        self.secret_set(INTEGRATION_TOKEN, &token)
+            .context("saving the integration token")?;
+        Ok(token)
+    }
+
+    /// Turns connecting other agents off.
+    pub fn delete_integration_token(&self) -> Result<()> {
+        self.secret_delete(INTEGRATION_TOKEN)
+    }
+
+    /// Where the running agent's web UI listens (other agents connect there).
+    pub fn ui_port_path(&self) -> PathBuf {
+        self.dir.join("ui-port")
     }
 
     /// Allowlist of peers this profile's agents talk to.
@@ -452,7 +537,7 @@ impl Profile {
     /// Where this profile's linked repositories are cloned: next to the data folder,
     /// outside the profiles folder, like task worktrees.
     pub fn repos_dir(&self) -> PathBuf {
-        self.outside_base().join(".p2prepos").join(&self.name)
+        self.outside_folder("repos").join(&self.name)
     }
 
     /// The profile as saved now (another process or the web UI may have changed it).
@@ -494,7 +579,7 @@ impl Profile {
                 token: gh_token(user, host)?,
             }),
             None => bail!(
-                "profile '{}' is not signed in to GitHub; run: p2pagents github login --gh-user <login> --profile {}",
+                "profile '{}' is not signed in to GitHub; run: proofkin github login --gh-user <login> --profile {}",
                 self.name,
                 self.name
             ),
@@ -504,16 +589,26 @@ impl Profile {
     /// Where per-task git worktrees are created: outside the profiles folder (like
     /// the data folder), since providers deny tasks access to profiles.
     pub fn worktrees_dir(&self) -> PathBuf {
-        self.outside_base().join(".p2pworktrees").join(&self.name)
+        self.outside_folder("worktrees").join(&self.name)
     }
 
-    /// The profile's `.p2pdata` folder: the built-in read-only `data` share.
-    /// `~/.p2pdata/<profile>`, or `$P2PAGENTS_HOME/.p2pdata/<profile>`.
+    /// The profile's data folder: the built-in read-only `data` share.
+    /// `~/.proofkin-data/<profile>`, or `$PROOFKIN_HOME/.proofkin-data/<profile>`.
     pub fn data_folder(&self) -> PathBuf {
-        self.outside_base().join(".p2pdata").join(&self.name)
+        self.outside_folder("data").join(&self.name)
     }
 
-    /// Next to the profiles folder, never inside it: `~/.p2pagents` -> `~`, so peers'
+    /// Folder `.proofkin-<kind>` next to the profiles folder, or `.p2p<kind>` where an
+    /// install from before the rename has one (and no new one).
+    fn outside_folder(&self, kind: &str) -> PathBuf {
+        let base = self.outside_base();
+        current_or_legacy(
+            base.join(format!(".proofkin-{kind}")),
+            base.join(format!(".p2p{kind}")),
+        )
+    }
+
+    /// Next to the profiles folder, never inside it: `~/.proofkin` -> `~`, so peers'
     /// tasks can work there while the credential-holding profiles stay denied.
     fn outside_base(&self) -> &Path {
         let root = self
@@ -521,8 +616,11 @@ impl Profile {
             .parent()
             .and_then(Path::parent)
             .unwrap_or(&self.dir);
-        // ~/.p2pagents -> ~/.p2pdata; a custom P2PAGENTS_HOME keeps it inside.
-        if root.file_name().is_some_and(|n| n == ".p2pagents") {
+        // ~/.proofkin -> ~/.proofkin-data; a custom PROOFKIN_HOME keeps it inside.
+        if root
+            .file_name()
+            .is_some_and(|n| n == ".proofkin" || n == ".p2pagents")
+        {
             root.parent().unwrap_or(root)
         } else {
             root
@@ -549,6 +647,7 @@ impl Profile {
         for provider in [Provider::Copilot, Provider::Claude, Provider::Codex] {
             self.delete_secret(provider)?;
         }
+        self.delete_integration_token()?;
         self.delete_identity()?;
         if self.dir.exists() {
             std::fs::remove_dir_all(&self.dir)
@@ -578,7 +677,7 @@ impl Profile {
         match file.try_lock() {
             Ok(()) => Ok(InstanceLock { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => bail!(
-                "profile '{}' is already running in another p2pagents agent",
+                "profile '{}' is already running in another proofkin agent",
                 self.name
             ),
             Err(std::fs::TryLockError::Error(e)) => {
@@ -627,7 +726,7 @@ impl Profile {
         }
         if !self.dir.join("profile.json").is_file() {
             bail!(
-                "profile '{}' has no sign-ins yet; sign it in first (p2pagents auth login copilot --profile {})",
+                "profile '{}' has no sign-ins yet; sign it in first (proofkin auth login copilot --profile {})",
                 self.name,
                 self.name
             );
@@ -714,7 +813,7 @@ pub fn github_login(token: &str, host: &str) -> Option<String> {
         format!("https://api.{host}/user")
     };
     let mut child = Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
-        .args(["-sf", "-H", "@-", "-H", "User-Agent: p2pagents", &api])
+        .args(["-sf", "-H", "@-", "-H", "User-Agent: proofkin", &api])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -763,6 +862,51 @@ mod tests {
     }
 
     #[test]
+    fn installs_from_before_the_rename_keep_their_folders() {
+        let home = tempfile::tempdir().unwrap();
+        let (new_root, old_root) = (
+            home.path().join(".proofkin"),
+            home.path().join(".p2pagents"),
+        );
+        assert_eq!(
+            current_or_legacy(new_root.clone(), old_root.clone()),
+            new_root
+        );
+
+        std::fs::create_dir_all(old_root.join("profiles")).unwrap();
+        std::fs::create_dir_all(home.path().join(".p2pdata")).unwrap();
+        assert_eq!(
+            current_or_legacy(new_root.clone(), old_root.clone()),
+            old_root
+        );
+        let boss = Profile::open_in(&old_root.join("profiles"), "boss").unwrap();
+        // Existing outside folders keep their old names; new ones get the new name.
+        assert_eq!(
+            boss.data_folder(),
+            home.path().join(".p2pdata").join("boss")
+        );
+        assert_eq!(
+            boss.worktrees_dir(),
+            home.path().join(".proofkin-worktrees").join("boss")
+        );
+        assert_eq!(
+            boss.repos_dir(),
+            home.path().join(".proofkin-repos").join("boss")
+        );
+
+        std::fs::create_dir_all(&new_root).unwrap();
+        assert_eq!(current_or_legacy(new_root.clone(), old_root), new_root);
+
+        // A custom home keeps everything inside it.
+        let custom = tempfile::tempdir().unwrap();
+        let p = Profile::open_in(&custom.path().join("profiles"), "w").unwrap();
+        assert_eq!(
+            p.data_folder(),
+            custom.path().join(".proofkin-data").join("w")
+        );
+    }
+
+    #[test]
     fn config_round_trips_and_homes_are_per_profile() {
         let root = tempfile::tempdir().unwrap();
         let mut a = Profile::open_in(root.path(), "a").unwrap();
@@ -799,7 +943,7 @@ mod tests {
         let p = Profile::open_in(root.path(), "w").unwrap();
         let err = p.copilot_credentials().unwrap_err().to_string();
         assert!(
-            err.contains("p2pagents auth login copilot --profile w"),
+            err.contains("proofkin auth login copilot --profile w"),
             "{err}"
         );
         let err = p.bridge_env(&[Provider::Codex]).unwrap_err().to_string();

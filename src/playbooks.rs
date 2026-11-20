@@ -57,6 +57,11 @@ const PLAYBOOKS: &[(&str, &str, &str)] = &[
         include_str!("../playbooks/implement-spec.plan"),
     ),
     (
+        SPEC_IMPORT,
+        "Implement a Spec Kit feature or OpenSpec change: a claim per user story, requirement and success criterion, each proven by a test or a sign-off",
+        include_str!("../playbooks/implement-speckit.plan"),
+    ),
+    (
         "rehearse",
         "Rehearse a feature's reviews: agents play each stakeholder in parallel, then actions and prepared answers",
         include_str!("../playbooks/rehearse.plan"),
@@ -111,6 +116,9 @@ pub struct Outline {
 
 const PICKED_PEER: &str = "PICKED-PEER";
 const PICKED_FOLDER: &str = "PICKED-FOLDER";
+const PICKED_SPEC: &str = "PICKED-SPEC";
+/// The playbook that imports a Spec Kit or OpenSpec spec (see [`crate::spec_import`]).
+pub const SPEC_IMPORT: &str = "implement-speckit";
 
 /// Describes playbook `name` step by step, before any value is filled in.
 pub fn outline(name: &str) -> Result<Outline> {
@@ -120,6 +128,7 @@ pub fn outline(name: &str) -> Result<Outline> {
         let value = match var.as_str() {
             "peer" => PICKED_PEER.to_owned(),
             "folder" => PICKED_FOLDER.to_owned(),
+            "spec" => PICKED_SPEC.to_owned(),
             "change" => "the change you describe".to_owned(),
             "project" => "your project".to_owned(),
             _ => continue,
@@ -294,10 +303,31 @@ pub fn variables(name: &str) -> Result<Vec<(String, Option<&'static str>)>> {
     Ok(vars)
 }
 
-/// The playbook as plan text with `vars` (and defaults) filled in. Values may not
-/// contain line breaks; ids (peers, folders, checks, topics) must be valid names.
-pub fn render(name: &str, vars: &BTreeMap<String, String>) -> Result<String> {
-    let mut text = template(name)?.to_owned();
+/// A filled-in playbook: the plan, and the knowledge to save in the profile before it
+/// runs (the implement-speckit playbook saves the spec it imports).
+#[derive(Debug, Clone)]
+pub struct Rendered {
+    pub text: String,
+    /// (topic, text, where it came from).
+    pub knowledge: Vec<(String, String, String)>,
+    /// For the person who filled it in: what was imported, and warnings.
+    pub notes: Vec<String>,
+}
+
+impl Rendered {
+    /// Saves the knowledge in `kb`; returns the topics.
+    pub fn save_knowledge(&self, kb: &crate::knowledge::KnowledgeBase) -> Result<Vec<String>> {
+        for (topic, text, source) in &self.knowledge {
+            kb.write(topic, text, source)?;
+        }
+        Ok(self.knowledge.iter().map(|k| k.0.clone()).collect())
+    }
+}
+
+/// `vars` checked, with defaults for those not given. Values may not contain line
+/// breaks; ids (peers, folders, checks, topics) must be single words.
+fn values(name: &str, vars: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
     let mut missing = Vec::new();
     for (var, default) in variables(name)? {
         let value = match (vars.get(&var), default) {
@@ -311,10 +341,12 @@ pub fn render(name: &str, vars: &BTreeMap<String, String>) -> Result<String> {
         if value.is_empty() || value.contains(['\n', '\r']) {
             bail!("{var} must be a single, non-empty line");
         }
-        if !matches!(var.as_str(), "change" | "project") && value.contains(char::is_whitespace) {
+        if !matches!(var.as_str(), "change" | "project" | "spec")
+            && value.contains(char::is_whitespace)
+        {
             bail!("{var} must be a single word, got {value:?}");
         }
-        text = text.replace(&format!("{{{{{var}}}}}"), &value);
+        values.insert(var, value);
     }
     if !missing.is_empty() {
         bail!(
@@ -323,8 +355,60 @@ pub fn render(name: &str, vars: &BTreeMap<String, String>) -> Result<String> {
             missing[0]
         );
     }
+    Ok(values)
+}
+
+/// The playbook as plan text with `vars` (and defaults) filled in, and the knowledge
+/// it needs. For [`SPEC_IMPORT`], `spec` is read and becomes the claims.
+pub fn render_full(name: &str, vars: &BTreeMap<String, String>) -> Result<Rendered> {
+    let values = values(name, vars)?;
+    if name == SPEC_IMPORT
+        && let Some(spec) = values.get("spec").filter(|s| *s != PICKED_SPEC)
+    {
+        let import = crate::spec_import::read(std::path::Path::new(spec))?;
+        let roles = crate::spec_import::Roles {
+            peer: &values["peer"],
+            folder: &values["folder"],
+            reviewers: &values["reviewers"],
+            test: &values["test"],
+            approver: &values["approver"],
+        };
+        let text = crate::spec_import::plan_text(&import, &roles)?;
+        let mut notes = vec![crate::spec_import::summary(&import)];
+        notes.extend(import.warnings.iter().map(|w| format!("Warning: {w}")));
+        return Ok(Rendered {
+            text,
+            knowledge: vec![(
+                import.topic.clone(),
+                import.knowledge.clone(),
+                format!("{} {}", import.kind.label(), import.dir.display()),
+            )],
+            notes,
+        });
+    }
+    let mut text = template(name)?.to_owned();
+    for (var, value) in &values {
+        text = text.replace(&format!("{{{{{var}}}}}"), value);
+    }
     crate::plan::Plan::parse(&text)?;
-    Ok(text)
+    Ok(Rendered {
+        text,
+        knowledge: Vec::new(),
+        notes: Vec::new(),
+    })
+}
+
+/// The playbook as plan text with `vars` (and defaults) filled in, for playbooks that
+/// need no knowledge saved first.
+pub fn render(name: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    let rendered = render_full(name, vars)?;
+    if !rendered.knowledge.is_empty() {
+        bail!(
+            "the {name} playbook saves the spec it imports as knowledge in a profile: \
+             run proofkin spec import <folder> --profile NAME (--set peer=...), or pick it in the web UI's Plan mode"
+        );
+    }
+    Ok(rendered.text)
 }
 
 #[cfg(test)]
@@ -345,6 +429,7 @@ mod tests {
             ("peer", "alice"),
             ("change", "Add CSV export"),
             ("change_id", "csv"),
+            ("spec", PICKED_SPEC),
         ]);
         for (name, _) in list() {
             let text = render(name, &all).unwrap_or_else(|e| panic!("{name}: {e:#}"));
@@ -506,6 +591,58 @@ mod tests {
                 o.steps
             );
         }
+    }
+
+    #[test]
+    fn the_spec_kit_playbook_imports_the_spec_as_claims_and_knowledge() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let feature = fixtures.join("speckit/specs/001-photo-albums");
+        let given = vars(&[
+            ("spec", feature.to_str().unwrap()),
+            ("peer", "alice"),
+            ("reviewers", "review"),
+        ]);
+        let rendered = render_full(SPEC_IMPORT, &given).unwrap();
+        let plan = crate::plan::Plan::parse(&rendered.text).unwrap();
+        assert_eq!(plan.claims.len(), 7);
+        assert_eq!(
+            plan.steps[1].target,
+            crate::plan::Target::Squad("review".into())
+        );
+        assert_eq!(rendered.knowledge[0].0, "spec-001-photo-albums");
+        assert!(
+            rendered.notes[0].starts_with("Spec Kit feature specs/001-photo-albums (Photo Albums): 5 claims proven by tests, 2 by sign-off; 1 of 5 tasks done"),
+            "{:?}",
+            rendered.notes
+        );
+        assert!(rendered.notes[1].starts_with("Warning: spec.md has 1 open question"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let kb = crate::knowledge::KnowledgeBase::new(dir.path().join("knowledge"));
+        assert_eq!(
+            rendered.save_knowledge(&kb).unwrap(),
+            ["spec-001-photo-albums"]
+        );
+        assert!(
+            kb.read("spec-001-photo-albums")
+                .unwrap()
+                .contains("Create an album")
+        );
+        crate::knowledge::check_topics(&kb, &plan.steps[0].context).unwrap();
+
+        // Without a profile to save the spec in, it can't be rendered.
+        let err = render(SPEC_IMPORT, &given).unwrap_err().to_string();
+        assert!(err.contains("proofkin spec import"), "{err}");
+        // A folder with several specs says which.
+        let several = vars(&[("spec", fixtures.to_str().unwrap()), ("peer", "alice")]);
+        let err = render_full(SPEC_IMPORT, &several).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::spec_import::SeveralSpecs>()
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
     }
 
     #[test]

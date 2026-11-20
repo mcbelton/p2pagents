@@ -1,5 +1,5 @@
 {
-  "$comment": "Evidence-driven development: every claim p2pagents makes, and the evidence that proves it. Test ids are <target>::<path> as printed by cargo test with '::tests' removed (target: lib, bin, or an integration test file name). Live checks are names printed by scripts/live_test.py; a trailing * matches a prefix. Run: python scripts/evidence.py [--live]. See README 'Evidence-driven development'.",
+  "$comment": "Evidence-driven development: every claim Proofkin makes, and the evidence that proves it. Test ids are <target>::<path> as printed by cargo test with '::tests' removed (target: lib, bin, or an integration test file name). Live checks are names printed by scripts/live_test.py; a trailing * matches a prefix. Run: python scripts/evidence.py [--live]. See README 'Evidence-driven development'.",
   "claims": [
     {
       "id": "NET-1",
@@ -46,7 +46,7 @@
     {
       "id": "SHR-1",
       "area": "shared folders",
-      "claim": "Peer tasks run only in folders the owner shared with that peer, by default the profile's own .p2pdata folder (read-only). The agent's working folder and every other folder stay private, and folders are advertised to peers by name only, never by path.",
+      "claim": "Peer tasks run only in folders the owner shared with that peer, by default the profile's own data folder (.proofkin-data) (read-only). The agent's working folder and every other folder stay private, and folders are advertised to peers by name only, never by path.",
       "tests": [
         "lib::shares::data_folder_is_built_in_read_only_and_per_profile",
         "lib::shares::shares_persist_and_names_are_validated",
@@ -54,7 +54,7 @@
         "agents::peers_reach_only_folders_shared_with_them"
       ],
       "live": [
-        "boss's task ran in worker1's .p2pdata folder",
+        "boss's task ran in worker1's data folder",
         "worker1 refused a folder it did not share with boss"
       ]
     },
@@ -761,6 +761,57 @@
       "area": "cli",
       "claim": "The command line definition is valid (no conflicting flags or subcommands).",
       "tests": ["bin::cli_definition_is_valid", "bin::runs_verify_takes_a_folder_alone_or_an_id_with_a_profile"]
+    },
+    {
+      "id": "NAME-1",
+      "area": "install",
+      "claim": "Installs from before the rename to Proofkin keep working: settings under their old names (P2PAGENTS_HOME, P2PAGENTS_SECRET_STORE, ...) apply when the PROOFKIN_* ones are unset, profiles stay in ~/.p2pagents while there is no ~/.proofkin, and data, repository and worktree folders that exist keep their old names (new ones get the new names).",
+      "tests": [
+        "lib::profile::installs_from_before_the_rename_keep_their_folders",
+        "secret_files::file_secret_store_keeps_identity_and_tokens_in_the_profile"
+      ]
+    },
+    {
+      "id": "SPEC-4",
+      "area": "spec",
+      "claim": "Spec Kit features and OpenSpec changes become evidence plans: a claim per user story (its acceptance scenarios), functional requirement or added and modified requirement, proven by the folder's tests in an implementation step and again on a reviewer's copy, and success criteria proven by a sign-off; removed and renamed requirements and edge cases become instructions; the spec, cut to fit a prompt, is saved as a knowledge topic the steps are given; a folder with several specs lists them to pick from; open questions and missing parts are flagged; spec files must be regular files inside the spec's folder, at most 1 MB (links out of it, devices and pipes are refused unread), and spec text can't add plan lines. It works from the command line, the web UI's implement-speckit playbook and the import_spec MCP tool.",
+      "tests": [
+        "lib::spec_import::spec_kit_features_become_claims_per_story_requirement_and_success_criterion",
+        "lib::spec_import::openspec_changes_become_claims_per_added_and_modified_requirement",
+        "lib::spec_import::folders_with_several_specs_list_them",
+        "lib::spec_import::long_specs_are_cut_to_fit_a_prompt",
+        "lib::spec_import::spec_text_and_folder_names_cannot_add_plan_lines",
+        "lib::spec_import::spec_files_must_be_regular_files_inside_their_folder",
+        "lib::playbooks::the_spec_kit_playbook_imports_the_spec_as_claims_and_knowledge",
+        "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a"
+      ]
+    },
+    {
+      "id": "INT-1",
+      "area": "integrations",
+      "claim": "Other agents connect over MCP (Streamable HTTP: the stateless 2026-07-28 revision, whose headers must match the body, with server/discover; and the initialize-based revisions before it) with the profile's integration token: off until the owner turns it on, valid only for MCP and A2A (and the web UI's token not there), refused from other sites' pages, and dead as soon as it's turned off. Their tools list peers, delegate tasks to peers (never this machine), check and run plans and return their evidence reports, and their work shows up as the owner's tasks; what they send is size-capped, and only the latest finished tasks are kept (the oldest go first, a plan's steps together).",
+      "tests": [
+        "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a",
+        "lib::ui::connect::secrets_compare_whole_and_headers_decode",
+        "lib::ui::the_oldest_finished_tasks_go_first_and_a_plans_steps_together",
+        "secret_files::file_secret_store_keeps_identity_and_tokens_in_the_profile",
+        "ui::the_page_follows_the_ux_guidelines"
+      ],
+      "live": [
+        "connect turned on with a token and client setups",
+        "an MCP client's task ran on a peer with real Copilot, signed by it"
+      ]
+    },
+    {
+      "id": "INT-2",
+      "area": "integrations",
+      "claim": "Other agents connect over A2A 1.0: an agent card (only while connecting is on) with the JSON-RPC interface and the bearer scheme; SendMessage runs a task on a peer or a plan, waiting for the result unless returnImmediately is set, with the peer's output, each step's output and the evidence verdict as artifacts; GetTask, ListTasks (by context, artifacts on request) and CancelTask; other versions, files, streaming, an extended card, finished and unknown tasks get A2A's errors, and work that can't start comes back as a rejected task.",
+      "tests": [
+        "connect::other_agents_hand_work_to_peers_over_mcp_and_a2a"
+      ],
+      "live": [
+        "an A2A agent's task ran on a peer with real Copilot"
+      ]
     }
   ]
 }

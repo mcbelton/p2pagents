@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build, test and run p2pagents. Reloads PATH from the registry first, so it works in
+  Build, test and run Proofkin. Reloads PATH from the registry first, so it works in
   terminals opened before Rust/MinGW were installed (e.g. an already-running VS Code).
 
 .EXAMPLE
@@ -12,7 +12,7 @@
   .\scripts\p2p.ps1 evidence    # gates + tests matched to evidence/claims.json; report in target\evidence
   .\scripts\p2p.ps1 evidence -Live   # same, plus the live internet test
   .\scripts\p2p.ps1 agent --name me --providers copilot   # run one agent in this terminal
-  .\scripts\p2p.ps1 agent auth status                     # any p2pagents command, e.g. auth
+  .\scripts\p2p.ps1 agent auth status                     # any proofkin command, e.g. auth
 #>
 param(
     [Parameter(Position = 0)]
@@ -28,7 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot
 if (-not $Workspace) { $Workspace = $Repo }
-$Exe = Join-Path $Repo 'target\debug\p2pagents.exe'
+$Exe = Join-Path $Repo 'target\debug\proofkin.exe'
 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
 
 function Test-Tool([string]$Name, [scriptblock]$Probe, [string]$Fix, [switch]$Optional) {
@@ -43,7 +43,7 @@ function Test-Tool([string]$Name, [scriptblock]$Probe, [string]$Fix, [switch]$Op
 }
 
 function Invoke-Doctor {
-    Write-Host 'Checking prerequisites for p2pagents:'
+    Write-Host 'Checking prerequisites for Proofkin:'
     $ok = $true
     $ok = (Test-Tool 'rustc >= 1.94' {
             $v = (rustc --version) -replace '^rustc (\d+\.\d+).*', '$1'
@@ -100,13 +100,13 @@ switch ($Command) {
         & $Exe share add repo $Workspace --profile worker | Out-Null
         & $Exe peers allow $bossId --profile worker --name boss --delegate --share data,repo | Out-Null
         & $Exe peers allow $workerId --profile boss --name worker | Out-Null
-        Write-Host "Allowlisted: worker <-> boss (boss may delegate to worker, read-only, in worker's .p2pdata folder and 'repo' = $Workspace). Agents find each other by key over the internet."
-        $worker = "`$Host.UI.RawUI.WindowTitle='p2pagents worker'; & '$Exe' --name worker --providers copilot --serve"
-        $boss = "`$Host.UI.RawUI.WindowTitle='p2pagents boss'; Write-Host 'Wait for + worker, then try:  /peers   and   /delegate copilot@worker:repo Summarize README.md in 3 bullets' -ForegroundColor Cyan; & '$Exe' --name boss"
+        Write-Host "Allowlisted: worker <-> boss (boss may delegate to worker, read-only, in worker's data folder and 'repo' = $Workspace). Agents find each other by key over the internet."
+        $worker = "`$Host.UI.RawUI.WindowTitle='proofkin worker'; & '$Exe' --name worker --providers copilot --serve"
+        $boss = "`$Host.UI.RawUI.WindowTitle='proofkin boss'; Write-Host 'Wait for + worker, then try:  /peers   and   /delegate copilot@worker:repo Summarize README.md in 3 bullets' -ForegroundColor Cyan; & '$Exe' --name boss"
         Start-Process $shell -ArgumentList '-NoExit', '-Command', $worker -WorkingDirectory $Repo
         Start-Sleep 2
         Start-Process $shell -ArgumentList '-NoExit', '-Command', $boss -WorkingDirectory $Repo
-        Write-Host "Opened 2 windows: 'p2pagents worker' (serves Copilot; boss may read its .p2pdata folder and $Workspace) and 'p2pagents boss'."
+        Write-Host "Opened 2 windows: 'proofkin worker' (serves Copilot; boss may read its data folder and $Workspace) and 'proofkin boss'."
         Write-Host 'Type commands in the boss window; /quit in each window to exit.'
     }
     'live-test' {

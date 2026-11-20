@@ -1,4 +1,4 @@
-// p2pagents web UI. Plain JS, no build step. All peer-provided text is rendered
+// Proofkin web UI. Plain JS, no build step. All peer-provided text is rendered
 // with textContent (never innerHTML), so chat and task output can't inject markup.
 "use strict";
 
@@ -234,7 +234,7 @@ function showAuthError() {
   pill.querySelector(".label").textContent = "Session ended";
   $("#feed").replaceChildren(el("div", { class: "feed-empty" },
     el("h2", { text: "This page's session has ended" }),
-    el("p", { text: "The agent was restarted, so its access link changed. Open the new link p2pagents printed (it ends with #t=…)." })));
+    el("p", { text: "The agent was restarted, so its access link changed. Open the new link Proofkin printed (it ends with #t=…)." })));
   for (const c of document.querySelectorAll("#composer textarea, #composer button, #add-peer-btn")) c.disabled = true;
 }
 
@@ -245,10 +245,14 @@ async function api(path, options = {}) {
   });
   if (res.status === 401) {
     showAuthError();
-    throw new Error("Session ended: open the new link printed by p2pagents");
+    throw new Error("Session ended: open the new link printed by Proofkin");
   }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const err = new Error(body.error || `${res.status} ${res.statusText}`);
+    err.body = body;
+    throw err;
+  }
   return body;
 }
 
@@ -324,7 +328,7 @@ function previewText(label) {
 function renderMe() {
   const me = state.me;
   if (!me) return;
-  document.title = `${me.name} · p2pagents`;
+  document.title = `${me.name} · Proofkin`;
   $("#me-name").textContent = me.name;
   const idChip = $("#me-id");
   idChip.textContent = me.short;
@@ -470,12 +474,14 @@ function taskNode(t) {
   const title = t.step
     ? `Step ${t.step} · ${t.approval ? "Approval" : providerLabel(t.provider)} → ${t.target}`
     : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
+  // Started by another agent (over MCP or A2A), not in this UI.
+  const via = t.via ? ` · asked by another agent (${t.via})` : "";
   const meta = t.status === "waiting"
-    ? el("div", { class: "task-meta", text: t.after?.length ? `Waits for: ${t.after.join(", ")}` : "Starting…" })
+    ? el("div", { class: "task-meta", text: (t.after?.length ? `Waits for: ${t.after.join(", ")}` : "Starting…") + via })
     : el("div", { class: "task-meta" }, `Started ${clock(t.started_ms)} · `,
       el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
         t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`),
-      t.after?.length ? ` · after ${t.after.join(", ")}` : null);
+      t.after?.length ? ` · after ${t.after.join(", ")}` : null, via || null);
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
     el("div", { class: "task-top" },
       el("span", { class: "task-title", text: title }),
@@ -1093,6 +1099,7 @@ const VAR_HELP = {
   change: "What to change, in a sentence",
   change_id: "A short id for this change (letters, digits, -)",
   project: "The project's name",
+  spec: "The feature's folder on this computer: specs/NNN-name in a Spec Kit project, or openspec/changes/<id> (a project folder with one feature works too)",
 };
 
 /// The playbook picker's step: "pick" (the list and what each does) or "fill" (who and where).
@@ -1205,6 +1212,7 @@ function renderPlaybookVars(name) {
       field = select("reviewers", state.squads.map((s) => [s.name, `#${s.name} (${s.members.map((m) => m.name).join(", ")})`]), v.default);
     } else {
       field = el("input", { type: "text", name: v.name, value: v.default ?? "", spellcheck: "false", autocomplete: "off" });
+      if (v.name === "spec") field.placeholder = "e.g. D:\\src\\shop\\specs\\001-photo-albums";
     }
     fields[v.name] = field;
     field.id = `pb-var-${v.name}`;
@@ -1268,9 +1276,25 @@ async function submitPlaybook(e) {
     $("#playbook-dialog").close("filled");
     renderPlanExplain();
     const ok = await checkPlan(res.text);
-    toast(ok ? "Playbook filled in and checked: review it, then Ctrl+Enter to run" : "Playbook filled in, but it has problems (see under the plan)", ok ? "" : "error");
+    // An imported spec: what was found (its warnings are at the top of the plan).
+    const imported = res.notes?.length ? `${res.notes[0]} ` : "";
+    toast(ok ? `${imported}Playbook filled in and checked: review it, then Ctrl+Enter to run` : `${imported}Playbook filled in, but it has problems (see under the plan)`, ok ? "" : "error");
   } catch (err) {
-    error.textContent = err.message;
+    const candidates = err.body?.candidates ?? [];
+    const spec = $("#pb-var-spec");
+    if (candidates.length && spec) {
+      error.replaceChildren(`That folder has ${candidates.length} specs. Pick one:`,
+        el("span", { class: "spec-picks" }, ...candidates.map((c) => el("button", {
+          type: "button", class: "btn small", title: c.path,
+          onclick: () => {
+            spec.value = c.path;
+            error.textContent = "";
+            $("#playbook-submit").focus();
+          },
+        }, `${c.id}: ${c.title}`))));
+    } else {
+      error.textContent = err.message;
+    }
   } finally {
     button.disabled = false;
     button.textContent = playbookPicker.step === "pick" ? "Next: who and where" : "Fill in the plan";
@@ -1432,7 +1456,7 @@ async function loadOps() {
   const health = $("#health");
   health.replaceChildren();
   if (!ops.monitors.length) {
-    health.append(el("p", { class: "muted small" }, "No monitors. Add one with ", el("span", { class: "mono", text: "p2pagents monitor add" }), " to track availability and heal incidents."));
+    health.append(el("p", { class: "muted small" }, "No monitors. Add one with ", el("span", { class: "mono", text: "proofkin monitor add" }), " to track availability and heal incidents."));
   }
   const list = el("ul", { class: "monitor-list" });
   for (const m of ops.monitors) {
@@ -1447,7 +1471,7 @@ async function loadOps() {
       el("span", { class: "muted small", text: m.problem ? "not checked" : `${m.availability == null ? "no data" : `${m.availability.toFixed(2)}%`} · SLO ${m.slo}%${m.meets_slo === false ? " missed" : ""}${m.p95_ms != null ? ` · p95 ${m.p95_ms} ms` : ""}` }),
       el("span", { class: `status ${cls}`, text: label }),
       m.problem ? el("span", { class: "problem" }, `${m.problem[0].toUpperCase()}${m.problem.slice(1)}. Fix the folder or its check, or remove the monitor: `,
-        el("span", { class: "mono", text: `p2pagents monitor remove ${m.name}` })) : null));
+        el("span", { class: "mono", text: `proofkin monitor remove ${m.name}` })) : null));
   }
   health.append(list);
   const t = ops.tasks;
@@ -1639,8 +1663,8 @@ let prTarget = null;
 function openPr(r, b) {
   prTarget = { repo: r, branch: b.name };
   $("#pr-desc").textContent = `${b.name} → ${r.branch} in ${r.slug}`;
-  $("#pr-title").value = b.subject.replace(/^p2pagents: /, "");
-  $("#pr-body").value = `Made by p2pagents (branch ${b.name}). See the evidence run for checks and sign-offs.`;
+  $("#pr-title").value = b.subject.replace(/^(proofkin|p2pagents): /, "");
+  $("#pr-body").value = `Made by Proofkin (branch ${b.name}). See the evidence run for checks and sign-offs.`;
   $("#pr-error").textContent = "";
   $("#pr-dialog").showModal();
   $("#pr-title").focus();
@@ -1919,7 +1943,7 @@ async function loadState() {
   renderFeed();
   renderTasks();
   renderApprovals();
-  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools(), loadWorkers()]);
+  await Promise.all([loadAudit(), loadRuns(), loadOps(), loadSchedules(), loadTools(), loadWorkers(), loadConnect()]);
 }
 
 let events = null;
@@ -2086,7 +2110,7 @@ function init() {
   if (!token) {
     $("#feed").replaceChildren(el("div", { class: "feed-empty" },
       el("h2", { text: "Access token missing" }),
-      el("p", { text: "Open the full link that p2pagents printed when it started (it ends with #t=…)." })));
+      el("p", { text: "Open the full link that Proofkin printed when it started (it ends with #t=…)." })));
     return;
   }
   loadState().then(connectEvents).catch((err) => toast(err.message, "error"));

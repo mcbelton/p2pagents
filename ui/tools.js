@@ -1,4 +1,4 @@
-// p2pagents web UI: Plugins & tools. Import plugins (reviewed before anything is
+// Proofkin web UI: Plugins & tools. Import plugins (reviewed before anything is
 // kept; importing runs nothing), offer MCP servers in shared folders, and add the
 // profile's own skills and agents. Uses app.js helpers: $, el, api, toast,
 // confirmDialog, radioGroup, openSkill, loadSkills, ACCESS_SHORT. Plugin and server
@@ -366,7 +366,7 @@ function renderOffered() {
   const shares = tools.mcp.shares;
   if (!shares.length) {
     box.replaceChildren(el("p", { class: "empty" }, "No shared folders yet. Share one with ",
-      el("span", { class: "mono", text: "p2pagents share add NAME PATH" }), " or link a GitHub repository, then offer servers in it."));
+      el("span", { class: "mono", text: "proofkin share add NAME PATH" }), " or link a GitHub repository, then offer servers in it."));
     return;
   }
   box.replaceChildren(...shares.map((sh) => el("div", { class: "share-block" },
@@ -725,7 +725,7 @@ async function readConfig() {
   f.configServer.replaceChildren(...servers.map((s) => el("option", { value: s.server, text: s.server })));
   f.configNotes.replaceChildren(...tools.parsed.notes.map((n) => el("p", { class: "note", text: n })));
   f.configPicked.hidden = !servers.length;
-  if (!servers.length) f.error.textContent = "It has no servers p2pagents can offer.";
+  if (!servers.length) f.error.textContent = "It has no servers Proofkin can offer.";
   onConfigServerChange();
   f.configServer.focus();
 }

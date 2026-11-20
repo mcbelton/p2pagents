@@ -1,7 +1,7 @@
 //! Skills: reusable instructions for agents (how to bootstrap a project, review
 //! security, debug an incident, ...). A plan step names them with `skill=a,b` and
 //! the boss puts their text in the step's prompt, so every peer gets the same
-//! procedure whichever provider runs it. Built-in skills ship with p2pagents
+//! procedure whichever provider runs it. Built-in skills ship with proofkin
 //! (`skills/*.md`); a profile's own skills (`<profile>/skills/<name>.md`) are added
 //! to them and replace built-ins of the same name. Enabled plugins add theirs
 //! (`SKILL.md`): by name when no other skill has it, always as `<plugin>.<skill>`.
@@ -455,7 +455,7 @@ impl Skills {
             return std::fs::read_to_string(&skill.path)
                 .with_context(|| format!("reading skill '{name}' of plugin '{}'", skill.plugin));
         }
-        bail!("there is no skill '{name}' (see p2pagents skill list)")
+        bail!("there is no skill '{name}' (see proofkin skill list)")
     }
 
     pub fn list(&self) -> Vec<SkillInfo> {
@@ -592,7 +592,7 @@ impl Skills {
             return Ok(def);
         }
         let Some(a) = self.plugin_agent(name) else {
-            bail!("there is no agent '{name}' (see p2pagents agent list)");
+            bail!("there is no agent '{name}' (see proofkin agent list)");
         };
         let what = format!("agent '{name}' of plugin '{}'", a.plugin);
         let text = Self::read_prompt_file(&a.path, &what).context("update the plugin")?;

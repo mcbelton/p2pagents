@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evidence-driven development for p2pagents.
+"""Evidence-driven development for proofkin.
 
 Runs the quality gates and the test suite, matches every result against the claims in
 evidence/claims.json, and writes an evidence report to target/evidence/:
@@ -206,7 +206,7 @@ def main():
 def render_markdown(report):
     meta = report["meta"]
     lines = [
-        f"# p2pagents evidence report: {meta['result']}",
+        f"# proofkin evidence report: {meta['result']}",
         "",
         "| | |", "| --- | --- |",
         *[f"| {k.replace('_', ' ')} | {v} |" for k, v in meta.items() if k != "result"],

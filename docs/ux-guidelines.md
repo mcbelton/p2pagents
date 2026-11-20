@@ -1,6 +1,6 @@
 # UX design guidelines
 
-The web UI (`p2pagents --ui`) is where owners run agents, review evidence and
+The web UI (`proofkin --ui`) is where owners run agents, review evidence and
 configure what peers may use. These guidelines keep it calm, predictable and
 accessible. Every UI change follows them, and the checklist at the end is part of
 its definition of done.

@@ -26,7 +26,7 @@ pub fn installed_bridge_dir() -> Result<PathBuf> {
     Ok(data_root()?.join("bridge"))
 }
 
-/// Bridge script to use: `explicit` (`--bridge` / `P2PAGENTS_BRIDGE`), else the one
+/// Bridge script to use: `explicit` (`--bridge` / `PROOFKIN_BRIDGE`), else the one
 /// installed by `setup`, else a source checkout's `bridge/` (development builds).
 pub fn resolve_bridge(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(path) = explicit {
@@ -56,7 +56,7 @@ fn npm() -> Command {
     }
 }
 
-/// Writes the bridge to `~/.p2pagents/bridge` and installs the pinned Claude Agent
+/// Writes the bridge to `~/.proofkin/bridge` and installs the pinned Claude Agent
 /// SDK and Codex SDK packages (`npm ci`). `registry` overrides the npm registry.
 pub fn install_bridge(registry: Option<&str>) -> Result<PathBuf> {
     let dir = installed_bridge_dir()?;
@@ -116,7 +116,7 @@ fn report(ok: bool, what: &str, detail: impl AsRef<str>) -> bool {
 /// Checks the machine for everything agents need; returns whether the core parts are ready.
 pub async fn doctor(bridge: &Path) -> Result<bool> {
     println!(
-        "p2pagents {} (data: {})",
+        "proofkin {} (data: {})",
         env!("CARGO_PKG_VERSION"),
         data_root()?.display()
     );
@@ -147,7 +147,7 @@ pub async fn doctor(bridge: &Path) -> Result<bool> {
         None => report(
             false,
             "node (claude/codex)",
-            "optional; for claude/codex: install Node.js 18+, then p2pagents setup",
+            "optional; for claude/codex: install Node.js 18+, then proofkin setup",
         ),
     };
     let bridge_ok = bridge.is_file()
@@ -160,7 +160,7 @@ pub async fn doctor(bridge: &Path) -> Result<bool> {
         if bridge_ok {
             bridge.display().to_string()
         } else {
-            "optional; run: p2pagents setup".into()
+            "optional; run: proofkin setup".into()
         },
     );
 

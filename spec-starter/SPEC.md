@@ -1,6 +1,6 @@
 # {{title}}: spec
 
-This is a starter example (a member's list of items). Replace it with your feature, keeping the headings and the id formats: `p2pagents spec check` validates them.
+This is a starter example (a member's list of items). Replace it with your feature, keeping the headings and the id formats: `proofkin spec check` validates them.
 
 ## Problem
 Members keep the items they must deal with in scattered notes, so they lose track of them and miss some.

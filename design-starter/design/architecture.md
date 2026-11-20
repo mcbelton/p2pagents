@@ -1,6 +1,6 @@
 # {{title}}: architecture
 
-A starter example for the member's list of items in `spec/SPEC.md`. Replace it with your design and keep the headings: `p2pagents spec check design` checks them.
+A starter example for the member's list of items in `spec/SPEC.md`. Replace it with your design and keep the headings: `proofkin spec check design` checks them.
 
 ## Context
 

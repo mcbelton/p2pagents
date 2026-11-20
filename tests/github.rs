@@ -6,9 +6,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use p2pagents::github::{GithubCredentials, RepoStore, link_url, task_branches, unlink};
-use p2pagents::worktree::Worktree;
-use p2pagents::{Access, Profile};
+use proofkin::github::{GithubCredentials, RepoStore, link_url, task_branches, unlink};
+use proofkin::worktree::Worktree;
+use proofkin::{Access, Profile};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -127,7 +127,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
         .await
         .unwrap();
     std::fs::write(wt.path.join("feature.txt"), "new\n").unwrap();
-    wt.commit("p2pagents: task 1 from boss\n\nAdd the feature")
+    wt.commit("proofkin: task 1 from boss\n\nAdd the feature")
         .await
         .unwrap();
     drop(wt);
@@ -136,7 +136,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
     assert!(
         branches[0]
             .subject
-            .starts_with("p2pagents: task 1 from boss")
+            .starts_with("proofkin: task 1 from boss")
     );
 
     creds.push(&repo, "p2p/boss/1-1").await.unwrap();
@@ -176,7 +176,7 @@ async fn linked_repositories_clone_share_sync_push_and_open_pull_requests() {
         }
     }
     // SAFETY: this test binary has a single test, so nothing reads the environment concurrently.
-    unsafe { std::env::set_var("P2PAGENTS_GH", &fake) };
+    unsafe { std::env::set_var("PROOFKIN_GH", &fake) };
     let pr = creds
         .create_pr(&repo, "p2p/boss/1-1", "Add the feature", "Made by agents.")
         .await

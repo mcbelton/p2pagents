@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Installs the p2pagents binary from GitHub releases (no source code or Rust needed).
+  Installs the Proofkin binary (proofkin.exe) from GitHub releases (no source code or Rust needed).
 
 .EXAMPLE
   irm https://github.com/mcbelton/p2pagents/releases/latest/download/install.ps1 | iex
@@ -8,16 +8,16 @@
 param(
     [string]$Version = 'latest',
     [string]$Repo = 'mcbelton/p2pagents',
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'p2pagents\bin'),
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'proofkin\bin'),
     # GitHub CLI account to download with (default: gh's active account).
     [string]$GhUser
 )
 $ErrorActionPreference = 'Stop'
 $arch = try { [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { $env:PROCESSOR_ARCHITECTURE }
 # Native ARM64 build when available; x64 also runs on Windows ARM through emulation.
-$assets = if ($arch -match 'arm64') { 'p2pagents-aarch64-pc-windows-msvc.zip', 'p2pagents-x86_64-pc-windows-msvc.zip' }
-          else { @('p2pagents-x86_64-pc-windows-msvc.zip') }
-$tmp = Join-Path ([IO.Path]::GetTempPath()) "p2pagents-install-$PID"
+$assets = if ($arch -match 'arm64') { 'proofkin-aarch64-pc-windows-msvc.zip', 'proofkin-x86_64-pc-windows-msvc.zip' }
+          else { @('proofkin-x86_64-pc-windows-msvc.zip') }
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "proofkin-install-$PID"
 New-Item -ItemType Directory $tmp -Force | Out-Null
 $savedToken = $env:GH_TOKEN
 try {
@@ -66,13 +66,17 @@ if (($userPath -split ';') -notcontains $InstallDir) {
     Write-Host "Added $InstallDir to your user PATH (open a new terminal to use it)."
 }
 $env:Path = "$InstallDir;$env:Path"
-Write-Host "Installed: $(& (Join-Path $InstallDir 'p2pagents.exe') --version)"
+Write-Host "Installed: $(& (Join-Path $InstallDir 'proofkin.exe') --version)"
+$legacy = Join-Path $env:LOCALAPPDATA 'p2pagents\bin'
+if (Test-Path (Join-Path $legacy 'p2pagents.exe')) {
+    Write-Host "p2pagents is now Proofkin: use proofkin (same profiles and data). You can delete $legacy and remove it from your PATH."
+}
 Write-Host @'
 Next steps:
   winget install GitHub.Copilot        # Copilot CLI (each agent runs its own instance)
   winget install GitHub.cli; gh auth login   # optional: easiest way to sign agents in to GitHub accounts
-  p2pagents setup                      # optional: Claude/Codex support (needs Node.js 18+)
-  p2pagents doctor                     # check everything
-  p2pagents auth login copilot --profile <me> --gh-user <github-login>
-  p2pagents peers id --profile <me>    # share your ticket with peers
+  proofkin setup                      # optional: Claude/Codex support (needs Node.js 18+)
+  proofkin doctor                     # check everything
+  proofkin auth login copilot --profile <me> --gh-user <github-login>
+  proofkin peers id --profile <me>    # share your ticket with peers
 '@

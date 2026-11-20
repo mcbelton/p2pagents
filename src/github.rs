@@ -1,5 +1,5 @@
 //! GitHub: a profile signs in with an account of the GitHub CLI, links repositories
-//! (cloned with that account into `~/.p2prepos/<profile>/<name>` and shared with
+//! (cloned with that account into `~/.proofkin-repos/<profile>/<name>` and shared with
 //! peers as a folder with a git worktree per task), keeps them in sync, pushes the
 //! branches agents' tasks committed to (`p2p/...`) and opens pull requests.
 //!
@@ -127,9 +127,9 @@ pub fn gh_accounts() -> Vec<(String, String, bool)> {
     accounts
 }
 
-/// The GitHub CLI (`P2PAGENTS_GH` overrides it, e.g. for tests).
+/// The GitHub CLI (`PROOFKIN_GH` overrides it, e.g. for tests).
 fn gh_program() -> PathBuf {
-    std::env::var_os("P2PAGENTS_GH")
+    crate::profile::env_setting_os("GH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("gh"))
 }
@@ -427,7 +427,7 @@ mod tests {
             ("corp.ghe.com".into(), "team/app".into())
         );
         for bad in [
-            "p2pagents",
+            "proofkin",
             "a/b/c/d",
             "owner/../x",
             "owner/re po",

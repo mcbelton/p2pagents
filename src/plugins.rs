@@ -458,7 +458,7 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_owned()
 }
 
-/// A name p2pagents accepts, from `name` (`My Plugin` -> `my-plugin`).
+/// A name proofkin accepts, from `name` (`My Plugin` -> `my-plugin`).
 fn safe_name(name: &str) -> String {
     let mut out: String = name
         .trim()
@@ -819,7 +819,7 @@ pub fn inspect(root: &Path) -> Result<Inspection> {
     }
     if skills.is_empty() && mcp.is_empty() && agents.is_empty() {
         bail!(
-            "{} has no skills (skills/NAME/SKILL.md), agents (agents/*.md) or MCP servers (.mcp.json or mcp.json) that p2pagents can use{}",
+            "{} has no skills (skills/NAME/SKILL.md), agents (agents/*.md) or MCP servers (.mcp.json or mcp.json) that proofkin can use{}",
             if manifest_path.is_some() {
                 format!("plugin '{name}'")
             } else {

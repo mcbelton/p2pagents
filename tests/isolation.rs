@@ -3,8 +3,8 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use p2pagents::llm::Bridge;
-use p2pagents::{Access, LlmTask, Provider};
+use proofkin::llm::Bridge;
+use proofkin::{Access, LlmTask, Provider};
 
 #[tokio::test]
 async fn bridge_gets_only_the_profile_credentials() {

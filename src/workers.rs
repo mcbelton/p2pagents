@@ -2,7 +2,7 @@
 //! its own agent, with its own key, allowlist, folders and audit log, on its
 //! owner's sign-ins. This module creates them with their folders and allowlists,
 //! lists and deletes them, and starts and stops them for the owner's agent: a
-//! [`Supervisor`] runs each one as a background `p2pagents` agent that dials its
+//! [`Supervisor`] runs each one as a background `proofkin` agent that dials its
 //! owner and takes its input from it, so it stops cleanly when the owner stops it,
 //! or when the owner's agent ends, however that ends.
 
@@ -289,7 +289,7 @@ struct Running {
     stopping: bool,
 }
 
-/// How workers run: the `p2pagents` program and the network they join.
+/// How workers run: the `proofkin` program and the network they join.
 #[derive(Debug, Clone)]
 pub struct Launch {
     pub exe: PathBuf,
