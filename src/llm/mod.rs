@@ -115,6 +115,10 @@ pub struct LlmTask {
     /// Names of the folder's owner-defined MCP servers the model may use.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<String>,
+    /// A team step: the worker (a lead) runs its folder's team plan for it instead of
+    /// a model (see [`crate::team`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::team::TeamRequest>,
 }
 
 impl LlmTask {
@@ -128,6 +132,7 @@ impl LlmTask {
             attempts: None,
             patch: None,
             mcp: Vec::new(),
+            team: None,
         }
     }
 

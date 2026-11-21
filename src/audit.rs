@@ -48,6 +48,13 @@ pub struct AuditEntry {
     pub prompt_chars: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What it was part of on the peer's side, e.g. "step fix of run 20261121-…".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// A team step: it ran the folder's team plan on this agent's own peers rather
+    /// than a model of `provider`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub team: bool,
 }
 
 impl AuditEntry {
@@ -89,6 +96,8 @@ impl AuditEntry {
             prompt_sha256: data_encoding::HEXLOWER.encode(&Sha256::digest(task.prompt.as_bytes())),
             prompt_chars: task.prompt.chars().count(),
             error,
+            origin: None,
+            team: task.team.is_some(),
         }
     }
 }

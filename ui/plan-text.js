@@ -5,20 +5,23 @@ const planText = (() => {
   // Step and claim names: letters, digits, '-', '_' or '.', not starting with '.'.
   const NAME = /^(?!\.)[A-Za-z0-9._-]{1,64}$/;
   // Words that start a part of a step line, so never its name.
-  const KEYWORDS = new Set(["after", "approve", "using"]);
+  const KEYWORDS = new Set(["after", "approve", "team", "using"]);
   // Step options (before what to do), by the option they set. Repeating a list
   // option adds to it; the others take one value.
   const LISTS = new Map([["verify", "verify"], ["mcp", "mcp"], ["skill", "skill"], ["skills", "skill"],
     ["context", "context"], ["claims", "claims"], ["claim", "claims"]]);
-  const SINGLE = new Set(["attempts", "save", "apply", "agent"]);
+  const SINGLE = new Set(["attempts", "save", "apply", "agent", "levels", "timeout"]);
   // A sign-off is a person's decision: no checks, retries, patches, saved result or agent.
-  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent"]);
+  const NOT_IN_SIGNOFF = new Set(["verify", "attempts", "apply", "save", "agent", "levels"]);
+  // A team step is done and proven by the lead's team plan.
+  const NOT_IN_TEAM = new Set(["verify", "attempts", "apply", "mcp", "agent"]);
   /// What a new step does until you say: selected, so typing replaces it (the plan
   /// check refuses to run it as is, see src/plan.rs).
   const TODO = "What to do";
   const ERRORS = {
     squadSignoff: "A sign-off needs a person (@name or @me), not a squad.",
     signoffOption: "A sign-off is a person's decision: it has no checks, retries, patches, saved result or agent.",
+    teamOption: "A team step is done and proven by the lead's team plan: it has no checks, retries, patches, MCP servers or agent of its own.",
     ownStep: (id) => `Step ${id} can't wait for itself.`,
   };
 
@@ -87,7 +90,7 @@ const planText = (() => {
   /// are found, repeated options are merged, and a line of plain words is what to do.
   function parseStep(line) {
     const words = line.trim().split(/\s+/).filter(Boolean);
-    const step = { id: null, after: [], approve: false, target: null, using: null, options: [], todo: "" };
+    const step = { id: null, after: [], approve: false, team: false, target: null, using: null, options: [], todo: "" };
     const found = [];
     let i = 0;
     if (NAME.test(words[0] ?? "") && !KEYWORDS.has(words[0])) step.id = words[i++];
@@ -96,8 +99,10 @@ const planText = (() => {
       if (word === "after" && !step.target && !step.after.length && next) {
         step.after = next.split(",").filter(Boolean);
         i++;
-      } else if (word === "approve" && !step.target && !step.approve) {
+      } else if (word === "approve" && !step.target && !step.approve && !step.team) {
         step.approve = true;
+      } else if (word === "team" && !step.target && !step.approve && !step.team) {
+        step.team = true;
       } else if (isTarget(word) && !step.target) {
         step.target = word;
       } else if (word === "using" && step.target && !step.using && next) {
@@ -119,7 +124,7 @@ const planText = (() => {
   }
 
   /// A step as plan text, its parts in the order the parser reads them.
-  const formatStep = (s) => [s.id, s.after.length ? `after ${s.after.join(",")}` : "", s.approve ? "approve" : "",
+  const formatStep = (s) => [s.id, s.after.length ? `after ${s.after.join(",")}` : "", s.approve ? "approve" : "", s.team ? "team" : "",
     s.target, s.using ? `using ${s.using}` : "", ...s.options, s.todo].filter(Boolean).join(" ");
 
   /// The names of the plan's steps.
@@ -169,6 +174,7 @@ const planText = (() => {
       if (!step.after.includes(dep)) step.after.push(dep);
     } else {
       if (step.approve && NOT_IN_SIGNOFF.has(optionOf(part))) return { error: ERRORS.signoffOption };
+      if (step.team && NOT_IN_TEAM.has(optionOf(part))) return { error: ERRORS.teamOption };
       setOption(step, part);
     }
     step.id ??= nextStepId(text);
@@ -392,7 +398,7 @@ const planText = (() => {
       if (blank(s.todo, TODO)) {
         need("step", i, "todo", s.approve ? "Say what to check before signing off" : "Say what this step should do");
       }
-      if (!s.approve && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
+      if (!s.approve && !s.team && valuesOf(s, "claims").length && !valuesOf(s, "verify").length) {
         need("step", i, "claims", "Without a check, this step can't prove a claim: pick a check, or let a sign-off prove it");
       }
     });

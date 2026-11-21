@@ -395,6 +395,16 @@ function renderMe() {
   }
 }
 
+/** How busy a peer says it is with its peers' tasks (newer peers say). */
+function loadBadge(p) {
+  const l = p.load;
+  if (!l || !p.capabilities.length) return null;
+  const title = `Tasks it runs for its peers now (${l.slots} at a time), and those waiting for a slot${l.yours ? `; ${l.yours} of them yours` : ""}`;
+  if (!l.running && !l.queued) return el("span", { class: "badge neutral", title, text: "idle" });
+  return el("span", { class: "badge busy", title,
+    text: `${l.running}/${l.slots} busy${l.queued ? ` · ${l.queued} waiting` : ""}` });
+}
+
 function renderPeers() {
   const list = $("#peer-list");
   list.replaceChildren();
@@ -418,7 +428,8 @@ function renderPeers() {
           el("span", { class: "mono", text: p.short }),
           p.capabilities.length
             ? p.capabilities.map((c) => el("span", { class: "badge", text: providerLabel(c) }))
-            : el("span", { class: "badge neutral", text: "no providers" })))));
+            : el("span", { class: "badge neutral", text: "no providers" }),
+          loadBadge(p)))));
   }
 
   const trust = $("#trust-list");
@@ -541,17 +552,45 @@ function copyTicket() {
 }
 
 const openResults = new Map();
+const openPlans = new Map();
+const STATUS_TEXT = {
+  running: "Running", done: "Done", failed: "Failed", cancelled: "Cancelled", waiting: "Waiting", skipped: "Skipped",
+};
+
+function statusNode(status) {
+  return el("span", { class: `status ${status}` },
+    status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, STATUS_TEXT[status] ?? status);
+}
+
+/** A team run's steps as its lead reports them: each one's status, who runs it and
+ * what it is doing; a team step's own team run nested a level further down. */
+function teamStepsNode(steps, label) {
+  return el("ol", { class: "team-steps", "aria-label": label },
+    ...steps.map((s) => el("li", { class: `team-step ${s.status}` },
+      el("div", { class: "team-step-top" },
+        statusNode(s.status),
+        el("span", { class: "mono", text: s.id }),
+        el("span", { class: "muted small", text: `on ${s.target}${s.signed ? " · signed ✓" : ""}` })),
+      s.text ? el("p", { class: "team-step-text", text: s.text }) : null,
+      s.steps?.length ? teamStepsNode(s.steps, `Team run of step ${s.id}`) : null)));
+}
+
+/** A team step's result without the summary of its team run at the top (its card
+ * shows the run and its steps above it); Copy still copies all of it. */
+function teamResult(t) {
+  if (!t.team || !t.output.startsWith("Team run ")) return t.output;
+  const at = t.output.indexOf("\n### ");
+  return at < 0 ? t.output : t.output.slice(at + 1);
+}
 
 function taskNode(t) {
-  const statusText = {
-    running: "Running", done: "Done", failed: "Failed", cancelled: "Cancelled", waiting: "Waiting", skipped: "Skipped",
-  }[t.status];
   const elapsed = (t.finished_ms || Date.now()) - t.started_ms;
   const title = t.step
-    ? `Step ${t.step} · ${t.approval ? "Approval" : providerLabel(t.provider)} → ${t.target}`
+    ? `Step ${t.step} · ${t.approval ? "Approval" : t.team_step ? "Team" : providerLabel(t.provider)} → ${t.target}`
     : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
-  // Started by another agent (over MCP or A2A), not in this UI.
-  const via = t.via ? ` · asked by another agent (${t.via})` : "";
+  // Started by another agent (over MCP or A2A), not in this UI; or a step of a team
+  // run this agent leads for a peer.
+  const via = t.via ? ` · asked by another agent (${t.via})` : t.for_peer ? ` · for ${t.for_peer}'s team step` : "";
   // A task the agent stopped in the middle (it restarted since) has no end time.
   const ran = t.status === "running" ? `running ${duration(elapsed)}` : t.finished_ms ? `took ${duration(elapsed)}` : null;
   const meta = t.status === "waiting"
@@ -560,7 +599,7 @@ function taskNode(t) {
       ran ? " · " : null,
       ran ? el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null }, ran) : null,
       t.after?.length ? ` · after ${t.after.join(", ")}` : null, via || null);
-  const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
+  const node = el("li", { class: `task ${t.status}`, "data-task": t.id, tabindex: "-1" },
     el("div", { class: "task-top" },
       el("span", { class: "task-title", text: title }),
       t.evidence ? el("span", {
@@ -570,10 +609,20 @@ function taskNode(t) {
           : "The evidence is NOT validly signed by that peer",
         text: t.evidence === "verified" ? "Signed ✓" : "Unverified ✗",
       }) : null,
-      el("span", { class: `status ${t.status}` },
-        t.status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, statusText)),
+      statusNode(t.status)),
     el("p", { class: "task-prompt", text: t.prompt }),
     meta);
+  // What its peer last said it is doing (queued, attempt 2 of 3, running a check…).
+  if (t.status === "running" && t.progress?.text) {
+    node.append(el("p", { class: `task-progress ${t.progress.phase ?? ""}`, text: t.progress.text }));
+  }
+  // A team step: its lead's team, live, then as the team run ended.
+  const team = t.status === "running" ? t.progress?.steps : t.team?.steps;
+  if (team?.length) {
+    node.append(el("div", { class: "team-run" },
+      el("p", { class: "task-meta", text: t.team ? `${t.team.lead}'s team run ${t.team.run}: ${t.team.verdict}` : `${t.target}'s team:` }),
+      teamStepsNode(team, `The team steps of ${t.step ? `step ${t.step}` : `task #${t.id}`}`)));
+  }
   // Why it was cancelled or skipped (by you, a failed step, or the agent stopping).
   if (t.output && ["cancelled", "skipped"].includes(t.status)) {
     node.append(el("p", { class: "task-meta task-why", text: t.output }));
@@ -589,19 +638,17 @@ function taskNode(t) {
           : "Sandboxed preview of the UX prototype this step created",
       })));
   }
-  if (t.status === "running" || (t.plan && t.status === "waiting")) {
+  // A plan's steps are cancelled, and open their evidence run, from the plan.
+  if (!t.plan && t.status === "running") {
     node.append(el("button", {
-      type: "button", class: "btn small",
-      "aria-label": t.plan ? `Cancel the plan of step ${t.step}` : `Cancel task #${t.id}`,
+      type: "button", class: "btn small", "aria-label": `Cancel task #${t.id}`,
       onclick: (e) => cancelTask(t, e.currentTarget),
-    }, icon(ICONS.stop), t.plan ? "Cancel plan" : "Cancel"));
+    }, icon(ICONS.stop), "Cancel"));
   }
-  // Its evidence run keeps what proves it (the plan's, or the task's own).
-  if (t.run) {
+  if (!t.plan && t.run) {
     node.append(el("div", { class: "task-actions" },
       el("button", {
-        type: "button", class: "btn small",
-        "aria-label": `Open the evidence run of ${t.step ? `step ${t.step}` : `task #${t.id}`}`,
+        type: "button", class: "btn small", "aria-label": `Open the evidence run of task #${t.id}`,
         onclick: () => openRun(t.run),
       }, "Evidence run")));
   }
@@ -611,12 +658,87 @@ function taskNode(t) {
       el("summary", { text: t.status === "failed" ? "Error" : "Result" }),
       t.status === "failed"
         ? el("pre", { text: t.output, tabindex: "0" })
-        : el("div", { class: "result", tabindex: "0" }, renderMarkdown(t.output)),
+        : el("div", { class: "result", tabindex: "0" }, renderMarkdown(teamResult(t))),
       el("button", { type: "button", class: "btn small", onclick: () => copy(t.output, "Result") }, icon(ICONS.copy), "Copy"));
     details.addEventListener("toggle", () => openResults.set(t.id, details.open));
     node.append(details);
   }
   return node;
+}
+
+/** The step of a plan, shown: its plan's steps open, and it in view and focused. */
+function showStep(id) {
+  const card = document.querySelector(`[data-task="${id}"]`);
+  if (!card) return;
+  const details = card.closest("details");
+  if (details) details.open = true;
+  card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  card.focus({ preventScroll: true });
+}
+
+/** A plan run (here, or a team run this agent leads for a peer): how far it is, its
+ * steps in the order they can run, then each step. */
+function planNode(planId, steps) {
+  const count = (status) => steps.filter((s) => s.status === status).length;
+  const [done, running, waiting] = [count("done"), count("running"), count("waiting")];
+  const ended = !running && !waiting;
+  const lead = steps.find((s) => s.for_peer)?.for_peer;
+  const words = [
+    `${done} of ${steps.length} step${steps.length === 1 ? "" : "s"} done`,
+    running ? `${running} running` : "", waiting ? `${waiting} waiting` : "",
+    ...["failed", "skipped", "cancelled"].map((s) => (count(s) ? `${count(s)} ${s}` : "")),
+  ].filter(Boolean).join(" · ");
+  const bar = el("div", {
+    class: "plan-bar", role: "progressbar", "aria-label": lead ? `Team run for ${lead}` : "Plan progress",
+    "aria-valuemin": "0", "aria-valuemax": String(steps.length), "aria-valuenow": String(steps.length - running - waiting),
+    "aria-valuetext": words,
+  });
+  for (const status of ["done", "failed", "skipped", "cancelled", "running", "waiting"]) {
+    if (!count(status)) continue;
+    const seg = el("span", { class: `seg ${status}` });
+    seg.style.flexGrow = String(count(status));
+    bar.append(seg);
+  }
+  // Columns by how long each step waits: those in a column can run side by side.
+  const byStep = new Map(steps.map((s) => [s.step, s]));
+  const depth = new Map();
+  const depthOf = (s, path = new Set()) => {
+    if (depth.has(s.step)) return depth.get(s.step);
+    if (path.has(s.step)) return 0;
+    path.add(s.step);
+    const deps = (s.after ?? []).map((d) => byStep.get(d)).filter(Boolean);
+    const d = deps.length ? 1 + Math.max(...deps.map((x) => depthOf(x, path))) : 0;
+    depth.set(s.step, d);
+    return d;
+  };
+  const columns = [];
+  for (const s of steps) (columns[depthOf(s)] ??= []).push(s);
+  const graph = el("ol", { class: "plan-graph", "aria-label": "Its steps in the order they can run: each column waits for the one before" },
+    ...columns.map((col) => el("li", { class: "plan-col" },
+      ...col.map((s) => el("button", {
+        type: "button", class: `step-chip ${s.status}`,
+        title: s.progress?.text || s.prompt,
+        "aria-label": `Step ${s.step}: ${STATUS_TEXT[s.status]} on ${s.target}${s.status === "running" && s.progress?.text ? `, ${s.progress.text}` : ""}. Show it`,
+        onclick: () => showStep(s.id),
+      }, el("span", { class: "dot", "aria-hidden": "true" }), el("span", { class: "mono", text: s.step }),
+      el("span", { class: "chip-who", text: s.target }))))));
+  const active = steps.find((s) => s.status === "running" || s.status === "waiting");
+  const runId = steps.find((s) => s.run)?.run;
+  const head = el("div", { class: "plan-head" },
+    el("span", { class: "task-title", text: lead ? `Team run for ${lead}'s team step` : `Plan · started ${stamp(steps[0].started_ms)}` }),
+    el("span", { class: "head-actions" },
+      runId ? el("button", { type: "button", class: "btn small", "aria-label": "Open the plan's evidence run", onclick: () => openRun(runId) }, "Evidence run") : null,
+      active && !lead ? el("button", {
+        type: "button", class: "btn small", "aria-label": "Cancel the plan", onclick: (e) => cancelTask(active, e.currentTarget),
+      }, icon(ICONS.stop), "Cancel plan") : null));
+  const open = openPlans.has(planId) ? openPlans.get(planId) : !ended;
+  const details = el("details", { class: "plan-steps", open: open || undefined },
+    el("summary", { text: `Steps (${steps.length})` }),
+    el("ol", { class: "task-list" }, ...steps.map(taskNode)));
+  details.addEventListener("toggle", () => openPlans.set(planId, details.open));
+  return el("li", { class: `plan-group${ended ? " ended" : ""}`, "data-plan": planId },
+    head, el("p", { class: "task-meta", text: lead ? `${words}. Your team runs it; ${lead} sees each step as it goes.` : words }),
+    bar, graph, details);
 }
 
 function renderTasks() {
@@ -628,10 +750,17 @@ function renderTasks() {
     list.append(el("li", { class: "empty" }, "No tasks yet. Choose ", el("strong", { text: "Run task" }),
       " below to run a prompt on this agent or a peer."));
   }
-  for (const t of [...state.tasks].reverse()) list.append(taskNode(t));
+  // Newest first; a plan's steps together, where its newest step is.
+  const shown = new Set();
+  for (const t of [...state.tasks].reverse()) {
+    if (t.plan == null) list.append(taskNode(t));
+    else if (!shown.has(t.plan)) {
+      shown.add(t.plan);
+      list.append(planNode(t.plan, state.tasks.filter((s) => s.plan === t.plan)));
+    }
+  }
   renderSquads();
 }
-
 async function clearTasks() {
   const ok = await confirmDialog({
     title: "Clear finished tasks?",
@@ -1984,9 +2113,10 @@ async function loadAudit() {
     const access = e.access ? ACCESS_SHORT[e.access] ?? e.access : "no access";
     list.append(el("li", { class: "audit-item" },
       el("div", { class: "task-top" },
-        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${providerLabel(e.provider)}` }),
+        el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${e.team ? "Team step" : providerLabel(e.provider)}` }),
         el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
       el("div", { class: "task-meta", text: `${stamp(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
+      e.origin ? el("div", { class: "task-meta", text: `Part of ${e.origin} on ${e.peer}` }) : null,
       e.error ? el("div", { class: e.outcome === "cancelled" ? "audit-note" : "audit-error", text: e.error }) : null));
   }
 }

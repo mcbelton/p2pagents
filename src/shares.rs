@@ -35,6 +35,10 @@ pub struct Share {
     /// Owner-defined MCP servers tasks here may use (see [`crate::mcp`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    /// The owner's team plan for team steps peers hand this folder (see
+    /// [`crate::team`]): plan text whose `{task}` is the task handed down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 /// What a peer learns about a share: its name, the access it would get and the
@@ -53,6 +57,10 @@ pub struct ShareInfo {
     /// What each of those MCP servers is for, in its owner's words.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_about: BTreeMap<String, String>,
+    /// The folder has a team plan: team steps may be handed to it (its text stays
+    /// with its owner).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub team: bool,
 }
 
 /// How an owner offers an MCP server in a shared folder (see [`ShareStore::offer_mcp`]).
@@ -110,6 +118,7 @@ impl ShareStore {
                 checks: BTreeMap::new(),
                 worktrees: false,
                 mcp: BTreeMap::new(),
+                team: None,
             }],
         }
     }
@@ -189,6 +198,7 @@ impl ShareStore {
             );
         }
         let mcp = self.get(name).map(|s| s.mcp.clone()).unwrap_or_default();
+        let team = self.get(name).and_then(|s| s.team.clone());
         self.shares.retain(|s| s.name != name);
         self.shares.push(Share {
             name: name.to_owned(),
@@ -197,8 +207,27 @@ impl ShareStore {
             checks,
             worktrees,
             mcp,
+            team,
         });
         Ok(self.shares.last().expect("just pushed"))
+    }
+
+    /// Sets (or with `None` removes) the team plan of share `share`; the plan must be
+    /// valid (see [`crate::team::validate_template`]).
+    pub fn set_team(&mut self, share: &str, plan: Option<String>) -> Result<()> {
+        if share == DATA_SHARE && plan.is_some() {
+            bail!("the built-in '{DATA_SHARE}' share can't have a team plan; share a folder");
+        }
+        if let Some(text) = &plan {
+            crate::team::validate_template(text)?;
+        }
+        let share = self
+            .shares
+            .iter_mut()
+            .find(|s| s.name == share)
+            .with_context(|| format!("no share named '{share}'"))?;
+        share.team = plan;
+        Ok(())
     }
 
     /// Offers MCP server `server` as `name` to tasks in share `share`, replacing a
@@ -314,6 +343,7 @@ impl ShareStore {
                         .filter(|(_, server)| !server.description.is_empty())
                         .map(|(name, server)| ((*name).clone(), server.description.clone()))
                         .collect(),
+                    team: s.team.is_some(),
                 }
             })
             .collect()

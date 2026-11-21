@@ -786,6 +786,29 @@ rights, so only peers with full access may request them.")]
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Set (or clear) a folder's team plan: what this agent's team does with team steps
+    /// peers hand the folder (`name team @you:folder ...` in their plans).
+    #[command(after_help = "\
+A team plan is plan text where {task} is the task handed down, e.g. team.plan:
+  claim: T-1 {task} works
+  dev #devs:app verify=test attempts=3 claims=T-1 {task}
+  review after dev #qa:app apply=dev verify=test claims=T-1 Review this change: {task}
+It runs on this agent's own peers, digital workers and squads, under its allowlist;
+each of its steps is reported to whoever handed the work down, and the result carries
+every step's signed evidence. At most 20 steps.
+example:
+  proofkin share team app team.plan --profile alice")]
+    Team {
+        /// The shared folder.
+        name: String,
+        /// The team plan file (plan text with {task}).
+        file: Option<PathBuf>,
+        /// Remove the folder's team plan.
+        #[arg(long, conflicts_with = "file")]
+        clear: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Stop sharing a folder.
     Remove {
         name: String,
@@ -1247,7 +1270,7 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
         let access = e.access.map_or("-".to_owned(), |a| a.to_string());
         let outcome = serde_json::to_value(e.outcome)?;
         println!(
-            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}",
+            "{:<20} {:<14} {:>5} {:<8} {:<16} {:<8} {:>8.1}  {} chars, sha256 {}{}{}",
             format!(
                 "{} {:02}:{:02}:{:02}",
                 civil_date(days),
@@ -1257,12 +1280,20 @@ fn run_audit(profile: &str, limit: usize, json: bool) -> Result<()> {
             ),
             e.peer,
             e.task_id,
-            e.provider.to_string(),
+            if e.team {
+                "team".to_owned()
+            } else {
+                e.provider.to_string()
+            },
             access,
             outcome.as_str().unwrap_or("?"),
             e.duration_ms as f64 / 1000.0,
             e.prompt_chars,
             &e.prompt_sha256[..12],
+            e.origin
+                .as_deref()
+                .map(|of| format!("\n{:>22}{of}", "part of: "))
+                .unwrap_or_default(),
             e.error
                 .as_deref()
                 .map(|err| format!("\n{:>22}{err}", "error: "))
@@ -1430,6 +1461,13 @@ fn share_extras(share: &proofkin::shares::Share) -> String {
         extras += &format!(
             "; MCP servers: {}",
             share.mcp.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if let Some(plan) = &share.team {
+        let steps = proofkin::plan::Plan::parse(plan).map_or(0, |p| p.steps.len());
+        extras += &format!(
+            "; team plan ({steps} step{}) for team steps",
+            if steps == 1 { "" } else { "s" }
         );
     }
     extras
@@ -2580,6 +2618,43 @@ fn run_share(command: ShareCommand) -> Result<()> {
                 );
             }
         }
+        ShareCommand::Team {
+            name,
+            file,
+            clear,
+            profile,
+        } => {
+            let profile = Profile::open(&profile.name)?;
+            let plan = match (file, clear) {
+                (Some(file), _) => Some(
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("reading {}", file.display()))?,
+                ),
+                (None, true) => None,
+                (None, false) => bail!("give the team plan file, or --clear to remove it"),
+            };
+            let steps = plan
+                .as_deref()
+                .map(proofkin::team::validate_template)
+                .transpose()?
+                .map(|p| p.steps.len());
+            let data = profile.data_folder();
+            proofkin::shares::ShareStore::update(&profile.shares_path(), data, |shares| {
+                shares.set_team(&name, plan)
+            })?;
+            match steps {
+                Some(n) => println!(
+                    "profile '{}': '{name}' takes team steps with a team plan of {n} step{}; peers hand them over with: name team @{}:{name} what to do",
+                    profile.name,
+                    if n == 1 { "" } else { "s" },
+                    profile.name
+                ),
+                None => println!(
+                    "profile '{}': '{name}' has no team plan any more",
+                    profile.name
+                ),
+            }
+        }
         ShareCommand::Remove { name, profile } => {
             let profile = Profile::open(&profile.name)?;
             let mut shares = profile.shares()?;
@@ -3290,6 +3365,11 @@ async fn run_agent(args: RunArgs) -> Result<()> {
         config.owner = profile.config.owner.clone();
         config.role = profile.config.role.clone();
         config.worktrees_dir = profile.worktrees_dir();
+        if let Some(secs) =
+            proofkin::profile::env_setting("TASK_GRACE_SECS").and_then(|v| v.parse::<u64>().ok())
+        {
+            config.task_grace = Duration::from_secs(secs.max(3));
+        }
         // Known for granting folders to peers; they're offered only while serving.
         config.shares = shares.clone();
         if args.serve {
@@ -3298,6 +3378,7 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                 .with_context(|| format!("creating the shared data folder {}", data.display()))?;
             config.executor = executor.clone().map(|e| e as Arc<dyn Executor>);
             config.audit = Some(Arc::new(AuditLog::new(profile.audit_path())));
+            config.team = Some(Arc::new(proofkin::team::TeamRunner::new(profile.clone())));
         }
         Agent::bind(config).await?
     };
@@ -3445,13 +3526,45 @@ async fn run_agent(args: RunArgs) -> Result<()> {
                     println!("! refused connection from {id} (not on the allowlist)")
                 }
                 Event::Chat { from, text } => println!("<{from}> {text}"),
+                Event::PeerBusy { .. } => {}
                 Event::TaskReceived {
                     from,
                     task_id,
                     provider,
+                    origin,
+                    team,
                 } => {
-                    println!("> task #{task_id} from {from} ({provider}) started")
+                    let what = if team {
+                        "team step".to_owned()
+                    } else {
+                        provider.to_string()
+                    };
+                    match origin
+                        .as_ref()
+                        .and_then(proofkin::protocol::Origin::describe)
+                    {
+                        Some(of) => {
+                            println!("> task #{task_id} from {from} ({what}, its {of}) started")
+                        }
+                        None => println!("> task #{task_id} from {from} ({what}) started"),
+                    }
                 }
+                Event::TeamRun {
+                    from,
+                    task_id,
+                    run,
+                    steps,
+                } => println!(
+                    "> task #{task_id} from {from} is a team step: team run {run} ({} step{})",
+                    steps.len(),
+                    if steps.len() == 1 { "" } else { "s" }
+                ),
+                Event::TeamStep {
+                    task_id,
+                    step,
+                    state,
+                    ..
+                } => print_step(&format!("{step} (team run of task #{task_id})"), &state),
                 Event::TaskCompleted {
                     from,
                     task_id,
@@ -3841,7 +3954,11 @@ fn peer_kind(peer: &proofkin::PeerInfo) -> String {
 fn print_step(id: &str, state: &StepState) {
     match state {
         StepState::Waiting => println!("  step {id}: waiting"),
-        StepState::Running { peer } => println!("  step {id}: running on {peer}"),
+        StepState::Running {
+            peer,
+            progress: Some(progress),
+        } => println!("  step {id}: {peer}: {}", progress.text),
+        StepState::Running { peer, .. } => println!("  step {id}: running on {peer}"),
         StepState::Done {
             peer,
             output,

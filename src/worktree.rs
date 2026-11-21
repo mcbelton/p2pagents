@@ -434,6 +434,7 @@ mod tests {
             evidence: Some(e.clone()),
             patch: None,
             verified: true,
+            refused: false,
         };
         let mut run = crate::runs::RunRecord::for_task(
             "boss",

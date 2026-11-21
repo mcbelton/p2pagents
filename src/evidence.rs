@@ -89,6 +89,10 @@ pub struct Evidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved: Option<bool>,
     pub finished_unix: u64,
+    /// For a team step: the lead's team run, with every step's own signed evidence
+    /// (absent otherwise, so other records sign as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<Box<crate::runs::RunRecord>>,
     /// Ed25519 signature (hex) over everything above.
     #[serde(default)]
     pub signature: String,
@@ -120,6 +124,7 @@ impl Evidence {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            team: None,
             signature: String::new(),
         }
     }

@@ -2163,3 +2163,205 @@ fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     found
 }
+
+/// A team step in the web UI: the boss's task shows the lead's team run and its
+/// steps (signed), the lead's page shows that team run as a plan of its own, marked
+/// for the boss, and the boss sees how busy the lead is.
+#[tokio::test]
+async fn team_runs_show_on_the_bosss_step_and_the_leads_page() {
+    let home = tempfile::tempdir().unwrap();
+    let app = tempfile::tempdir().unwrap();
+    let (boss_key, lead_key, member_key) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let trust = |name: &str, key: &SecretKey, delegate: bool, access: Access, shares: &[&str]| {
+        TrustedPeer {
+            name: name.into(),
+            id: key.public(),
+            addrs: Default::default(),
+            can_delegate: delegate,
+            tasks_per_hour: 100,
+            access,
+            shares: shares.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    };
+    let local = |config: &mut AgentConfig| {
+        config.network = Network::Local;
+        config.bind = Some("127.0.0.1:0".parse().unwrap());
+    };
+    let mut member = AgentConfig::new("member", member_key.clone());
+    local(&mut member);
+    member
+        .trust
+        .allow(trust("lead", &lead_key, true, Access::ReadOnly, &["data"]));
+    member.executor = Some(Arc::new(Echo));
+    member.shares = ShareStore::with_data(home.path().join("member-data"));
+    let (member, _me) = Agent::bind(member).await.unwrap();
+
+    let lead_profile = Profile::open_in(home.path(), "lead").unwrap();
+    let mut lead = AgentConfig::new("lead", lead_key.clone());
+    local(&mut lead);
+    lead.trust.allow(trust(
+        "boss",
+        &boss_key,
+        true,
+        Access::WorkspaceWrite,
+        &["data", "app"],
+    ));
+    lead.trust
+        .allow(trust("member", &member_key, false, Access::ReadOnly, &[]));
+    lead.executor = Some(Arc::new(Echo));
+    lead.shares = ShareStore::with_data(home.path().join("lead-data"));
+    lead.shares.add("app", app.path(), Access::Full).unwrap();
+    lead.shares
+        .set_team("app", Some("dev @member {task}".into()))
+        .unwrap();
+    lead.team = Some(Arc::new(proofkin::team::TeamRunner::new(
+        lead_profile.clone(),
+    )));
+    let (lead, lead_events) = Agent::bind(lead).await.unwrap();
+
+    let mut boss = AgentConfig::new("boss", boss_key);
+    local(&mut boss);
+    boss.trust
+        .allow(trust("lead", &lead_key, false, Access::ReadOnly, &[]));
+    let (boss, boss_events) = Agent::bind(boss).await.unwrap();
+    lead.connect(member.addr()).await.unwrap();
+    boss.connect(lead.addr()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while lead.peers().len() < 2 || boss.peers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let ui_for = |agent: &Agent, events, profile: Profile| {
+        let info = UiInfo {
+            profile,
+            network: Network::Local,
+            serving: true,
+            access: Access::ReadOnly,
+            workspace: home.path().to_path_buf(),
+            providers: Vec::new(),
+            accounts: Vec::new(),
+            workers: None,
+        };
+        ui::start(
+            agent.clone(),
+            events,
+            info,
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+    };
+    let address = |url: &str| {
+        let rest = url.strip_prefix("http://127.0.0.1:").unwrap();
+        let (port, token) = rest.split_once("/#t=").unwrap();
+        (port.parse::<u16>().unwrap(), token.to_owned())
+    };
+    let boss_ui = ui_for(
+        &boss,
+        boss_events,
+        Profile::open_in(home.path(), "boss").unwrap(),
+    )
+    .await
+    .unwrap();
+    let lead_ui = ui_for(&lead, lead_events, lead_profile).await.unwrap();
+    let (boss_port, boss_token) = address(&boss_ui.url);
+    let (lead_port, lead_token) = address(&lead_ui.url);
+    let state = |port: u16, token: String| async move {
+        request(
+            port,
+            "GET",
+            "/api/state",
+            &format!("127.0.0.1:{port}"),
+            Some(&token),
+            None,
+        )
+        .await
+        .json()
+    };
+
+    let text = serde_json::json!({ "text": "build team @lead:app make the thing" });
+    let started = request(
+        boss_port,
+        "POST",
+        "/api/plans",
+        &format!("127.0.0.1:{boss_port}"),
+        Some(&boss_token),
+        Some(&text.to_string()),
+    )
+    .await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let step = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let s = state(boss_port, boss_token.clone()).await;
+            if let Some(t) = s["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["step"] == "build" && t["status"] == "done")
+            {
+                return t.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the team step ends");
+    assert_eq!(step["evidence"], "verified", "{step}");
+    assert_eq!(
+        step["team_step"], true,
+        "shown as a team step, not a model's task"
+    );
+    assert_eq!(step["team"]["lead"], "lead");
+    let dev = &step["team"]["steps"][0];
+    assert_eq!(
+        (&dev["id"], &dev["status"], &dev["target"], &dev["signed"]),
+        (
+            &serde_json::json!("dev"),
+            &serde_json::json!("done"),
+            &serde_json::json!("member"),
+            &serde_json::json!(true)
+        ),
+        "{step}"
+    );
+    let run = step["team"]["run"].as_str().unwrap().to_owned();
+
+    // The lead's page has the team run as a plan of its own, for the boss.
+    let ran = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let s = state(lead_port, lead_token.clone()).await;
+            if let Some(t) = s["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["step"] == "dev" && t["run"] == run.as_str())
+            {
+                return t.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the lead shows its team run");
+    assert_eq!(
+        (&ran["for_peer"], &ran["status"], &ran["target"]),
+        (
+            &serde_json::json!("boss"),
+            &serde_json::json!("done"),
+            &serde_json::json!("member")
+        ),
+        "{ran}"
+    );
+    assert!(ran["plan"].is_u64());
+    // The boss sees how busy the lead is (it serves tasks).
+    let peers = state(boss_port, boss_token.clone()).await["peers"].clone();
+    assert_eq!(peers[0]["load"]["slots"], 2, "{peers}");
+    boss.shutdown().await;
+    lead.shutdown().await;
+    member.shutdown().await;
+}

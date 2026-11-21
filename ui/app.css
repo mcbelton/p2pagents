@@ -361,6 +361,7 @@ fieldset.field legend { padding: 0; margin-bottom: 6px; font-weight: 600; font-s
 .badge.evidence.verified { background: var(--success-soft); color: var(--success); }
 .badge.evidence.unverified { background: var(--danger-soft); color: var(--danger); }
 .task-top .badge.evidence { margin-left: auto; }
+.task-top .badge, .task-top .status { flex: none; white-space: nowrap; }
 .approvals-panel { border: 1px solid var(--warn); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 12px; background: var(--warn-soft); }
 .approvals-panel > p { margin: 0 0 8px; }
 .task.approval .approval-note { width: 100%; margin-top: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; }
@@ -429,6 +430,43 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
 .monitor .icon-btn { padding: 4px; }
 .monitor-fields { display: flex; flex-direction: column; gap: 12px; }
 .task-why { margin: 0 0 4px; overflow-wrap: anywhere; }
+/* Live status: what a running task's peer last said, a plan's progress, its steps in
+   the order they can run, and a lead's team steps. */
+.badge.busy { background: var(--warn-soft); color: var(--warn); }
+.task-progress { margin: 4px 0 0; font-size: 12.5px; color: var(--accent); overflow-wrap: anywhere; }
+.task-progress.queued, .task-progress.reconnecting { color: var(--warn); }
+.plan-group { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: var(--surface-2); display: flex; flex-direction: column; gap: 8px; }
+.plan-group .task-meta { margin: 0; }
+.plan-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.plan-bar { display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: var(--surface-3); }
+.plan-bar .seg { min-width: 6px; }
+.plan-bar .seg.done { background: var(--success); }
+.plan-bar .seg.failed { background: var(--danger); }
+.plan-bar .seg.cancelled { background: var(--warn); }
+.plan-bar .seg.skipped { background: var(--muted); }
+.plan-bar .seg.running { background: var(--accent); }
+.plan-bar .seg.waiting { background: transparent; }
+.plan-graph { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; }
+.plan-col { position: relative; display: flex; flex-direction: column; gap: 6px; }
+/* Each column waits for the one before it. */
+.plan-col + .plan-col::before { content: "→"; position: absolute; left: -14px; top: 50%; transform: translateY(-50%); color: var(--muted); }
+.step-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; min-height: 28px; padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); font: inherit; font-size: 12.5px; cursor: pointer; }
+.step-chip:hover { border-color: var(--accent); }
+.step-chip .dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--muted); }
+.step-chip.running .dot { background: var(--accent); }
+.step-chip.done .dot { background: var(--success); }
+.step-chip.failed .dot { background: var(--danger); }
+.step-chip.cancelled .dot { background: var(--warn); }
+.step-chip.waiting .dot { background: transparent; border: 1px solid var(--muted); }
+.step-chip .chip-who { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-steps > summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.plan-steps > .task-list { margin-top: 8px; }
+.team-run { margin-top: 6px; }
+.team-run > .task-meta { margin: 0 0 4px; }
+.team-steps { list-style: none; margin: 0; padding: 0 0 0 10px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.team-step-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12.5px; }
+.team-step-text { margin: 2px 0 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.team-step > .team-steps { margin-top: 4px; }
 .kb-list li { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; background: var(--surface); }
 .incident-log { margin-top: 6px; font-size: 12.5px; }
 .incident-log .incident.resolved strong, .incident-log .incident.learned strong { color: var(--success); }

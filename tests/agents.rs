@@ -2,14 +2,15 @@
 //! direct IPs only, no relays or lookup services, so no internet is needed).
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use proofkin::audit::{AuditLog, Outcome};
 use proofkin::mcp::McpServer;
-use proofkin::plan::{Plan, SquadStore, StepState, run_plan};
+use proofkin::plan::{Plan, RunContext, SquadStore, StepState, run_plan, run_plan_with};
+use proofkin::protocol::Phase;
 use proofkin::runs::{RunRecord, Verdict};
 use proofkin::shares::{DATA_SHARE, ShareInfo, ShareStore, parse_checks};
 use proofkin::{
@@ -107,6 +108,9 @@ struct Node {
     shares: ShareStore,
     owner: Option<String>,
     role: Option<String>,
+    /// How long its tasks wait for a dropped peer (short, so tests don't wait long).
+    grace: Duration,
+    team: Option<Arc<proofkin::team::TeamRunner>>,
 }
 
 impl Node {
@@ -121,6 +125,8 @@ impl Node {
             shares: ShareStore::with_data(data_folder(name)),
             owner: None,
             role: None,
+            grace: Duration::from_secs(2),
+            team: None,
         }
     }
 
@@ -159,6 +165,8 @@ impl Node {
         config.shares = self.shares;
         config.owner = self.owner;
         config.role = self.role;
+        config.task_grace = self.grace;
+        config.team = self.team;
         config.worktrees_dir = std::env::temp_dir()
             .join("p2p-test-worktrees")
             .join(format!("{}-{}", self.name, self.key.public().fmt_short()));
@@ -591,11 +599,54 @@ async fn refuses_providers_the_peer_does_not_serve() {
     assert!(err.to_string().contains("does not serve claude"), "{err}");
 }
 
+/// A worker that stops says so: its tasks end at once, as not done there (so a
+/// squad step could move to another member), instead of waiting for it to return.
+#[tokio::test]
+async fn delegated_task_fails_at_once_when_the_worker_stops() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    // However long tasks would wait for it to come back.
+    boss.grace = Duration::from_secs(60);
+    mutual(&mut worker, &mut boss);
+    let (worker, mut worker_events) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let pending = tokio::spawn({
+        let boss = boss.clone();
+        let id = worker.id();
+        async move {
+            boss.delegate_verified(id, LlmTask::new(Provider::Copilot, "hang"))
+                .await
+        }
+    });
+    next_matching(&mut worker_events, |e| {
+        matches!(e, Event::TaskReceived { .. })
+    })
+    .await;
+    worker.shutdown().await;
+
+    let delivered = timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("no waiting for the grace")
+        .unwrap()
+        .unwrap();
+    assert!(!delivered.ok && delivered.refused, "{delivered:?}");
+    assert_eq!(
+        delivered.output,
+        "worker stopped before it finished the task"
+    );
+}
+
+/// A peer that drops and doesn't come back within the task grace: the tasks given
+/// to it fail (as gone) and the tasks it asked for stop.
 #[tokio::test]
 async fn delegated_task_fails_when_peer_disconnects() {
     let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
     let mut boss = Node::new("boss");
     mutual(&mut worker, &mut boss);
+    let stopped = worker.stopped.clone();
     let (worker, mut worker_events) = worker.start().await;
     let (boss, _be) = boss.start().await;
     boss.connect(worker.addr()).await.unwrap();
@@ -613,7 +664,7 @@ async fn delegated_task_fails_when_peer_disconnects() {
         matches!(e, Event::TaskReceived { .. })
     })
     .await;
-    worker.shutdown().await;
+    assert!(boss.disconnect(worker.id()));
 
     let err = timeout(Duration::from_secs(10), pending)
         .await
@@ -621,6 +672,8 @@ async fn delegated_task_fails_when_peer_disconnects() {
         .unwrap()
         .unwrap_err();
     assert!(err.to_string().contains("disconnected"), "{err}");
+    assert!(err.downcast_ref::<proofkin::agent::PeerGone>().is_some());
+    wait_stopped(&stopped, 1).await;
 }
 
 /// Waits until `count` hanging runs on the worker have been stopped.
@@ -1730,4 +1783,416 @@ async fn tasks_delegated_while_peers_dial_each_other_are_not_lost() {
             .unwrap();
         assert_eq!(out, format!("copilot did: round {round}"));
     }
+}
+
+/// A worker says where a delegated task is while it runs: its place in the queue
+/// for a slot, then the model working; and how busy it is, counting this boss's.
+#[tokio::test]
+async fn delegated_tasks_report_their_place_in_the_queue_and_the_worker_its_load() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    // Two slow tasks fill both slots; the third waits for one.
+    let slow = || LlmTask::new(Provider::Copilot, "slow");
+    let first: Vec<_> = (0..2)
+        .map(|_| boss.send_task(worker.id(), slow(), None).unwrap())
+        .collect();
+    let third = boss.send_task(worker.id(), slow(), None).unwrap();
+    assert_eq!(boss.pending_to(worker.id()), 3, "counted as sent at once");
+    wait_until(|| {
+        boss.peers()[0]
+            .load
+            .is_some_and(|l| l.running == 2 && l.queued == 1 && l.yours == 3 && l.slots == 2)
+    })
+    .await;
+    let mut seen = Vec::new();
+    let delivered = third.finish(|p| seen.push(p)).await.unwrap();
+    assert_eq!(delivered.output, "slow done");
+    assert_eq!(seen[0].phase, Phase::Queued, "{seen:?}");
+    assert_eq!(
+        seen[0].text,
+        "waiting for a free slot on worker (next in line)"
+    );
+    let last = seen.last().unwrap();
+    assert_eq!(
+        (last.phase, last.text.as_str()),
+        (Phase::Running, "the model is working")
+    );
+    for d in first {
+        d.finish(|_| {}).await.unwrap();
+    }
+    wait_until(|| {
+        boss.peers()[0]
+            .load
+            .is_some_and(|l| l.running == 0 && l.queued == 0)
+    })
+    .await;
+}
+
+/// While checks fail and attempts are left, each attempt and check is reported.
+#[tokio::test]
+async fn delegated_tasks_report_each_attempt_and_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    worker
+        .shares
+        .add_with(
+            "app",
+            dir.path(),
+            Access::Full,
+            parse_checks(&[format!("fixed={}", exists_check("fixed.txt"))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    mutual(&mut worker, &mut boss);
+    worker.grant("boss", Access::Full, &["data", "app"]);
+    let (worker, _we) = worker.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let task = LlmTask::new(Provider::Copilot, "fix-on-retry")
+        .in_share("app")
+        .with_checks(vec!["fixed".into()], Some(2));
+    let mut seen = Vec::new();
+    let delivered = boss
+        .send_task(worker.id(), task, None)
+        .unwrap()
+        .finish(|p| seen.push((p.phase, p.text)))
+        .await
+        .unwrap();
+    assert!(delivered.ok && delivered.verified, "{delivered:?}");
+    assert_eq!(
+        seen,
+        [
+            (
+                Phase::Running,
+                "attempt 1 of 2: the model is working".to_owned()
+            ),
+            (Phase::Checking, "running check fixed".to_owned()),
+            (
+                Phase::Running,
+                "attempt 2 of 2: the model is working, told what failed".to_owned()
+            ),
+            (Phase::Checking, "running check fixed".to_owned()),
+        ]
+    );
+}
+
+/// A dropped connection isn't the end of a task: while the peer comes back within
+/// the task grace, the task waits (saying so), then its result arrives.
+#[tokio::test]
+async fn tasks_survive_a_dropped_connection_when_the_peer_comes_back_in_time() {
+    let mut worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let mut boss = Node::new("boss");
+    worker.grace = Duration::from_secs(20);
+    boss.grace = Duration::from_secs(20);
+    mutual(&mut worker, &mut boss);
+    let (worker, _we) = worker.start().await;
+    let (boss, mut boss_events) = boss.start().await;
+    boss.connect(worker.addr()).await.unwrap();
+    wait_for_peers(&boss, 1).await;
+
+    let delegation = boss
+        .send_task(worker.id(), LlmTask::new(Provider::Copilot, "slow"), None)
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let result = tokio::spawn(delegation.finish(move |p| log.lock().unwrap().push(p.phase)));
+    assert!(boss.disconnect(worker.id()));
+    next_matching(&mut boss_events, |e| {
+        matches!(e, Event::PeerDisconnected { .. })
+    })
+    .await;
+    wait_until(|| seen.lock().unwrap().contains(&Phase::Reconnecting)).await;
+    boss.connect(worker.addr()).await.unwrap();
+    let delivered = timeout(Duration::from_secs(15), result)
+        .await
+        .expect("the result arrives once it is back")
+        .unwrap()
+        .unwrap();
+    assert!(delivered.ok && delivered.verified, "{delivered:?}");
+    assert_eq!(delivered.output, "slow done");
+}
+
+/// A squad step its member never runs (here it refuses: over its hourly limit) goes
+/// to another member, which says why it came.
+#[tokio::test]
+async fn squad_steps_move_to_another_member_when_theirs_refuses_them() {
+    let mut boss = Node::new("boss");
+    let mut m1 = Node::new("m1").serving(vec![Provider::Copilot]);
+    let mut m2 = Node::new("m2").serving(vec![Provider::Copilot]);
+    m1.trusts(&boss, Some(0));
+    boss.trusts(&m1, Some(100));
+    mutual(&mut m2, &mut boss);
+    let (m1, _e1) = m1.start().await;
+    let (m2, _e2) = m2.start().await;
+    let (boss, _be) = boss.start().await;
+    boss.connect(m1.addr()).await.unwrap();
+    boss.connect(m2.addr()).await.unwrap();
+    wait_for_peers(&boss, 2).await;
+    let mut squads = SquadStore::default();
+    squads.set("devs", vec!["m1".into(), "m2".into()]).unwrap();
+    let plan = Plan::parse("work #devs do it").unwrap();
+
+    let mut log = Vec::new();
+    let states = run_plan(&boss, &squads, &plan, |_, s| log.push(s.clone())).await;
+    assert!(
+        matches!(&states["work"], StepState::Done { peer, .. } if peer == "m2"),
+        "{:?}",
+        states["work"]
+    );
+    // It went to m1 first (the tie goes by name), then moved, saying why.
+    let moved = log
+        .iter()
+        .find_map(|s| match s {
+            StepState::Running {
+                peer,
+                progress: Some(p),
+            } if peer == "m2" => Some(p.text.clone()),
+            _ => None,
+        })
+        .expect("it says it moved");
+    assert_eq!(
+        moved,
+        "moved here: m1: m1 refused the task: boss reached its limit of 0 tasks per hour"
+    );
+}
+
+/// A squad step goes to the member least busy with everyone's tasks (as members
+/// report them), not only with the boss's own.
+#[tokio::test]
+async fn squad_steps_go_to_the_member_least_busy_with_everyones_tasks() {
+    let mut boss = Node::new("boss");
+    let mut other = Node::new("other");
+    let mut m1 = Node::new("m1").serving(vec![Provider::Copilot]);
+    let mut m2 = Node::new("m2").serving(vec![Provider::Copilot]);
+    mutual(&mut m1, &mut boss);
+    mutual(&mut m2, &mut boss);
+    mutual(&mut m1, &mut other);
+    let (m1, _e1) = m1.start().await;
+    let (m2, _e2) = m2.start().await;
+    let (boss, _be) = boss.start().await;
+    let (other, _oe) = other.start().await;
+    boss.connect(m1.addr()).await.unwrap();
+    boss.connect(m2.addr()).await.unwrap();
+    other.connect(m1.addr()).await.unwrap();
+    wait_for_peers(&boss, 2).await;
+    wait_for_peers(&other, 1).await;
+    // Another peer keeps m1 busy, and m1 tells the boss.
+    let _busy = other
+        .send_task(m1.id(), LlmTask::new(Provider::Copilot, "hang"), None)
+        .unwrap();
+    wait_until(|| {
+        boss.peers()
+            .iter()
+            .any(|p| p.name == "m1" && p.load.is_some_and(|l| l.running == 1 && l.yours == 0))
+    })
+    .await;
+    let mut squads = SquadStore::default();
+    squads.set("devs", vec!["m1".into(), "m2".into()]).unwrap();
+    let plan = Plan::parse("work #devs do it").unwrap();
+    let states = run_plan(&boss, &squads, &plan, |_, _| {}).await;
+    assert!(
+        matches!(&states["work"], StepState::Done { peer, .. } if peer == "m2"),
+        "m1 (first by name) is busy with another peer's task: {:?}",
+        states["work"]
+    );
+}
+
+/// `timeout=` cancels a step that takes too long (on its peer too).
+#[tokio::test]
+async fn steps_that_take_longer_than_their_timeout_are_cancelled() {
+    let worker = Node::new("worker").serving(vec![Provider::Copilot]);
+    let stopped = worker.stopped.clone();
+    let (boss, _workers) = boss_with(vec![worker]).await;
+    let plan = Plan::parse(
+        "slowpoke @worker timeout=1s hang\n\
+         next after slowpoke @worker never runs",
+    )
+    .unwrap();
+    let states = timeout(
+        Duration::from_secs(10),
+        run_plan(&boss, &SquadStore::default(), &plan, |_, _| {}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&states["slowpoke"], StepState::Failed { error, .. } if error == "cancelled: it took longer than its timeout=1s"),
+        "{:?}",
+        states["slowpoke"]
+    );
+    assert!(matches!(&states["next"], StepState::Skipped { .. }));
+    wait_stopped(&stopped, 1).await;
+}
+
+/// A team step hands work down a level: the lead's agent runs its team plan on its
+/// own member (whom the boss doesn't know), reports the team's steps as they move
+/// on, and signs its answer with the team run inside, so the boss's claim is proven
+/// through the whole tree, which re-verifies offline. Work never goes back up.
+#[tokio::test]
+async fn team_steps_hand_work_down_a_level_and_prove_it_through_the_whole_tree() {
+    let home = tempfile::tempdir().unwrap();
+    let lead_profile = proofkin::Profile::open_in(home.path(), "lead").unwrap();
+    let app = tempfile::tempdir().unwrap();
+    let code = tempfile::tempdir().unwrap();
+    std::fs::write(code.path().join("ok.txt"), "ok").unwrap();
+    let mut boss = Node::new("boss").serving(vec![Provider::Copilot]);
+    let mut lead = Node::new("lead").serving(vec![Provider::Copilot]);
+    let mut member = Node::new("member").serving(vec![Provider::Copilot]);
+    lead.team = Some(Arc::new(proofkin::team::TeamRunner::new(
+        lead_profile.clone(),
+    )));
+    lead.shares.add("app", app.path(), Access::Full).unwrap();
+    lead.shares
+        .set_team(
+            "app",
+            Some(
+                "claim: T-1 {task} passes the member's check\n\
+                 build @member:code verify=ok claims=T-1 {task}"
+                    .into(),
+            ),
+        )
+        .unwrap();
+    lead.shares.add("loop", app.path(), Access::Full).unwrap();
+    lead.shares
+        .set_team("loop", Some("back @boss {task}".into()))
+        .unwrap();
+    member
+        .shares
+        .add_with(
+            "code",
+            code.path(),
+            Access::Full,
+            parse_checks(&[format!("ok={}", exists_check("ok.txt"))]).unwrap(),
+            false,
+        )
+        .unwrap();
+    mutual(&mut boss, &mut lead);
+    mutual(&mut lead, &mut member);
+    let audit_path = home.path().join("lead-audit.jsonl");
+    lead.audit = Some(Arc::new(AuditLog::new(audit_path.clone())));
+    lead.grant("boss", Access::WorkspaceWrite, &["data", "app", "loop"]);
+    member.grant("lead", Access::Full, &["data", "code"]);
+    let (member, _me) = member.start().await;
+    let (lead, mut lead_events) = lead.start().await;
+    let (boss, _be) = boss.start().await;
+    lead.connect(member.addr()).await.unwrap();
+    boss.connect(lead.addr()).await.unwrap();
+    wait_for_peers(&lead, 2).await;
+    wait_for_peers(&boss, 1).await;
+    wait_until(|| {
+        boss.peers()[0]
+            .shares
+            .iter()
+            .any(|s| s.name == "app" && s.team)
+    })
+    .await;
+
+    let plan = Plan::parse(
+        "claim: C-1 The team built it\n\
+         build team @lead:app claims=C-1 make the thing",
+    )
+    .unwrap();
+    let ctx = RunContext {
+        run_id: Some("boss-run".into()),
+        chain: Vec::new(),
+    };
+    let mut seen = Vec::new();
+    let states = run_plan_with(&boss, &SquadStore::default(), &plan, &ctx, |_, s| {
+        seen.push(s.clone())
+    })
+    .await;
+    let StepState::Done {
+        peer,
+        evidence: Some(e),
+        verified,
+        output,
+        ..
+    } = &states["build"]
+    else {
+        panic!("{:?}", states["build"]);
+    };
+    assert_eq!(peer, "lead");
+    assert!(*verified, "the whole tree checks out");
+    let run = e.team.as_ref().expect("the team run comes with it");
+    assert_eq!(run.boss, "lead");
+    assert!(run.passed(), "{}", run.verdict_line());
+    assert!(
+        output.starts_with(&format!("Team run {} by lead: PASS", run.id)),
+        "{output}"
+    );
+    // The member did the work, for the lead, and signed it.
+    let StepState::Done {
+        peer,
+        evidence: Some(sub),
+        verified,
+        ..
+    } = &run.steps[0].state
+    else {
+        panic!("{:?}", run.steps[0].state);
+    };
+    assert_eq!(peer, "member");
+    assert!(*verified);
+    assert_eq!(sub.requester_id, lead.id().to_string());
+    // While it ran, the boss saw the team's steps.
+    assert!(
+        seen.iter().any(|s| matches!(s,
+            StepState::Running { progress: Some(p), .. }
+                if p.phase == Phase::Team
+                    && p.steps.iter().any(|t| t.id == "build" && t.target == "member"))),
+        "{seen:?}"
+    );
+    // The boss's run proves C-1 through the team run, and re-verifies offline.
+    let mut record = RunRecord::new("boss", &boss.id().to_string(), "", &plan, &states, 0);
+    record.peer_ids = proofkin::runs::peer_ids(&boss);
+    assert!(record.passed(), "{}", record.verdict_line());
+    assert!(
+        record.verify(None).iter().all(|(_, r)| r.is_ok()),
+        "{:?}",
+        record.verify(None)
+    );
+    // A team run changed after the lead signed it doesn't check out.
+    let mut forged = (**run).clone();
+    if let StepState::Done { output, .. } = &mut forged.steps[0].state {
+        output.push_str(" and more");
+    }
+    assert!(proofkin::runs::verify_team(&forged, &lead.id().to_string()).is_err());
+    // The lead kept the team run, and showed it as it went.
+    assert_eq!(
+        RunRecord::list(&lead_profile.runs_dir()).unwrap()[0].id,
+        run.id
+    );
+    next_matching(&mut lead_events, |e| {
+        matches!(e, Event::TaskReceived { team: true, .. })
+    })
+    .await;
+    next_matching(
+        &mut lead_events,
+        |e| matches!(e, Event::TeamRun { from, .. } if from == "boss"),
+    )
+    .await;
+    // Its audit log has it as a team step (no model of its own ran it).
+    let audited = AuditLog::read(&audit_path, 10).unwrap();
+    assert!(
+        audited.len() == 1 && audited[0].team && audited[0].outcome == Outcome::Done,
+        "{audited:?}"
+    );
+
+    // Work never goes back up: a team plan naming the boss fails there.
+    let back = Plan::parse("again team @lead:loop do it").unwrap();
+    let states = run_plan(&boss, &SquadStore::default(), &back, |_, _| {}).await;
+    let StepState::Failed { error, .. } = &states["again"] else {
+        panic!("{:?}", states["again"]);
+    };
+    assert!(
+        error.contains("boss handed this work down, so it isn't given back to it"),
+        "{error}"
+    );
 }

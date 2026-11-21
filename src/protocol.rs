@@ -43,6 +43,10 @@ pub enum Message {
     TaskRequest {
         task_id: u64,
         task: LlmTask,
+        /// What the task is part of on the requester's side (its run and step), so the
+        /// worker can tell whose work it is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
     },
     TaskResult {
         task_id: u64,
@@ -54,6 +58,24 @@ pub enum Message {
         /// The task's commit as a patch (folders shared with `--worktrees`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         patch: Option<String>,
+        /// The task never ran: the worker refused it (or stopped before it started),
+        /// so another worker may take it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        refused: bool,
+    },
+    /// Where a task the receiver delegated is now (sent while it runs, when it moves on).
+    TaskProgress {
+        task_id: u64,
+        progress: Progress,
+    },
+    /// How busy the sender is with peers' tasks (sent when it changes): tasks running
+    /// and waiting for a slot, how many run at once, and how many are the receiver's.
+    Load {
+        running: u32,
+        queued: u32,
+        slots: u32,
+        #[serde(default)]
+        yours: u32,
     },
     /// Asks a team member to approve a plan step; answered with `TaskResult`
     /// (`ok` = approved) and withdrawn with `TaskCancel`.
@@ -81,6 +103,117 @@ pub enum Message {
     /// A message type from a newer version; ignored so mixed versions keep working.
     #[serde(other)]
     Unknown,
+}
+
+/// What a delegated task is part of on the requester's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// The requester's evidence run (a plan run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// The plan step it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// Its number in the requester's task list (`#N` in its web UI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<u64>,
+}
+
+impl Origin {
+    /// How the worker names it, e.g. "step fix of run 20261121-…" or "task #4".
+    pub fn describe(&self) -> Option<String> {
+        match (&self.step, &self.run, self.task) {
+            (Some(step), Some(run), _) => Some(format!("step {step} of run {run}")),
+            (Some(step), None, _) => Some(format!("step {step}")),
+            (None, _, Some(task)) => Some(format!("task #{task}")),
+            _ => None,
+        }
+    }
+}
+
+/// What a delegated task is doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Waiting for one of the worker's task slots.
+    Queued,
+    /// The model is working.
+    #[default]
+    Running,
+    /// The runtime is running the task's checks.
+    Checking,
+    /// The runtime is committing the work.
+    Committing,
+    /// A lead's agent is running its team plan for it.
+    Team,
+    /// The connection to the worker dropped; waiting for it to come back.
+    Reconnecting,
+    /// A phase from a newer version.
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Phase {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "queued" => Phase::Queued,
+            "running" => Phase::Running,
+            "checking" => Phase::Checking,
+            "committing" => Phase::Committing,
+            "team" => Phase::Team,
+            "reconnecting" => Phase::Reconnecting,
+            _ => Phase::Other,
+        })
+    }
+}
+
+/// Where a delegated task is now, as the runtime running it reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    #[serde(default)]
+    pub phase: Phase,
+    /// In words, for people, e.g. "waiting for a free slot (1 task ahead)".
+    pub text: String,
+    /// The model attempt it is on, and how many it may make.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
+    /// For a team step: the lead's team run, and where each of its steps is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<SubStep>,
+}
+
+impl Progress {
+    pub fn new(phase: Phase, text: impl Into<String>) -> Self {
+        Self {
+            phase,
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// A step of a lead's team run, as the lead reports it upward.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubStep {
+    pub id: String,
+    /// Who runs it: the peer, or `#squad` until a member is picked.
+    pub target: String,
+    /// waiting, running, done, failed or skipped.
+    pub status: String,
+    /// What it is doing now, or why it failed or was skipped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Its result is signed by the peer that did it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signed: bool,
+    /// A team step's own team run, a level further down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<SubStep>,
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(writer: &mut W, msg: &Message) -> Result<()> {
@@ -111,6 +244,7 @@ mod tests {
         let msg = Message::TaskRequest {
             task_id: 7,
             task: LlmTask::new(Provider::Codex, "fix it"),
+            origin: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
@@ -126,10 +260,64 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(json, r#"{"type":"task_cancel","task_id":3}"#);
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
-        let future = r#"{"type":"task_progress","task_id":3,"text":"half way"}"#;
+        let future = r#"{"type":"task_hologram","task_id":3,"text":"half way"}"#;
         assert_eq!(
             serde_json::from_str::<Message>(future).unwrap(),
             Message::Unknown
+        );
+    }
+
+    /// Progress, load and origins are new: older peers skip them (an unknown message
+    /// type, unknown fields), and phases from newer peers still read.
+    #[test]
+    fn progress_load_and_origins_keep_older_peers_working() {
+        let msg = Message::TaskProgress {
+            task_id: 3,
+            progress: Progress {
+                phase: Phase::Team,
+                text: "team run: 1 of 2 steps done".into(),
+                run: Some("r1".into()),
+                steps: vec![SubStep {
+                    id: "dev".into(),
+                    target: "alice-dev".into(),
+                    status: "done".into(),
+                    signed: true,
+                    ..SubStep::default()
+                }],
+                ..Progress::default()
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), msg);
+        let newer =
+            r#"{"type":"task_progress","task_id":3,"progress":{"phase":"teleporting","text":"x"}}"#;
+        let Message::TaskProgress { progress, .. } = serde_json::from_str(newer).unwrap() else {
+            panic!("a progress message");
+        };
+        assert_eq!(progress.phase, Phase::Other);
+        let request = r#"{"type":"task_request","task_id":1,"task":{"provider":"copilot","prompt":"p"},"origin":{"run":"r","step":"a"}}"#;
+        let Message::TaskRequest { origin, .. } = serde_json::from_str(request).unwrap() else {
+            panic!("a request");
+        };
+        assert_eq!(
+            origin.and_then(|o| o.describe()).as_deref(),
+            Some("step a of run r")
+        );
+        // What an older peer sends still reads (no origin, not refused, no `yours`).
+        let old = r#"{"type":"task_result","task_id":1,"ok":false,"output":"no"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Message>(old).unwrap(),
+            Message::TaskResult { refused: false, .. }
+        ));
+        let load = r#"{"type":"load","running":2,"queued":1,"slots":2}"#;
+        assert_eq!(
+            serde_json::from_str::<Message>(load).unwrap(),
+            Message::Load {
+                running: 2,
+                queued: 1,
+                slots: 2,
+                yours: 0
+            }
         );
     }
 

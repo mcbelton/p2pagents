@@ -150,6 +150,13 @@ cases.push(
   ["an emptied option goes", edit((p) => planText.setValues(step(p, "build"), "verify", [])).split("\n").at(-2),
     "build @worker:repo skill=build-run-discovery claims=KB-2 save=build-and-run Find out how to build it."],
   ["no waiting in circles", [...planText.dependents(model(), "architecture")].join(","), "confirm"],
+  // A team step: the lead's team plan does and proves it.
+  ["a team step comes back as it was", text(planText.parsePlan("claim: C-1 x\nbuild after spec team @alice:app levels=2 timeout=2h claims=C-1 Build it")),
+    "claim: C-1 x\n\nbuild after spec team @alice:app levels=2 timeout=2h claims=C-1 Build it"],
+  ["a team step proves claims without checks of its own",
+    needs(planText.parsePlan("claim: C-1 x\nbuild team @alice:app claims=C-1 Build it")), ""],
+  ["no checks on a team step", part("build team @alice:app Build| it", "verify=test"), `error: ${ERRORS.teamOption}`],
+  ["a team step's timeout", part("build team @alice:app Build| it", "timeout=30m"), "build team @alice:app timeout=30m Build it[]"],
 );
 
 const failed = cases.filter(([, got, want]) => got !== want);

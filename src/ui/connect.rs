@@ -885,6 +885,9 @@ fn job_json(s: &Shared, job: &Job) -> Value {
             if let Some(t) = views(s, job).first() {
                 v["peer"] = json!(t.target);
                 v["provider"] = json!(t.provider);
+                if let Some(p) = &t.progress {
+                    v["progress"] = json!(p.text);
+                }
                 if let Some(output) = &t.output {
                     let key = if state == JobState::Completed {
                         "output"
@@ -906,6 +909,7 @@ fn job_json(s: &Shared, job: &Job) -> Value {
                     json!({
                         "step": t.step, "peer": t.target, "status": t.status,
                         "output": t.output, "evidence": t.evidence,
+                        "progress": t.progress.as_ref().map(|p| p.text.clone()),
                     })
                 })
                 .collect();
@@ -1336,7 +1340,10 @@ fn a2a_task(s: &Shared, job: &Job, history: Option<i64>, artifacts: bool) -> Val
                 meta["provider"] = json!(t.provider);
             }
             match (state, t) {
-                (JobState::Working, Some(t)) => Some(format!("Running on {}", t.target)),
+                (JobState::Working, Some(t)) => Some(match &t.progress {
+                    Some(p) => format!("Running on {}: {}", t.target, p.text),
+                    None => format!("Running on {}", t.target),
+                }),
                 (JobState::Completed, Some(t)) => {
                     outputs.push(json!({
                         "artifactId": "result",
@@ -1387,7 +1394,21 @@ fn a2a_task(s: &Shared, job: &Job, history: Option<i64>, artifacts: bool) -> Val
                         .filter(|t| t.approval && t.status == "running")
                         .map(|t| t.target.clone())
                         .collect::<Vec<_>>();
-                    Some(if signing.is_empty() {
+                    // What each running step's peer last said it is doing.
+                    let doing: Vec<String> = steps
+                        .iter()
+                        .filter(|t| t.status == "running" && !t.approval)
+                        .filter_map(|t| {
+                            let p = t.progress.as_ref()?;
+                            Some(format!(
+                                "{} on {}: {}",
+                                t.step.as_deref().unwrap_or("?"),
+                                t.target,
+                                p.text
+                            ))
+                        })
+                        .collect();
+                    let mut text = if signing.is_empty() {
                         format!("{done} of {} steps done", steps.len())
                     } else {
                         format!(
@@ -1395,7 +1416,11 @@ fn a2a_task(s: &Shared, job: &Job, history: Option<i64>, artifacts: bool) -> Val
                             steps.len(),
                             signing.join(", ")
                         )
-                    })
+                    };
+                    if !doing.is_empty() {
+                        text += &format!(" ({})", doing.join("; "));
+                    }
+                    Some(text)
                 }
             }
         }

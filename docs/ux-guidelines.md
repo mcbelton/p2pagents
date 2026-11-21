@@ -83,6 +83,15 @@ Every list and panel defines three states:
 - **Error:** inline, next to what failed (`.form-error` with `role="alert"`), in
   the server's words, with the input kept.
 
+**Live work:** work running on a peer says what it is doing now, in a line under
+its status ("waiting for a free slot on worker (next in line)", "attempt 2 of 3:
+…"), not only "Running". A group of work (a plan, a team run) is one card: a bar
+of its parts' states, the parts in the order they can run, and one Cancel for the
+whole group. A peer's load is a badge ("idle", "1/2 busy · 1 waiting") with the
+details in its tooltip. Updates replace text in place: they never move focus or
+the scroll position, and screen readers hear when a part finishes (a polite
+status), not every update.
+
 ## Forms
 
 - Labels above fields; hints below in `.muted.small`; examples in placeholders end

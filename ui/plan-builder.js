@@ -41,6 +41,15 @@ const planBuilder = (() => {
     return { Peers: peers, Squads: squads };
   }
 
+  /// Who can take a team step: a peer's folder with a team plan (its agent runs the
+  /// plan on its own team), or a squad.
+  function leads() {
+    const folders = state.peers.flatMap((p) => (p.shares ?? []).filter((f) => f.team)
+      .map((f) => [`@${p.name}:${f.name}`, `${p.name}'s team, for ${f.name}`]));
+    const squads = (state.squads ?? []).map((q) => [`#${q.name}`, `#${q.name}: any online member's team`]);
+    return { Teams: folders, Squads: squads };
+  }
+
   /// Who can sign off: you, or a teammate on the allowlist.
   function signers() {
     return {
@@ -158,12 +167,13 @@ const planBuilder = (() => {
     const name = el("input", { type: "text", class: "mono pb-id", spellcheck: "false", autocomplete: "off" });
     name.value = s.id;
     name.addEventListener("change", () => rename("step", s, name));
+    const current = s.approve ? "signoff" : s.team ? "team" : "task";
     const kind = el("div", { class: "segmented pb-kind", role: "radiogroup", "aria-label": `Step ${s.id} is` },
-      ...[[false, "Agent task"], [true, "Sign-off"]].map(([approve, label]) => el("button", {
-        type: "button", role: "radio", "aria-checked": String(s.approve === approve),
-        tabindex: s.approve === approve ? "0" : "-1", "data-key": `${k}-kind-${approve ? "signoff" : "task"}`,
+      ...[["task", "Agent task"], ["team", "Team task"], ["signoff", "Sign-off"]].map(([name, label]) => el("button", {
+        type: "button", role: "radio", "aria-checked": String(current === name),
+        tabindex: current === name ? "0" : "-1", "data-key": `${k}-kind-${name}`,
       }, label)));
-    radioGroup(kind, (btn) => setKind(s, btn.dataset.key.endsWith("signoff")));
+    radioGroup(kind, (btn) => setKind(s, btn.dataset.key.slice(btn.dataset.key.lastIndexOf("-") + 1)));
     const remove = removeButton(`Remove step ${s.id}`, async () => {
       if (!planText.isTodo(s.todo) && !(await confirmDialog({
         title: `Remove step ${s.id}?`,
@@ -178,7 +188,8 @@ const planBuilder = (() => {
       el("span", { class: "pb-badge", "data-badge": k, hidden: true, text: "Incomplete" }),
       remove);
 
-    const who = select(s.approve ? signers() : runners(), s.target, s.approve ? "Choose who signs off…" : "Choose who does it…");
+    const who = select(s.approve ? signers() : s.team ? leads() : runners(), s.target,
+      s.approve ? "Choose who signs off…" : s.team ? "Choose whose team does it…" : "Choose who does it…");
     who.addEventListener("change", () => {
       s.target = who.value || null;
       if (s.approve) s.target = s.target?.split(":")[0] ?? null;
@@ -194,7 +205,11 @@ const planBuilder = (() => {
     todo.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.ctrlKey && !e.metaKey) e.preventDefault(); });
     todo.addEventListener("input", () => { s.todo = todo.value.replace(/\s*\n\s*/g, " "); changed(); });
 
-    const body = s.approve
+    const body = s.team
+      ? [field(`${k}-target`, "Whose team does it", who, "A peer's folder with a team plan: its agent runs the plan on its own team, and you see each of its steps as it goes"),
+        field(`${k}-todo`, "What to do", todo),
+        provesField(s, k, true), waitsField(s, k), moreOptions(s, k)]
+      : s.approve
       ? [field(`${k}-target`, "Who signs off", who, "Their answer is signed evidence"),
         field(`${k}-todo`, "What to check", todo, "The approver sees this and the results of the steps it waits for"),
         provesField(s, k, true), waitsField(s, k)]
@@ -203,7 +218,7 @@ const planBuilder = (() => {
         agentField(s, k),
         skillsField(s, k), checksField(s, k), provesField(s, k, planText.valuesOf(s, "verify").length > 0),
         waitsField(s, k), moreOptions(s, k)];
-    return el("li", { class: `pb-step${s.approve ? " signoff" : ""}`, "data-card": k }, head, ...body,
+    return el("li", { class: `pb-step${s.approve ? " signoff" : ""}${s.team ? " team" : ""}`, "data-card": k }, head, ...body,
       el("div", { class: "pb-marks", "data-marks": k }));
   }
 
@@ -288,7 +303,7 @@ const planBuilder = (() => {
       [el("span", { class: "mono", text: c.id }), " ", planText.isTodoClaim(c.text) ? el("em", { class: "muted", text: "not written yet" }) : c.text],
       chosen.includes(c.id), (on) => { toggle(s, "claims", c.id)(on); changed(true); },
       { disabled: !canProve && !chosen.includes(c.id) }));
-    const hint = s.approve ? "Approving proves them." : canProve ? "Proven when its checks pass."
+    const hint = s.approve ? "Approving proves them." : s.team ? "Proven when the team's run proves its own claims." : canProve ? "Proven when its checks pass."
       : "A task proves a claim only with a check: pick one above, or let a sign-off prove it.";
     // A claim this task can't prove can move to a sign-off on it.
     const signoff = !canProve && !s.approve && chosen.length
@@ -316,6 +331,24 @@ const planBuilder = (() => {
     const folder = folderOf(s.target);
     const items = [];
     let set = 0;
+    // How long it may take; then it is cancelled (on every level below it too).
+    const limit = el("select", {}, ...[["", "No limit"], ["10m", "10 minutes"], ["30m", "30 minutes"], ["1h", "an hour"],
+      ["2h", "2 hours"], ["6h", "6 hours"], ["1d", "a day"]].map(([value, text]) => el("option", { value, text })));
+    const timeout = planText.valuesOf(s, "timeout")[0] ?? "";
+    if (timeout && ![...limit.options].some((o) => o.value === timeout)) limit.append(el("option", { value: timeout, text: timeout }));
+    limit.value = timeout;
+    limit.addEventListener("change", () => { planText.setValues(s, "timeout", limit.value || null); changed(); });
+    items.push(field(`${k}-timeout`, "Cancel it after", limit, "It fails then, and steps waiting for it are skipped"));
+    set += Boolean(timeout);
+    if (s.team) {
+      const levels = el("select", {}, ...[1, 2, 3].map((n) => el("option", {
+        value: String(n), text: n === 1 ? "Their team does it" : `It may go ${n} levels down (their team's own team steps)`,
+      })));
+      levels.value = planText.valuesOf(s, "levels")[0] ?? "1";
+      levels.addEventListener("change", () => { planText.setValues(s, "levels", levels.value === "1" ? null : levels.value); changed(); });
+      items.push(field(`${k}-levels`, "How far down it may go", levels, "Work never goes back up to an agent it came from"));
+      set += levels.value !== "1";
+    }
     if (planText.valuesOf(s, "verify").length) {
       const tries = el("select", {}, ...[1, 2, 3, 4, 5].map((n) => el("option", { value: String(n), text: n === 1 ? "Once" : `Up to ${n} times, each told what failed` })));
       tries.value = planText.valuesOf(s, "attempts")[0] ?? "1";
@@ -323,11 +356,14 @@ const planBuilder = (() => {
       items.push(field(`${k}-attempts`, "Tries while its checks fail", tries));
       set += tries.value !== "1";
     }
-    const provider = el("select", {}, ...["copilot", "claude", "codex"].map((p) => el("option", { value: p, text: providerLabel(p) })));
-    provider.value = s.using ?? "copilot";
-    provider.addEventListener("change", () => { s.using = provider.value === "copilot" ? null : provider.value; changed(); });
-    items.push(field(`${k}-using`, "Model", provider, "Which of the peer's providers runs it"));
-    set += Boolean(s.using);
+    // A team step's models are the team plan's.
+    if (!s.team) {
+      const provider = el("select", {}, ...["copilot", "claude", "codex"].map((p) => el("option", { value: p, text: providerLabel(p) })));
+      provider.value = s.using ?? "copilot";
+      provider.addEventListener("change", () => { s.using = provider.value === "copilot" ? null : provider.value; changed(); });
+      items.push(field(`${k}-using`, "Model", provider, "Which of the peer's providers runs it"));
+      set += Boolean(s.using);
+    }
     const context = planText.valuesOf(s, "context");
     const topics = [...new Set(["all", ...(state.knowledge ?? []).map((t) => t.name), ...context])];
     if (topics.length > 1 || context.length) {
@@ -352,14 +388,14 @@ const planBuilder = (() => {
     set += Boolean(save.value);
     const mcp = planText.valuesOf(s, "mcp");
     const servers = [...new Set([...(folder?.mcp ?? []), ...mcp])];
-    if (servers.length) {
+    if (servers.length && !s.team) {
       items.push(group(`${k}-mcp`, "MCP servers it may use", servers.map((m) => checkbox(`${k}-mcp-${m}`,
         [el("span", { class: "mono", text: m }), folder?.about?.[m] ? el("span", { class: "muted small", text: ` ${folder.about[m]}` }) : null],
         mcp.includes(m), (on) => { toggle(s, "mcp", m)(on); changed(true); }))));
       set += mcp.length > 0;
     }
     const applied = planText.valuesOf(s, "apply")[0] ?? "";
-    if ((folder?.worktrees && s.after.length) || applied) {
+    if (!s.team && ((folder?.worktrees && s.after.length) || applied)) {
       const apply = el("select", {}, el("option", { value: "", text: "Nothing: start from the folder as it is" }),
         ...s.after.map((d) => el("option", { value: d, text: `What ${d} changed (its commit)` })));
       apply.value = applied;
@@ -376,7 +412,7 @@ const planBuilder = (() => {
     const to = input.value.trim();
     const list = kind === "claim" ? plan.claims : plan.steps;
     if (to === item.id) return;
-    const why = !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(to) || (kind === "step" && ["after", "approve", "using"].includes(to))
+    const why = !/^(?!\.)[A-Za-z0-9._-]{1,64}$/.test(to) || (kind === "step" && ["after", "approve", "team", "using"].includes(to))
       ? "Use letters, digits, '-', '_' or '.'"
       : list.some((x) => x !== item && x.id === to) ? `There is already a ${kind} called ${to}` : null;
     if (why) {
@@ -388,16 +424,24 @@ const planBuilder = (() => {
     changed(true);
   }
 
-  function setKind(s, approve) {
-    if (s.approve === approve) return;
-    s.approve = approve;
-    if (approve) {
+  function setKind(s, kind) {
+    const was = s.approve ? "signoff" : s.team ? "team" : "task";
+    if (was === kind) return;
+    s.approve = kind === "signoff";
+    s.team = kind === "team";
+    if (kind === "signoff") {
       // A person's decision: no folder, checks, retries, patch, saved result, tools or agent.
       s.target = "@me";
       s.using = null;
-      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent"]) planText.setValues(s, option, null);
+      for (const option of ["verify", "attempts", "apply", "save", "mcp", "agent", "levels"]) planText.setValues(s, option, null);
+    } else if (kind === "team") {
+      // The lead's team plan does and proves it: no checks, retries, patch, tools or agent of its own.
+      s.target = null;
+      s.using = null;
+      for (const option of ["verify", "attempts", "apply", "mcp", "agent"]) planText.setValues(s, option, null);
     } else {
       s.target = null;
+      planText.setValues(s, "levels", null);
     }
     changed(true);
   }

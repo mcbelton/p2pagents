@@ -29,7 +29,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent::{Agent, Event, Network};
 use crate::audit::{AuditLog, Outcome};
 use crate::llm::{Access, Executor, LlmTask, Provider, TaskContext};
-use crate::plan::{Plan, SquadStore, StepState, run_plan};
+use crate::plan::{Plan, SquadStore, StepState};
 use crate::profile::{Profile, validate_name};
 use crate::runs::RunRecord;
 use crate::trust::{Ticket, TrustedPeer};
@@ -92,6 +92,9 @@ struct TaskView {
     /// An approval step (a person signs off) rather than an LLM task.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     approval: bool,
+    /// A team step: its lead hands the work down to its own team (it runs no model).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    team_step: bool,
     /// For peers' results: "verified" (signed by the peer for this output) or "unverified".
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<&'static str>,
@@ -108,6 +111,39 @@ struct TaskView {
     /// its own, the run made of it when it asked for checks or its peer committed work.
     #[serde(skip_serializing_if = "Option::is_none")]
     run: Option<String>,
+    /// What its peer last said it is doing, while it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<crate::protocol::Progress>,
+    /// For a team step: the lead's team run and its steps, once it has ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    team: Option<TeamView>,
+    /// For a step of a team run this agent leads: the peer whose team step it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    for_peer: Option<String>,
+}
+
+/// A team step's team run as the page shows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TeamView {
+    run: String,
+    lead: String,
+    verdict: String,
+    passed: bool,
+    steps: Vec<crate::protocol::SubStep>,
+}
+
+impl TeamView {
+    /// The team run in `evidence`, if it carries one.
+    fn of(evidence: Option<&crate::evidence::Evidence>) -> Option<Self> {
+        let run = evidence?.team.as_ref()?;
+        Some(Self {
+            run: run.id.clone(),
+            lead: run.boss.clone(),
+            verdict: run.team_verdict(),
+            passed: run.passed(),
+            steps: crate::team::run_steps(run),
+        })
+    }
 }
 
 impl TaskView {
@@ -137,12 +173,18 @@ struct StoredTask {
     after: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     approval: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    team_step: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evidence: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     via: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    team: Option<TeamView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    for_peer: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -172,9 +214,12 @@ impl From<&TaskView> for StoredTask {
             step: t.step.clone(),
             after: t.after.clone(),
             approval: t.approval,
+            team_step: t.team_step,
             evidence: t.evidence.map(str::to_owned),
             via: t.via.map(str::to_owned),
             run: t.run.clone(),
+            team: t.team.clone(),
+            for_peer: t.for_peer.clone(),
         }
     }
 }
@@ -207,11 +252,15 @@ impl StoredTask {
             step: self.step,
             after: self.after,
             approval: self.approval,
+            team_step: self.team_step,
             evidence: known(self.evidence.as_deref(), &["verified", "unverified"]),
             preview: None,
             preview_label: None,
             via: known(self.via.as_deref(), &["MCP", "A2A"]),
             run: self.run,
+            progress: None,
+            team: self.team,
+            for_peer: self.for_peer,
         }
     }
 }
@@ -265,12 +314,18 @@ struct Shared {
     unsaved: tokio::sync::Notify,
     /// Other agents connected over MCP and A2A: their token and the work they started.
     connect: connect::Connect,
+    /// Team runs this agent leads for peers' team steps, by (peer, its task id): the
+    /// run's id and the task ids of its steps here.
+    team_runs: Mutex<TeamRuns>,
     /// Started with --ui-port: the address other agents use stays the same.
     fixed_port: bool,
 }
 
 type AppState = Arc<Shared>;
 type ApiError = (StatusCode, Json<Value>);
+/// Team runs this agent leads, by (peer, its task id): the run's id, and the task id
+/// here of each of its steps.
+type TeamRuns = HashMap<(String, u64), (String, HashMap<String, u64>)>;
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -321,6 +376,9 @@ impl Shared {
                     "owner": p.owner,
                     "role": p.role,
                     "shares": p.shares,
+                    // How busy it says it is, with this agent's tasks there right now.
+                    "load": p.load,
+                    "mine": self.agent.pending_to(p.id),
                 })
             })
             .collect();
@@ -458,6 +516,87 @@ impl Shared {
         self.changed.notify_waiters();
     }
 
+    /// Shows a team run this agent leads for `from`'s team step as a plan of its
+    /// own: its steps as tasks, marked whose they are. The agent runs them (they end
+    /// when the team step ends, not by a cancel here).
+    fn show_team_run(&self, from: &str, task_id: u64, run: &str, steps: &[crate::plan::Step]) {
+        let plan_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let mut ids = HashMap::new();
+        for step in steps {
+            let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+            ids.insert(step.id.clone(), id);
+            let view = TaskView {
+                id,
+                provider: step.provider,
+                prompt: step.prompt.clone(),
+                target: format!(
+                    "{}{}",
+                    step.target,
+                    step.share
+                        .as_ref()
+                        .map(|f| format!(":{f}"))
+                        .unwrap_or_default()
+                ),
+                status: "waiting",
+                output: None,
+                started_ms: now_ms(),
+                finished_ms: None,
+                plan: Some(plan_id),
+                step: Some(step.id.clone()),
+                after: step.after.clone(),
+                approval: step.approve,
+                team_step: step.team.is_some(),
+                evidence: None,
+                preview: None,
+                preview_label: None,
+                via: None,
+                run: None,
+                progress: None,
+                team: None,
+                for_peer: Some(from.to_owned()),
+            };
+            self.add_task(view.clone());
+            self.send(json!({ "type": "task", "task": view }));
+        }
+        self.team_runs
+            .lock()
+            .unwrap()
+            .insert((from.to_owned(), task_id), (run.to_owned(), ids));
+        self.system(
+            "task",
+            format!(
+                "Team run {run} started for {from}'s team step: {} step{} on your team",
+                steps.len(),
+                if steps.len() == 1 { "" } else { "s" }
+            ),
+        );
+    }
+
+    /// `from`'s team step `task_id` ended (`verb`): its team run's steps link to the
+    /// saved run, and those that hadn't finished stopped with it.
+    fn end_team_run(&self, from: &str, task_id: u64, verb: &str) {
+        let Some((run, ids)) = self
+            .team_runs
+            .lock()
+            .unwrap()
+            .remove(&(from.to_owned(), task_id))
+        else {
+            return;
+        };
+        for id in ids.values() {
+            self.update_task(*id, |t| {
+                if !t.finished() {
+                    t.status = "cancelled";
+                    t.output = Some(format!("The team run stopped: {from}'s team step {verb}."));
+                    t.finished_ms = Some(now_ms());
+                    t.progress = None;
+                }
+                t.run = Some(run.clone());
+            });
+        }
+        self.send(json!({ "type": "runs" }));
+    }
+
     fn save_trust(&self) -> Result<(), ApiError> {
         self.agent
             .trusted()
@@ -581,6 +720,7 @@ pub async fn start(
         changed: tokio::sync::Notify::new(),
         unsaved: tokio::sync::Notify::new(),
         connect: connect::Connect::default(),
+        team_runs: Mutex::new(HashMap::new()),
         fixed_port: bind.port() != 0,
     });
     if stopped > 0 {
@@ -640,14 +780,55 @@ pub async fn start(
                 Event::Chat { from, text } => pump.push_feed(
                     json!({ "kind": "chat", "from": from, "text": text, "self": false }),
                 ),
+                Event::PeerBusy { .. } => pump.broadcast_peers(),
                 Event::TaskReceived {
                     from,
                     task_id,
                     provider,
-                } => pump.system(
-                    "task",
-                    format!("{from} delegated task #{task_id} ({provider}) to this agent"),
-                ),
+                    origin,
+                    team,
+                } => {
+                    let what = origin.as_ref().and_then(crate::protocol::Origin::describe);
+                    pump.system(
+                        "task",
+                        match (what, team) {
+                            (Some(what), true) => format!(
+                                "{from} handed {what} to this agent's team (team step, task #{task_id})"
+                            ),
+                            (None, true) => {
+                                format!("{from} handed team step #{task_id} to this agent's team")
+                            }
+                            (Some(what), false) => format!(
+                                "{from} delegated {what} to this agent (task #{task_id}, {provider})"
+                            ),
+                            (None, false) => {
+                                format!("{from} delegated task #{task_id} ({provider}) to this agent")
+                            }
+                        },
+                    )
+                }
+                Event::TeamRun {
+                    from,
+                    task_id,
+                    run,
+                    steps,
+                } => pump.show_team_run(&from, task_id, &run, &steps),
+                Event::TeamStep {
+                    from,
+                    task_id,
+                    step,
+                    state,
+                } => {
+                    let id = pump
+                        .team_runs
+                        .lock()
+                        .unwrap()
+                        .get(&(from.clone(), task_id))
+                        .and_then(|(_, steps)| steps.get(&step).copied());
+                    if let Some(id) = id {
+                        pump.update_task(id, |t| apply_state(&pump, t, &state));
+                    }
+                }
                 Event::TaskCompleted {
                     from,
                     task_id,
@@ -659,6 +840,7 @@ pub async fn start(
                         _ => ("warn", "failed"),
                     };
                     pump.system(level, format!("Task #{task_id} from {from} {verb}"));
+                    pump.end_team_run(&from, task_id, verb);
                     pump.send(json!({ "type": "audit" }));
                 }
                 Event::TaskRefused {
@@ -1196,11 +1378,15 @@ fn start_task(
         step: None,
         after: Vec::new(),
         approval: false,
+        team_step: false,
         evidence: None,
         preview: None,
         preview_label: None,
         via,
         run: None,
+        progress: None,
+        team: None,
+        for_peer: None,
     };
     s.add_task(view.clone());
     s.send(json!({ "type": "task", "task": view }));
@@ -1216,7 +1402,21 @@ fn start_task(
                 executor.execute(&task, &ctx).await
             }
             Route::Peer(peer, name) => {
-                match shared.agent.delegate_verified(peer, task.clone()).await {
+                let origin = crate::protocol::Origin {
+                    task: Some(id),
+                    ..Default::default()
+                };
+                let sent = shared.agent.send_task(peer, task.clone(), Some(origin));
+                let progress = shared.clone();
+                let delivered = match sent {
+                    Ok(delegation) => {
+                        delegation
+                            .finish(|p| progress.update_task(id, |t| t.progress = Some(p)))
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match delivered {
                     Ok(d) => {
                         if d.evidence.is_some() {
                             evidence = Some(if d.verified { "verified" } else { "unverified" });
@@ -1239,6 +1439,7 @@ fn start_task(
             t.finished_ms = Some(now_ms());
             t.evidence = evidence;
             t.run = run;
+            t.progress = None;
             match result {
                 Ok(out) => {
                     t.status = "done";
@@ -1395,6 +1596,72 @@ struct StartedPlan {
     done: tokio::task::JoinHandle<crate::schedule::Outcome>,
 }
 
+/// Shows plan step `state` on its task `t` (a step of a plan run here, or of a team
+/// run this agent leads): its peer, what it is doing, and its result and evidence.
+fn apply_state(shared: &Shared, t: &mut TaskView, state: &StepState) {
+    match state {
+        StepState::Waiting => {}
+        StepState::Running { peer, progress } => {
+            // Progress updates (and a move to another squad member) keep its start.
+            if t.status != "running" {
+                t.started_ms = now_ms();
+            }
+            t.status = "running";
+            t.target = peer.clone();
+            t.progress = progress.clone();
+        }
+        StepState::Done {
+            peer,
+            output,
+            evidence,
+            verified,
+            patch,
+        } => {
+            t.status = "done";
+            t.target = peer.clone();
+            t.output = Some(output.clone());
+            t.finished_ms = Some(now_ms());
+            t.progress = None;
+            t.evidence = evidence
+                .as_ref()
+                .map(|_| if *verified { "verified" } else { "unverified" });
+            t.team = TeamView::of(evidence.as_ref());
+            if let Some(patch) = patch.as_deref() {
+                let sources = crate::preview::sources_from_patch(patch);
+                t.preview_label = crate::preview::label(&sources);
+                t.preview = t
+                    .preview_label
+                    .and_then(|_| shared.previews.add(crate::preview::site(&sources)))
+                    .map(|cap| format!("/preview/{cap}/"));
+            }
+        }
+        StepState::Failed {
+            peer,
+            error,
+            evidence,
+            verified,
+        } => {
+            t.status = "failed";
+            if let Some(peer) = peer {
+                t.target = peer.clone();
+            }
+            t.output = Some(error.clone());
+            t.finished_ms = Some(now_ms());
+            t.progress = None;
+            t.evidence = evidence
+                .as_ref()
+                .map(|_| if *verified { "verified" } else { "unverified" });
+            t.team = TeamView::of(evidence.as_ref());
+        }
+        StepState::Skipped { reason } => {
+            t.status = "skipped";
+            t.output = Some(format!("Skipped: {reason}"));
+            t.finished_ms = Some(now_ms());
+            t.progress = None;
+        }
+    }
+}
+
 /// Starts plan `text` (`via`: another agent started it, over MCP or A2A).
 fn start_plan(
     s: &AppState,
@@ -1443,11 +1710,15 @@ fn start_plan(
             step: Some(step.id.clone()),
             after: step.after.clone(),
             approval: step.approve,
+            team_step: step.team.is_some(),
             evidence: None,
             preview: None,
             preview_label: None,
             via,
             run: None,
+            progress: None,
+            team: None,
+            for_peer: None,
         };
         s.add_task(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -1457,60 +1728,19 @@ fn start_plan(
     let step_ids = ids.clone();
     let handle = tokio::spawn(async move {
         let started = crate::runs::unix_now();
-        let states = run_plan(&shared.agent.clone(), &squads, &ready, |step, state| {
+        // The run's id is known from the start: each step's peer is told it.
+        let run_id = crate::runs::new_run_id();
+        let ctx = crate::plan::RunContext {
+            run_id: Some(run_id.clone()),
+            chain: Vec::new(),
+        };
+        let agent = shared.agent.clone();
+        let states = crate::plan::run_plan_with(&agent, &squads, &ready, &ctx, |step, state| {
             let id = step_ids[step];
             if !matches!(state, StepState::Waiting | StepState::Running { .. }) {
                 shared.running.lock().unwrap().remove(&id);
             }
-            shared.update_task(id, |t| match state {
-                StepState::Waiting => {}
-                StepState::Running { peer } => {
-                    t.status = "running";
-                    t.target = peer.clone();
-                    t.started_ms = now_ms();
-                }
-                StepState::Done {
-                    peer,
-                    output,
-                    evidence,
-                    verified,
-                    patch,
-                } => {
-                    t.status = "done";
-                    t.target = peer.clone();
-                    t.output = Some(output.clone());
-                    t.finished_ms = Some(now_ms());
-                    t.evidence = evidence
-                        .as_ref()
-                        .map(|_| if *verified { "verified" } else { "unverified" });
-                    if let Some(patch) = patch.as_deref() {
-                        let sources = crate::preview::sources_from_patch(patch);
-                        t.preview_label = crate::preview::label(&sources);
-                        t.preview = t
-                            .preview_label
-                            .and_then(|_| shared.previews.add(crate::preview::site(&sources)))
-                            .map(|cap| format!("/preview/{cap}/"));
-                    }
-                }
-                StepState::Failed {
-                    error,
-                    evidence,
-                    verified,
-                    ..
-                } => {
-                    t.status = "failed";
-                    t.output = Some(error.clone());
-                    t.finished_ms = Some(now_ms());
-                    t.evidence = evidence
-                        .as_ref()
-                        .map(|_| if *verified { "verified" } else { "unverified" });
-                }
-                StepState::Skipped { reason } => {
-                    t.status = "skipped";
-                    t.output = Some(format!("Skipped: {reason}"));
-                    t.finished_ms = Some(now_ms());
-                }
-            });
+            shared.update_task(id, |t| apply_state(&shared, t, state));
         })
         .await;
         let mut run = RunRecord::new(
@@ -1521,6 +1751,7 @@ fn start_plan(
             &states,
             started,
         );
+        run.id = run_id;
         run.peer_ids = crate::runs::peer_ids(&shared.agent);
         let saved_run = match run.save(&shared.info.profile.runs_dir()) {
             Ok(_) => {
@@ -2630,11 +2861,15 @@ mod tests {
             step: None,
             after: Vec::new(),
             approval: false,
+            team_step: false,
             evidence: None,
             preview: None,
             preview_label: None,
             via: None,
             run: None,
+            progress: None,
+            team: None,
+            for_peer: None,
         }
     }
 

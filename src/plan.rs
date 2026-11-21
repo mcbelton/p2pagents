@@ -27,10 +27,11 @@
 //! team member to sign off instead of running a model. See [`crate::runs`] for the
 //! verdicts.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
@@ -39,6 +40,7 @@ use crate::evidence::Evidence;
 use crate::knowledge::{KnowledgeBase, check_topics};
 use crate::llm::{LlmTask, Provider};
 use crate::profile::validate_name;
+use crate::protocol::{Origin, Phase, Progress};
 use crate::skills::Skills;
 
 /// Longest prerequisite result passed on to a dependent step.
@@ -176,6 +178,15 @@ pub struct Step {
     /// its skills and MCP servers with it (see [`crate::skills`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// A team step (`team @lead`): the lead's agent runs its folder's team plan for it,
+    /// whose own team steps may hand it down this many levels in all (`levels=N`,
+    /// default 1: the lead's team does it). See [`crate::team`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<u32>,
+    /// The longest the step may take, in seconds (`timeout=30m`); then it is
+    /// cancelled, on every level below too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 /// A statement the plan must prove with evidence (`claim: ID text`).
@@ -289,6 +300,18 @@ impl Plan {
             }
             if step.approve && matches!(step.target, Target::Squad(_)) {
                 bail!("approval step '{}' needs a person: @name or @me", step.id);
+            }
+            if step.team.is_some()
+                && (!step.checks.is_empty()
+                    || step.attempts.is_some()
+                    || step.apply.is_some()
+                    || !step.mcp.is_empty()
+                    || step.agent.is_some())
+            {
+                bail!(
+                    "team step '{}' is done and proven by the lead's team plan: it can't have checks, attempts, apply=, mcp= or agent=",
+                    step.id
+                );
             }
         }
         // Kahn's algorithm: whatever can't be ordered is on a cycle.
@@ -435,8 +458,41 @@ const TODO_CLAIM: &str = "What must be true at the end";
 /// Step options (`name=value`, before what to do).
 const STEP_OPTIONS: &[&str] = &[
     "verify", "attempts", "claims", "claim", "apply", "context", "skill", "skills", "mcp", "save",
-    "agent",
+    "agent", "levels", "timeout",
 ];
+
+/// The longest `timeout=` a step may have (a week).
+const MAX_TIMEOUT: u64 = 7 * 24 * 3600;
+
+/// Seconds in a step's `timeout=` value: a number and a unit (s, m, h or d).
+fn parse_timeout(value: &str) -> Result<u64> {
+    let digits = value.chars().take_while(char::is_ascii_digit).count();
+    let (n, unit) = value.split_at(digits);
+    let n: u64 = n.parse().map_err(|_| {
+        anyhow!("timeout= needs a number and a unit, e.g. 30m or 2h, got {value:?}")
+    })?;
+    let secs = match unit {
+        "s" | "sec" | "secs" => n,
+        "m" | "min" | "mins" => n * 60,
+        "h" | "hr" | "hrs" => n * 3600,
+        "d" | "day" | "days" => n * 86_400,
+        _ => bail!("timeout= needs a unit (s, m, h or d), e.g. 30m, got {value:?}"),
+    };
+    if secs == 0 || secs > MAX_TIMEOUT {
+        bail!("timeout= must be more than 0 and at most 7 days, got {value:?}");
+    }
+    Ok(secs)
+}
+
+/// `secs` as a step's timeout reads: "30m", "2h", "45s".
+pub fn timeout_text(secs: u64) -> String {
+    match secs {
+        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
 
 /// Whether `word` sets a step option.
 fn is_option(word: &str) -> bool {
@@ -481,6 +537,10 @@ fn parse_step(line: &str) -> Result<Step> {
     if approve {
         words.next();
     }
+    let team = !approve && words.peek() == Some(&"team");
+    if team {
+        words.next();
+    }
     let target = words
         .next()
         .with_context(|| format!("who runs it is missing; {STEP_FORM}"))?;
@@ -506,6 +566,7 @@ fn parse_step(line: &str) -> Result<Step> {
     let (mut checks, mut attempts, mut claims, mut apply) = (Vec::new(), None, Vec::new(), None);
     let (mut context, mut save, mut skills, mut mcp) = (Vec::new(), None, Vec::new(), Vec::new());
     let mut agent = None;
+    let (mut levels, mut timeout) = (None, None);
     let mut once = std::collections::HashSet::new();
     loop {
         match words.peek().copied() {
@@ -517,7 +578,11 @@ fn parse_step(line: &str) -> Result<Step> {
             }
             Some(word) if word.contains('=') => {
                 let (key, value) = word.split_once('=').expect("contains '='");
-                if matches!(key, "attempts" | "apply" | "save" | "agent") && !once.insert(key) {
+                if matches!(
+                    key,
+                    "attempts" | "apply" | "save" | "agent" | "levels" | "timeout"
+                ) && !once.insert(key)
+                {
                     bail!("{key}= is given twice; a step has one");
                 }
                 match key {
@@ -554,6 +619,16 @@ fn parse_step(line: &str) -> Result<Step> {
                             .map_err(|_| anyhow!("agent= needs an agent's name, got {value:?}"))?;
                         agent = Some(value.to_owned());
                     }
+                    "levels" => {
+                        let n: u32 = value
+                            .parse()
+                            .map_err(|_| anyhow!("levels must be a number, got {value:?}"))?;
+                        if !(1..=crate::team::MAX_LEVELS).contains(&n) {
+                            bail!("levels must be between 1 and {}", crate::team::MAX_LEVELS);
+                        }
+                        levels = Some(n);
+                    }
+                    "timeout" => timeout = Some(parse_timeout(value)?),
                     _ => break,
                 }
                 words.next();
@@ -564,6 +639,9 @@ fn parse_step(line: &str) -> Result<Step> {
     let prompt = words.collect::<Vec<_>>().join(" ");
     if prompt.is_empty() {
         bail!("missing the task prompt: what to do comes last, after who runs it and the options");
+    }
+    if levels.is_some() && !team {
+        bail!("levels= is for team steps (name team @lead ...)");
     }
     Ok(Step {
         id,
@@ -582,6 +660,8 @@ fn parse_step(line: &str) -> Result<Step> {
         skills,
         mcp,
         agent,
+        team: team.then(|| levels.unwrap_or(1)),
+        timeout,
     })
 }
 
@@ -610,6 +690,9 @@ pub enum StepState {
     Waiting,
     Running {
         peer: String,
+        /// What the peer's runtime last said it is doing (newer peers report it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<crate::protocol::Progress>,
     },
     Done {
         peer: String,
@@ -841,6 +924,24 @@ fn unproven_fixes(plan: &Plan, claim: &ClaimDef) -> Vec<Fix> {
 /// Why `peer` can't run `step`, if it can't: provider, folder, checks, access.
 fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
     use crate::llm::Access;
+    if step.team.is_some() {
+        let folder = step.share.as_deref().unwrap_or(crate::shares::DATA_SHARE);
+        return match peer.shares.iter().find(|s| s.name == folder) {
+            None => Some(format!(
+                "{} shares no folder '{folder}' with you, so its team can't take it",
+                peer.name
+            )),
+            Some(share) if !share.team => Some(format!(
+                "folder '{folder}' on {} has no team plan (its owner sets one with: proofkin share team {folder} FILE), or its agent is older",
+                peer.name
+            )),
+            Some(share) if share.access < Access::WorkspaceWrite => Some(format!(
+                "a team step needs edit access in '{folder}' on {}; you have {}",
+                peer.name, share.access
+            )),
+            Some(_) => None,
+        };
+    }
     if !peer.capabilities.contains(&step.provider) {
         return Some(format!("{} doesn't serve {}", peer.name, step.provider));
     }
@@ -1061,7 +1162,11 @@ pub fn preflight(
             );
         }
         let signoff = proving.iter().find(|s| s.approve);
-        for step in proving.iter().filter(|s| !s.approve && s.checks.is_empty()) {
+        // A team step is proven by its team run's own claims.
+        for step in proving
+            .iter()
+            .filter(|s| !s.approve && s.team.is_none() && s.checks.is_empty())
+        {
             let outcome = match signoff {
                 Some(s) => format!(
                     "so {} will end unverified even if the sign-off {} is approved",
@@ -1249,12 +1354,107 @@ pub async fn execute(
     Ok(start(agent, profile, text)?.run(agent, on_update).await)
 }
 
+/// What a plan run is part of: its id and, for a lead's team run, the agents the work
+/// came down from (see [`run_plan_with`]).
+#[derive(Debug, Clone, Default)]
+pub struct RunContext {
+    /// Sent with each step, so its peer can tell (and show) whose work it is.
+    pub run_id: Option<String>,
+    /// The agents the work came down from, top first: no step runs on one of them, and
+    /// team steps pass the chain on (with this agent added), so work never loops.
+    pub chain: Vec<EndpointId>,
+}
+
 /// Runs `plan` with `agent`, reporting every state change to `on_update`, and
 /// returns each step's final state. Dropping the future cancels running steps.
 pub async fn run_plan(
     agent: &Agent,
     squads: &SquadStore,
     plan: &Plan,
+    on_update: impl FnMut(&str, &StepState),
+) -> BTreeMap<String, StepState> {
+    run_plan_with(agent, squads, plan, &RunContext::default(), on_update).await
+}
+
+/// How busy each of `peers` is, by name: the tasks it reports running or queueing
+/// for other agents, plus those this agent gave it and is waiting for.
+fn load(agent: &Agent, peers: &[PeerInfo]) -> HashMap<String, usize> {
+    peers
+        .iter()
+        .map(|p| {
+            let others = p
+                .load
+                .map_or(0, |l| (l.running + l.queued).saturating_sub(l.yours));
+            (p.name.clone(), others as usize + agent.pending_to(p.id))
+        })
+        .collect()
+}
+
+/// Why a squad step may move to another member: it never ran on its peer (refused,
+/// or the peer stopped first), or the peer dropped and didn't come back.
+fn movable(result: &Result<Delivered>) -> Option<String> {
+    match result {
+        Ok(d) if d.refused => Some(
+            d.output
+                .lines()
+                .next()
+                .unwrap_or("it refused the step")
+                .to_owned(),
+        ),
+        Err(e) if e.downcast_ref::<crate::agent::PeerGone>().is_some() => Some(format!("{e:#}")),
+        _ => None,
+    }
+}
+
+/// `work`, cancelled (by dropping it) once `secs` have passed.
+async fn within<T>(secs: Option<u64>, work: impl Future<Output = Result<T>>) -> Result<T> {
+    match secs {
+        None => work.await,
+        Some(secs) => tokio::time::timeout(std::time::Duration::from_secs(secs), work)
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "cancelled: it took longer than its timeout={}",
+                    timeout_text(secs)
+                ))
+            }),
+    }
+}
+
+/// The peer to run task `step` on: as [`choose_peer`], but never one the work came
+/// down from (`ctx`), nor a squad member the step already moved away from.
+fn pick_peer(
+    agent: &Agent,
+    step: &Step,
+    squads: &SquadStore,
+    ctx: &RunContext,
+    tried: Option<&HashSet<String>>,
+) -> Result<PeerInfo> {
+    let all = agent.peers();
+    if let Target::Peer(name) = &step.target
+        && let Some(peer) = all.iter().find(|p| &p.name == name)
+        && ctx.chain.contains(&peer.id)
+    {
+        bail!("{name} handed this work down, so it isn't given back to it");
+    }
+    let peers: Vec<PeerInfo> = all
+        .into_iter()
+        .filter(|p| !ctx.chain.contains(&p.id))
+        .filter(|p| !tried.is_some_and(|t| t.contains(&p.name)))
+        .collect();
+    choose_peer(step, &peers, squads, &load(agent, &peers))
+}
+
+/// [`run_plan`] as part of `ctx`: each step's request says which run and step it is,
+/// running steps report what their peer last said it is doing, squad steps go to the
+/// member with the least work (counting other agents' tasks) and move to another
+/// member when theirs refuses or drops them, and `timeout=` cancels a step (on every
+/// level below it too) that takes too long.
+pub async fn run_plan_with(
+    agent: &Agent,
+    squads: &SquadStore,
+    plan: &Plan,
+    ctx: &RunContext,
     mut on_update: impl FnMut(&str, &StepState),
 ) -> BTreeMap<String, StepState> {
     let mut states: BTreeMap<String, StepState> = plan
@@ -1265,8 +1465,14 @@ pub async fn run_plan(
     for step in &plan.steps {
         on_update(&step.id, &StepState::Waiting);
     }
-    let mut busy: HashMap<String, usize> = HashMap::new();
     let mut running: JoinSet<(String, String, Result<Delivered>)> = JoinSet::new();
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Progress)>();
+    // Squad members a step moved away from, and why it last moved.
+    let mut tried: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut moved: HashMap<String, String> = HashMap::new();
+    let mut chain: Vec<String> = ctx.chain.iter().map(ToString::to_string).collect();
+    chain.push(agent.id().to_string());
     loop {
         // Skip steps whose prerequisites failed; start steps whose prerequisites are done.
         let mut changed = true;
@@ -1308,11 +1514,15 @@ pub async fn run_plan(
                     })
                     .collect();
                 let prompt = step_prompt(step, &deps);
-                // An approver sees what the steps before it created (directly or
-                // through other approvals): the prototype, decks and design documents.
-                let preview: BTreeMap<String, String> = if step.approve {
+                let fail = |error: String| StepState::failed(None, error);
+                let (peer_name, work): (
+                    String,
+                    std::pin::Pin<Box<dyn Future<Output = Result<Delivered>> + Send>>,
+                ) = if step.approve {
+                    // An approver sees what the steps before it created (directly or
+                    // through other approvals): the prototype, decks and design documents.
                     let earlier = ancestors(plan, &step.id);
-                    crate::preview::sources_from_patches(
+                    let preview: BTreeMap<String, String> = crate::preview::sources_from_patches(
                         plan.steps
                             .iter()
                             .filter(|s| earlier.contains(&s.id))
@@ -1325,102 +1535,149 @@ pub async fn run_plan(
                     )
                     .into_iter()
                     .map(|(path, bytes)| (path, String::from_utf8_lossy(&bytes).into_owned()))
-                    .collect()
-                } else {
-                    BTreeMap::new()
-                };
-                let chosen = if step.approve {
-                    choose_approver(step, &agent.peers()).map(|(id, name)| (id, name, None))
-                } else {
-                    choose_peer(step, &agent.peers(), squads, &busy).map(|peer| {
-                        let mut task = LlmTask::new(step.provider, prompt.clone())
-                            .with_checks(step.checks.clone(), step.attempts);
-                        task.mcp = step.mcp.clone();
-                        if let Some(share) = &step.share {
-                            task = task.in_share(share.clone());
+                    .collect();
+                    match choose_approver(step, &agent.peers()) {
+                        Ok((approver, name)) => {
+                            let (agent, title) = (agent.clone(), format!("Plan step {}", step.id));
+                            // A person reads it: the rule for models is left out.
+                            let text = prompt
+                                .strip_prefix(crate::boundary::DIRECTIVE)
+                                .unwrap_or(&prompt)
+                                .to_owned();
+                            (
+                                name,
+                                Box::pin(async move {
+                                    agent
+                                        .request_approval_with(approver, &title, &text, preview)
+                                        .await
+                                }),
+                            )
                         }
-                        task.patch = step.apply.as_ref().and_then(|a| match &states[a] {
-                            StepState::Done { patch, .. } => patch.clone(),
-                            _ => None,
-                        });
-                        (Some(peer.id), peer.name, Some(task))
-                    })
-                };
-                let (peer_id, peer_name, task) = match chosen {
-                    Ok(chosen) => chosen,
-                    Err(e) => {
-                        let state = StepState::failed(None, format!("{e:#}"));
+                        Err(e) => {
+                            let state = fail(format!("{e:#}"));
+                            on_update(&step.id, &state);
+                            states.insert(step.id.clone(), state);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    let peer = match pick_peer(agent, step, squads, ctx, tried.get(&step.id)) {
+                        Ok(peer) => peer,
+                        Err(e) => {
+                            let state = fail(format!("{e:#}"));
+                            on_update(&step.id, &state);
+                            states.insert(step.id.clone(), state);
+                            changed = true;
+                            continue;
+                        }
+                    };
+                    let mut task = LlmTask::new(step.provider, prompt.clone())
+                        .with_checks(step.checks.clone(), step.attempts);
+                    task.mcp = step.mcp.clone();
+                    if let Some(share) = &step.share {
+                        task = task.in_share(share.clone());
+                    }
+                    task.patch = step.apply.as_ref().and_then(|a| match &states[a] {
+                        StepState::Done { patch, .. } => patch.clone(),
+                        _ => None,
+                    });
+                    if step.apply.is_some() && task.patch.is_none() {
+                        let state = fail(format!(
+                            "step {} left no patch to apply (it changed nothing, or its folder isn't shared with --worktrees)",
+                            step.apply.as_deref().unwrap_or_default()
+                        ));
                         on_update(&step.id, &state);
                         states.insert(step.id.clone(), state);
                         changed = true;
                         continue;
                     }
+                    if let Some(levels) = step.team {
+                        task.team = Some(crate::team::TeamRequest {
+                            levels,
+                            chain: chain.clone(),
+                            brief: step.prompt.clone(),
+                        });
+                    }
+                    let origin = Origin {
+                        run: ctx.run_id.clone(),
+                        step: Some(step.id.clone()),
+                        task: None,
+                    };
+                    let delegation = match agent.send_task(peer.id, task, Some(origin)) {
+                        Ok(delegation) => delegation,
+                        Err(e) => {
+                            let state = StepState::failed(Some(peer.name), format!("{e:#}"));
+                            on_update(&step.id, &state);
+                            states.insert(step.id.clone(), state);
+                            changed = true;
+                            continue;
+                        }
+                    };
+                    let (tx, id) = (progress_tx.clone(), step.id.clone());
+                    (
+                        peer.name,
+                        Box::pin(delegation.finish(move |progress| {
+                            let _ = tx.send((id.clone(), progress));
+                        })),
+                    )
                 };
-                if task
-                    .as_ref()
-                    .is_some_and(|t| step.apply.is_some() && t.patch.is_none())
-                {
-                    let state = StepState::failed(
-                        None,
-                        format!(
-                            "step {} left no patch to apply (it changed nothing, or its folder isn't shared with --worktrees)",
-                            step.apply.as_deref().unwrap_or_default()
-                        ),
-                    );
-                    on_update(&step.id, &state);
-                    states.insert(step.id.clone(), state);
-                    changed = true;
-                    continue;
-                }
-                *busy.entry(peer_name.clone()).or_default() += 1;
                 let state = StepState::Running {
                     peer: peer_name.clone(),
+                    progress: moved
+                        .remove(&step.id)
+                        .map(|why| Progress::new(Phase::Running, format!("moved here: {why}"))),
                 };
                 on_update(&step.id, &state);
                 states.insert(step.id.clone(), state);
-                let (agent, id, title) = (
-                    agent.clone(),
-                    step.id.clone(),
-                    format!("Plan step {}", step.id),
-                );
-                running.spawn(async move {
-                    let result = match (peer_id, task) {
-                        (Some(peer), Some(task)) => agent.delegate_verified(peer, task).await,
-                        (approver, _) => {
-                            // A person reads it: the rule for models is left out.
-                            let text = prompt
-                                .strip_prefix(crate::boundary::DIRECTIVE)
-                                .unwrap_or(&prompt);
-                            agent
-                                .request_approval_with(approver, &title, text, preview)
-                                .await
-                        }
-                    };
-                    (id, peer_name, result)
-                });
+                let (id, timeout) = (step.id.clone(), step.timeout);
+                running.spawn(async move { (id, peer_name, within(timeout, work).await) });
             }
         }
-        let Some(joined) = running.join_next().await else {
+        if running.is_empty() {
             break;
-        };
-        let Ok((id, peer, result)) = joined else {
-            continue;
-        };
-        if let Some(n) = busy.get_mut(&peer) {
-            *n = n.saturating_sub(1);
         }
-        let step = plan.steps.iter().find(|s| s.id == id).expect("known step");
-        let state = match result {
-            Ok(delivered) => StepState::from_delivered(peer, step, delivered),
-            Err(e) => StepState::failed(Some(peer), format!("{e:#}")),
-        };
-        on_update(&id, &state);
-        states.insert(id, state);
+        tokio::select! {
+            joined = running.join_next() => {
+                let Some(Ok((id, peer, result))) = joined else {
+                    continue;
+                };
+                let step = plan.steps.iter().find(|s| s.id == id).expect("known step");
+                // A squad step its peer never ran (or lost) goes to another member.
+                if matches!(step.target, Target::Squad(_))
+                    && let Some(why) = movable(&result)
+                {
+                    let seen = tried.entry(id.clone()).or_default();
+                    seen.insert(peer.clone());
+                    let seen = seen.clone();
+                    if pick_peer(agent, step, squads, ctx, Some(&seen)).is_ok() {
+                        moved.insert(id.clone(), format!("{peer}: {why}"));
+                        states.insert(id, StepState::Waiting);
+                        continue;
+                    }
+                }
+                let state = match result {
+                    Ok(delivered) => StepState::from_delivered(peer, step, delivered),
+                    Err(e) => StepState::failed(Some(peer), format!("{e:#}")),
+                };
+                on_update(&id, &state);
+                states.insert(id, state);
+            }
+            Some((id, progress)) = progress_rx.recv() => {
+                if let Some(StepState::Running { peer, .. }) = states.get(&id) {
+                    let state = StepState::Running {
+                        peer: peer.clone(),
+                        progress: Some(progress),
+                    };
+                    on_update(&id, &state);
+                    states.insert(id, state);
+                }
+            }
+        }
     }
     debug_assert!(states.values().all(StepState::finished));
     states
 }
-
 /// The person who must approve `step`: a connected peer by name, or `@me` (None).
 fn choose_approver(step: &Step, peers: &[PeerInfo]) -> Result<(Option<iroh::EndpointId>, String)> {
     match &step.target {
@@ -1759,6 +2016,7 @@ mod tests {
                 vec![]
             },
             mcp_about: Default::default(),
+            team: false,
         };
         let peer = |name: &str, shares: Vec<ShareInfo>| PeerInfo {
             name: name.into(),
@@ -1767,6 +2025,7 @@ mod tests {
             shares,
             owner: None,
             role: None,
+            load: None,
         };
         let peers = vec![
             peer("alice", vec![share("app", Access::Full, &["test"], true)]),
@@ -1997,6 +2256,69 @@ mod tests {
         );
     }
 
+    /// `team @lead` hands a step to a lead's team (as many levels down as `levels=`
+    /// allows); `timeout=` limits any step. A team step's lead must offer a team plan
+    /// in that folder, with edit access, and the team run proves its claims.
+    #[test]
+    fn team_steps_and_timeouts_parse_and_are_checked() {
+        let plan = Plan::parse(
+            "claim: C-1 x\n\
+             build team @alice:app levels=2 timeout=90m claims=C-1 Build it\n\
+             ok after build approve @me timeout=1d Check it",
+        )
+        .unwrap();
+        assert_eq!(
+            (plan.steps[0].team, plan.steps[0].timeout),
+            (Some(2), Some(5400))
+        );
+        assert_eq!(plan.steps[1].timeout, Some(86_400));
+        assert_eq!(timeout_text(5400), "90m");
+        // After who runs it, "team" is a word of the task.
+        let words = Plan::parse("x @alice team up with bob").unwrap();
+        assert_eq!(
+            (words.steps[0].team, words.steps[0].prompt.as_str()),
+            (None, "team up with bob")
+        );
+        let err = |text: &str| Plan::parse(text).unwrap_err().to_string();
+        assert!(err("x team @a verify=test do").contains("proven by the lead's team plan"));
+        assert!(err("x @a levels=2 do").contains("levels= is for team steps"));
+        assert!(err("x team @a levels=9 do").contains("levels must be between 1 and 3"));
+        assert!(err("x @a timeout=soon do").contains("timeout= needs"));
+        assert!(err("x @a timeout=8d do").contains("at most 7 days"));
+
+        let lead = |team: bool, access: Access| PeerInfo {
+            name: "alice".into(),
+            id: iroh::SecretKey::generate().public(),
+            capabilities: Vec::new(),
+            shares: vec![ShareInfo {
+                name: "app".into(),
+                access,
+                team,
+                ..Default::default()
+            }],
+            owner: None,
+            role: None,
+            load: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let kb = KnowledgeBase::new(dir.path().join("kb"));
+        let skills = Skills::new(dir.path().join("skills"));
+        let problems = |peer: PeerInfo| -> Vec<String> {
+            preflight(&plan, &[peer], &SquadStore::default(), &kb, &skills)
+                .into_iter()
+                .filter(|p| p.step.as_deref() == Some("build"))
+                .map(|p| p.message)
+                .collect()
+        };
+        assert!(problems(lead(false, Access::Full))[0].contains("has no team plan"));
+        assert!(problems(lead(true, Access::ReadOnly))[0].contains("needs edit access"));
+        // No provider needed, and its claim needs no check of its own.
+        assert_eq!(
+            problems(lead(true, Access::WorkspaceWrite)),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn squad_steps_pick_the_least_busy_capable_member() {
         let peer = |name: &str, providers: Vec<Provider>, shares: &[&str]| PeerInfo {
@@ -2013,6 +2335,7 @@ mod tests {
                 .collect(),
             owner: None,
             role: None,
+            load: None,
         };
         let peers = vec![
             peer("alice", vec![Provider::Copilot], &["data", "code"]),

@@ -145,10 +145,44 @@ fn step_verdict(record: &StepRecord) -> Verdict {
             {
                 Verdict::Proven
             }
+            // A team step: proven if its team run (checked through) proves its claims.
+            Some(e) if e.team.is_some() => match &e.team {
+                Some(run) if *verified && run.passed() => Verdict::Proven,
+                _ => Verdict::Unverified,
+            },
             Some(e) if *verified && !e.checks.is_empty() && e.checks_passed() => Verdict::Proven,
             _ => Verdict::Unverified,
         },
     }
+}
+
+/// A new run id: the time it is made, to the millisecond, so ids sort by time.
+pub fn new_run_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let rand = data_encoding::HEXLOWER.encode(&iroh::SecretKey::generate().to_bytes()[..1]);
+    let stamp: String = utc(now / 1000)
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    format!("{}-{}-{:03}{rand}", &stamp[..8], &stamp[8..], now % 1000)
+}
+
+/// Checks a lead's team run (embedded in its signed evidence) through: it is the
+/// lead's (`lead_id`), and every step's evidence is valid and belongs to it (on every
+/// level below too).
+pub fn verify_team(run: &RunRecord, lead_id: &str) -> Result<()> {
+    if run.boss_id != lead_id {
+        bail!("the team run is {}'s, not the lead's", short(&run.boss_id));
+    }
+    for (step, check) in run.verify(None) {
+        if let Err(e) = check {
+            bail!("team step {step}: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 impl RunRecord {
@@ -160,22 +194,12 @@ impl RunRecord {
         states: &std::collections::BTreeMap<String, StepState>,
         started_unix: u64,
     ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let rand = data_encoding::HEXLOWER.encode(&iroh::SecretKey::generate().to_bytes()[..1]);
-        let stamp: String = utc(now / 1000)
-            .chars()
-            .filter(char::is_ascii_digit)
-            .collect();
         Self {
-            // Sorts by when the run was recorded, to the millisecond.
-            id: format!("{}-{}-{:03}{rand}", &stamp[..8], &stamp[8..], now % 1000),
+            id: new_run_id(),
             boss: boss.to_owned(),
             boss_id: boss_id.to_owned(),
             started_unix,
-            finished_unix: now / 1000,
+            finished_unix: unix_now(),
             plan_text: plan_text.to_owned(),
             claims: plan.claims.clone(),
             peer_ids: BTreeMap::new(),
@@ -328,6 +352,8 @@ impl RunRecord {
             skills: Vec::new(),
             mcp: task.mcp.clone(),
             agent: None,
+            team: None,
+            timeout: None,
         };
         // The task as the plan step it amounts to.
         let mut text: String = claims
@@ -385,6 +411,17 @@ impl RunRecord {
                 s.steps_done,
                 s.steps
             )
+        }
+    }
+
+    /// The verdict as the peer whose team step this run did reads it: without the
+    /// tip to the plan's author (the lead's user) about claims.
+    pub fn team_verdict(&self) -> String {
+        let s = self.summary();
+        if s.claims == 0 {
+            format!("{}/{} steps done, no claims", s.steps_done, s.steps)
+        } else {
+            self.verdict_line()
         }
     }
 
@@ -520,12 +557,14 @@ impl RunRecord {
         let step = &s.step;
         let kind = if step.approve {
             "approval".to_owned()
+        } else if step.team.is_some() {
+            "team".to_owned()
         } else {
             step.provider.to_string()
         };
         let (status, peer) = match &s.state {
             StepState::Waiting => ("waiting", None),
-            StepState::Running { peer } => ("running", Some(peer.clone())),
+            StepState::Running { peer, .. } => ("running", Some(peer.clone())),
             StepState::Done { peer, .. } => ("done", Some(peer.clone())),
             StepState::Failed { peer, .. } => ("failed", peer.clone()),
             StepState::Skipped { .. } => ("skipped", None),
@@ -584,7 +623,17 @@ impl RunRecord {
                     "signature ✗ NOT valid"
                 }
             );
-            if e.kind == EvidenceKind::Task {
+            if let Some(run) = &e.team {
+                md += &format!(
+                    "- Team run `{}` by {} (its plan, with every step's evidence, is in the signed record): {}\n",
+                    run.id,
+                    run.boss,
+                    run.team_verdict()
+                );
+                for t in &run.steps {
+                    md += &format!("  - {}\n", team_line(t));
+                }
+            } else if e.kind == EvidenceKind::Task {
                 md += &format!(
                     "- Model attempts: {}; checks run by the worker's runtime:\n",
                     e.attempts
@@ -716,6 +765,17 @@ fn verify_step(
     dir: Option<&Path>,
 ) -> Result<String> {
     evidence.verify_self(output)?;
+    if let Some(run) = &evidence.team {
+        verify_team(run, &evidence.signer_id)?;
+        return Ok(format!(
+            "signed by {} ({}), output intact; its team run {} checked through ({} step{})",
+            evidence.signer,
+            short(&evidence.signer_id),
+            run.id,
+            run.steps.len(),
+            if run.steps.len() == 1 { "" } else { "s" }
+        ));
+    }
     if let (Some(dir), Some(hash)) = (
         dir,
         evidence.git.as_ref().and_then(|g| g.patch_sha256.as_ref()),
@@ -742,6 +802,54 @@ fn verify_step(
 /// The first 10 characters (never splits a character).
 fn short(id: &str) -> String {
     id.chars().take(10).collect()
+}
+
+/// A team run's step in a line of the report: where it ran, how it ended, whether
+/// its evidence is signed, and its own team run, if it is a team step too.
+pub(crate) fn team_line(s: &StepRecord) -> String {
+    let (status, peer, signed, nested) = match &s.state {
+        StepState::Done {
+            peer,
+            evidence,
+            verified,
+            ..
+        } => (
+            "done",
+            Some(peer.as_str()),
+            *verified,
+            evidence.as_ref().and_then(|e| e.team.as_ref()),
+        ),
+        StepState::Failed {
+            peer,
+            evidence,
+            verified,
+            ..
+        } => (
+            "failed",
+            peer.as_deref(),
+            *verified,
+            evidence.as_ref().and_then(|e| e.team.as_ref()),
+        ),
+        StepState::Skipped { .. } => ("skipped", None, false, None),
+        _ => ("not finished", None, false, None),
+    };
+    let mut line = format!(
+        "{} on {}: {status}{}",
+        s.step.id,
+        peer.map_or_else(|| s.step.target.to_string(), str::to_owned),
+        if signed { ", signed ✓" } else { "" }
+    );
+    match &s.state {
+        StepState::Failed { error, .. } => {
+            line += &format!(" ({})", clip(error.lines().next().unwrap_or_default(), 200))
+        }
+        StepState::Skipped { reason } => line += &format!(" ({reason})"),
+        _ => {}
+    }
+    if let Some(run) = nested {
+        line += &format!(" (team run {}: {})", run.id, run.team_verdict());
+    }
+    line
 }
 
 /// `text` on one line, each run of whitespace a single space.
@@ -917,6 +1025,7 @@ mod tests {
             evidence: Some(task_evidence(&key, "fixed", true)),
             patch: None,
             verified: true,
+            refused: false,
         };
         assert!(RunRecord::worth_keeping(&task, &delivered));
         let mut run = RunRecord::for_task(
@@ -957,6 +1066,7 @@ mod tests {
             ),
             patch: None,
             verified: true,
+            refused: false,
         };
         assert!(!RunRecord::worth_keeping(&question, &answer));
         // Without checks, a run's title is its task.

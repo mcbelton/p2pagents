@@ -120,6 +120,12 @@ try:
     _, out1 = cli("share", "add", "repo", REPO, "--profile", "worker1")
     _, out2 = cli("share", "add", "code", ws, "--access", "workspace-write", "--profile", "worker2")
     print(f"  {out1.strip()}\n  {out2.strip()}")
+    # A team plan for 'code': team steps peers hand worker2 there go on to worker1.
+    team_plan = os.path.join(HOME, "team.plan")
+    with open(team_plan, "w") as f:
+        f.write("relay @worker1 {task}\n")
+    _, out = cli("share", "team", "code", team_plan, "--profile", "worker2")
+    print(f"  {out.strip()}")
     # An MCP server worker2's owner offers in 'code': only its secret_word tool, to any access.
     _, out = cli("mcp", "add", "code", "echo", "--access", "read-only", "--tool", "secret_word",
                  "--env", f"ECHO_MCP_LOG={MCP_LOG}", "--profile", "worker2", "--",
@@ -180,7 +186,7 @@ try:
     _, out7 = cli("kb", "add", "api-down", guide, "--profile", "worker2")
     print(f"  {out7.strip()}")
     ok = all([
-        allow("worker1", "boss", delegate=True, shares="data,repo"), allow("worker1", "worker2"),
+        allow("worker1", "boss", delegate=True, shares="data,repo"), allow("worker1", "worker2", delegate=True),
         allow("worker2", "boss", delegate=True, access="full", shares="data,code,app"), allow("worker2", "worker1"),
         allow("boss", "worker1"), allow("boss", "worker2"),
         allow("intruder", "worker1"),  # worker1 does NOT allow intruder
@@ -350,6 +356,28 @@ try:
     check("boss's plan ran a dependent step with its prerequisite's result",
           relay_at is not None and any("p2pdata-token-7731" in l for l in lines[relay_at:relay_at + 6]),
           lines[-12:])
+    check("boss saw live what worker1 was doing on its step",
+          any("step facts: worker1: the model is working" in l for l in lines), lines[:12])
+
+    print("== team step: boss hands work to worker2's team, which passes it on to worker1")
+    with open(plan_file, "w") as f:
+        f.write("ask team @worker2:code Read notes.md and reply with only the status token it contains.\n")
+    # Later checks read worker2's output from where they did before (its incidents).
+    boss.cursor, w2_cursor = len(boss.lines), w2.cursor
+    w2.cursor = len(w2.lines)
+    boss.send(f"/plan {plan_file}")
+    finished = boss.wait_for(r"=== plan finished", 400)
+    lines = boss.lines[boss.cursor:]
+    text = "\n".join(lines)
+    check("a team step went through worker2's team to worker1's real Copilot, signed all the way down",
+          finished and "p2pdata-token-7731" in text
+          and re.search(r"Team run \S+ by worker2: 1/1 steps done", text)
+          and "relay on worker1: done, signed ✓" in text
+          and re.search(r"evidence: signed by worker2 \([0-9a-f]+\) ✓ verified", text),
+          lines[-20:])
+    check("worker2 led the team run for boss's team step",
+          w2.wait_for(r"task #\d+ from boss is a team step: team run \S+ \(1 step\)", 5), w2.lines[w2.cursor:][-10:])
+    w2.cursor = w2_cursor
 
     print("== EDD plan: claims proven by a check worker2's runtime runs, and worker1's signed approval")
     broken = os.path.join(HOME, "broken.plan")

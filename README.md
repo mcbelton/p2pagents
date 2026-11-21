@@ -507,14 +507,18 @@ two tasks edit the same workspace at once, each lists both tasks' changes.
 ### Audit log
 
 An agent started with `--serve` records every task a peer asks it to run, accepted or
-refused, in the profile's `audit.jsonl`: peer name and key, provider, the access the task
-got, outcome (`done`, `failed`, `cancelled`, `refused`), duration and any error. The prompt is **not**
+refused, in the profile's `audit.jsonl`: peer name and key, provider (or `team` for a
+[team step](#team-steps-handing-work-down-a-level)), the access the task got, outcome
+(`done`, `failed`, `cancelled`, `refused`), duration, any error, and what the task is part
+of on the peer's side (a step of one of its runs, or one of its tasks). The prompt is **not**
 stored, only its SHA-256 and length, so the log holds no peer content.
 
 ```text
 > proofkin audit --profile worker
 time (UTC)           peer            task provider access           outcome   seconds  prompt
 2026-11-15 18:39:55  boss               1 copilot  read-only        done          7.0  43 chars, sha256 7a9139bee1be
+2026-11-21 05:50:18  boss               1 team     workspace-write  done          7.0  66 chars, sha256 f9c32289c1a4
+             part of: step build of run 20261121-055018-74874
 ```
 
 `--limit N` shows more entries and `--json` prints the raw lines.
@@ -526,9 +530,14 @@ the peer is told to stop: it aborts the Copilot session (or the Claude/Codex run
 task slot and records the task as `cancelled` in its audit log. If you disconnect, the peer
 cancels your running tasks the same way, so nothing keeps spending its accounts for you.
 
-A brief reconnect doesn't lose work: if a connection is replaced (for example both peers
-dialed each other at once), running tasks carry on and their results arrive over the new
-connection. Tasks are failed or cancelled only if the peer stays away for 2 seconds.
+A dropped connection doesn't lose work. If a connection is replaced (for example both peers
+dialed each other at once) or drops and comes back, running tasks carry on and their
+results arrive over the new connection. After 2 seconds the peer shows as disconnected and
+its tasks say **reconnecting to** it. They are failed (on your side) and cancelled (on the
+peer's) only if it stays away for the **task grace**: 60 seconds, or
+`PROOFKIN_TASK_GRACE_SECS`. An agent that stops on purpose (Ctrl+C, or **Stop** on a
+digital worker) says so first: the tasks it runs for you fail at once ("worker stopped
+before it finished the task"), and it cancels the tasks it gave its peers.
 
 ### Squads and plans
 
@@ -552,8 +561,14 @@ report after api,tests @helper Write a one-paragraph status report
 ```
 
 - `@peer` runs on that peer; `#squad` runs on the least busy online member that serves the
-  provider (and shares the folder, if one is named). `:folder` defaults to the peer's
-  `data` folder and `using` to `copilot`.
+  provider (and shares the folder, if one is named): the one with the fewest tasks, counting
+  what each member says it runs and queues for all its peers, plus your own tasks waiting
+  on it. `:folder` defaults to the peer's `data` folder and `using` to `copilot`.
+- If a squad member turns a step down (it is over your hourly limit, or stopping) or goes
+  away for good, the step moves to another member that can take it, and its task says
+  **moved here** and why. A step on a named `@peer` fails instead.
+- `timeout=30m` (`s`, `m`, `h` or `d`, up to 7 days) cancels a step that takes longer, on
+  every peer working on it; it fails with the reason.
 - A step starts when the steps it waits for (`after`) are done, and gets their results
   (up to 8,000 characters each) ahead of its prompt. Steps without dependencies run at once.
 - If a step fails, the steps that depend on it are **skipped**; independent steps still run.
@@ -562,8 +577,69 @@ report after api,tests @helper Write a one-paragraph status report
   limit, access level and audit log apply. Squads live only in the boss's profile
   (`squads.json`); members just see tasks from the boss.
 
-Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. Each step appears as a task
-that waits, runs, finishes or is skipped, and cancelling any step cancels the whole plan.
+Run it with `/plan plan.txt`, or in the web UI's **Plan** mode. The web UI shows the plan as
+one card: a bar of its steps (done, running, failed), the steps in the order they can run
+(each column waits for the one before), and each step as a task that waits, runs, finishes
+or is skipped. Cancelling the plan, or any of its steps, cancels the whole plan.
+
+#### Live status
+
+Every peer working for you says what it is doing, and the UI and CLI show it as it changes:
+
+- **Queued**: "waiting for a free slot on worker (2 tasks ahead)". A serving agent runs 2
+  tasks at a time and queues the rest.
+- **Working**: "the model is working", "attempt 2 of 3: the model tries again (told what
+  failed)", "running check test (1 of 2)", "committing the work".
+- **Team**: a team step's lead reports each step of its team run (below), with the same
+  status for each one, nested level by level.
+- **Reconnecting**, and **moved here** for a squad step that went to another member.
+
+Each serving agent also tells its peers how busy it is (tasks running and queued, and how
+many of them are yours). The web UI shows it on each connected peer ("1/2 busy") and squad
+member, and squads use it to pick a member. Tasks carry where they come from, so a
+worker's activity and audit log say "boss delegated step build of run 20261121-… to this
+agent". Agents that connect over [MCP or A2A](#connect-other-agents-mcp-and-a2a) get the
+same status text while they poll a task.
+
+### Team steps: handing work down a level
+
+A step can hand its work to a **lead**: a peer that does it with its own team. The lead's
+owner writes a **team plan** for one of its folders, with `{task}` where the work goes (in
+claims, `{task}` is a one-line brief of it):
+
+```powershell
+@'
+claim: T-1 {task} passes the tests
+build @bob:app verify=test attempts=3 claims=T-1 {task}
+review after build @carol:app apply=build verify=test claims=T-1 Review the change
+'@ | Set-Content team.plan
+proofkin share team app team.plan --profile alice   # --clear removes it; share list shows it
+```
+
+The boss gives a step to the lead with `team`:
+
+```text
+claim: F-1 Reports can be exported as CSV
+feature team @alice:app claims=F-1 Add CSV export to the report page
+```
+
+- The lead runs its team plan on **its** peers, digital workers and squads, with its own
+  grants, and reports each of its steps upward as it goes: the boss sees them live under
+  its step. On the lead's page the run shows as a plan of its own, for the boss's team
+  step, and is saved in the lead's `runs/`.
+- The result is the lead's team run, signed by the lead, with every team step's own signed
+  evidence inside. A claim on the boss's step is proven only if that team run passed (so
+  it has claims of its own, all proven) and every signature in it checks out, all the way
+  down. `runs verify` checks the whole tree, offline.
+- A team step needs edit access (`workspace-write` or `full`) in the lead's folder, and the
+  folder must have a team plan (at most 20 steps). It takes no options for a model
+  (`verify=`, `attempts=`, `apply=`, `mcp=`, `agent=`): the team plan decides how the work
+  is done and checked.
+- By default the lead's team does the work itself. `levels=2` or `levels=3` lets the
+  team plan's own team steps hand it further down. `timeout=` on the step cancels every
+  level below it.
+- Work never goes back up: a lead never hands it to an agent it came down from, and a team
+  plan step naming one fails with the reason.
 
 ### Scheduled plans
 
@@ -640,11 +716,13 @@ signoff after review approve @carol claims=PARSE-2 Approve the parser change for
 | `context=a,b` / `save=topic` | Puts knowledge base topics in the prompt / saves the step's verified result as a topic |
 | `mcp=a,b` | Lets the model use those MCP servers the folder's owner offers you (see [MCP servers](#mcp-servers-owner-controlled-tools-for-peers-tasks)) |
 | `approve @person` / `approve @me` | Instead of a model, a team member (or you) approves or rejects, seeing the earlier steps' results. |
+| `team @lead:folder`, `levels=N` | Instead of a model, the lead's team does it, with the folder's team plan ([team steps](#team-steps-handing-work-down-a-level)). `levels=` (1 to 3, default 1) is how many levels down it may go. |
+| `timeout=30m` | Cancels the step if it takes longer (`s`, `m`, `h` or `d`, up to 7 days), on every peer working on it. |
 
-A step line is `name [after steps] @peer[:folder] or #squad [options] what to do`: options
+A step line is `name [after steps] [team] @peer[:folder] or #squad [options] what to do`: options
 go before the task text (the plan check warns about one typed after it). Repeating an
 option that takes a list adds to it: `skill=adr skill=api-contract` is
-`skill=adr,api-contract`. `agent`, `attempts`, `apply` and `save` are given once.
+`skill=adr,api-contract`. `agent`, `attempts`, `apply`, `save`, `levels` and `timeout` are given once.
 
 **3. Agents do the work, and each result comes back with signed evidence.**
 
@@ -1131,13 +1209,15 @@ proofkin playbook show rehearse --set peer=alice --set folder=shop --set change=
 | `--no-open` | off | Print the web UI link without opening a browser (needs `--ui`) |
 
 Subcommands: `proofkin auth login|status|logout`, `proofkin peers id|allow|list|remove`,
-`proofkin share add|list|remove`, `proofkin mcp add|import|list|pause|resume|remove`,
+`proofkin share add|list|remove|team`, `proofkin mcp add|import|list|pause|resume|remove`,
 `proofkin plugin add|list|show|update|enable|disable|remove`, `proofkin worker create|list|remove`,
 `proofkin squad create|list|remove`, `proofkin runs list|show|verify`, `proofkin kb list|show|add|remove|search|learn`,
 `proofkin playbook list|explain|show`, `proofkin schedule add|list|pause|resume|remove`, `proofkin skill list|show|add|import|remove`, `proofkin agent list|show|add|remove`, `proofkin github login|status|logout`,
 `proofkin repo link|list|sync|branches|pr|unlink`, `proofkin monitor add|list|remove`, `proofkin ops report|incidents`, `proofkin spec check|init|import`, `proofkin design init|render`, `proofkin connect`, `proofkin audit`, `proofkin profile delete`. `PROOFKIN_HOME` moves the profiles folder
 (and uses a separate credential store namespace). `PROOFKIN_SCHEDULE_TICK_SECS` sets how
-often an agent looks for due schedules (default 30). Each setting also works under its
+often an agent looks for due schedules (default 30), and `PROOFKIN_TASK_GRACE_SECS` how long
+tasks wait for a peer that dropped off to come back (default 60, see
+[Cancelling tasks](#cancelling-tasks)). Each setting also works under its
 name from before the rename (`P2PAGENTS_HOME`, ...).
 
 ## Web UI
@@ -1149,7 +1229,8 @@ proofkin --name me --providers copilot --serve --ui
 # web UI: http://127.0.0.1:53817/#t=3f9c…   (opens in your default browser)
 ```
 
-- **Connected peers** with the providers they serve, live.
+- **Connected peers** with the providers they serve and how busy they are ("idle",
+  "1/2 busy", "2/2 busy · 1 waiting"; hover for how many of those tasks are yours), live.
 - **Allowlist**: add a peer by pasting their ticket (optionally letting them delegate, with an
   hourly limit and an access level: read only, edit files, or full) or remove one; changes
   are saved to the profile's `peers.json` and take effect at once (removed peers are
@@ -1169,9 +1250,13 @@ proofkin --name me --providers copilot --serve --ui
   full access to the folder, tick the checks its runtime runs after the model
   (**Verify with**, and how many attempts it gets while they fail): the task is proven
   only if they pass, and it is kept under **Evidence runs**.
-  The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
+  The **Tasks** panel shows status and elapsed time, what the peer is doing right now
+  ([live status](#live-status)), renders results as Markdown, can copy
   results and errors, has a **Cancel** button on running tasks, and links each plan step,
-  and each task kept as evidence, to its **Evidence run**. The latest 200 tasks are kept
+  and each task kept as evidence, to its **Evidence run**. A plan is one card with a bar of
+  its steps, its steps in the order they run, **Cancel plan** and **Evidence run**; a
+  [team step](#team-steps-handing-work-down-a-level) shows its lead's team steps under it,
+  live. The latest 200 tasks are kept
   in the profile (`tasks.json`, long results cut at 32,000 characters) and come back
   after a restart; one the agent stopped in the middle comes back cancelled, saying so.
   **Clear finished** lets the finished ones go (running ones stay).
@@ -1179,11 +1264,13 @@ proofkin --name me --providers copilot --serve --ui
   Ctrl+Enter runs it), or press **Open editor** for a full-size editor with two views of
   the same plan:
   - **Builder** (forms, no syntax to learn): what must be true (claims), then a card per
-    step, an agent task or a sign-off: who does it (connected peers, their folders and
+    step, an agent task, a team task (handed to a peer's [team](#team-steps-handing-work-down-a-level);
+    only folders that take team steps are offered) or a sign-off: who does it (connected peers, their folders and
     squads), what to do, the [agent](#agents) it acts as (with what that agent brings),
     skills (picked from a list with what each is for), the checks
     the folder offers (and the built-in ones), the claims it proves, the steps it waits
-    for, and more options (tries, model, knowledge, MCP servers). It can't hold the
+    for, and more options (tries, model, knowledge, MCP servers, when to cancel it, and how
+    far down a team task may go). It can't hold the
     usual mistakes: a task proves claims only once it has a check, a step can't wait for
     one that waits for it, renaming or removing a step or claim updates what refers to
     it, and what a card still needs is said on its field. **Run plan** goes to the first
@@ -1337,6 +1424,9 @@ A worker decides exactly what each peer can see:
 - Peers see shared folders **by name and access only**, never their paths, and only the ones
   granted to them (`/peers` lists them). Changing a connected peer's grant reaches it at once.
 - A task naming a folder that isn't shared with that peer is refused (and audited).
+- `proofkin share team <folder> <file>` gives a folder a **team plan**, so peers with edit
+  access can hand it [team steps](#team-steps-handing-work-down-a-level) that your agent
+  runs with your own team. Peers see only that the folder takes team steps, not the plan.
 
 | | `data` (built in) | A folder you add |
 | --- | --- | --- |
@@ -1604,8 +1694,8 @@ Workflow for a change:
 
 ## Layout
 
-- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses and capabilities, `peers`, `chat`, `task_request`, `task_result`, `task_cancel`; unknown types are ignored) and the `p2pagents/1` ALPN
-- [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, shutdown
+- [src/protocol.rs](src/protocol.rs): wire messages (`hello` with addresses and capabilities, `peers`, `chat`, `task_request`, `task_result`, `task_cancel`, `task_progress`, `load`; unknown types are ignored) and the `p2pagents/1` ALPN
+- [src/agent.rs](src/agent.rs): `Agent` node on an iroh endpoint: allowlist enforcement, dialing, gossip, auto-reconnect, broadcast, task delegation with permissions and hourly limits, task slots and queue, live progress and load reports, the task grace for dropped peers, shutdown (telling peers)
 - [src/trust.rs](src/trust.rs): allowlist (`peers.json`) and `p2pa1...` tickets
 - [src/llm/mod.rs](src/llm/mod.rs): `Provider`, `Access`, `LlmTask`, the `Executor` trait and `SdkExecutor`
 - [src/llm/copilot.rs](src/llm/copilot.rs): per-agent Copilot instance on the official Rust SDK (own token and `COPILOT_HOME`), with per-access tool allowlists and the path-checking permission handler
@@ -1624,7 +1714,8 @@ Workflow for a change:
 - [src/boundary.rs](src/boundary.rs): the external-content envelope and standing rule against prompt injection
 - [src/redact.rs](src/redact.rs): secret redaction of results, check output, knowledge and alerts
 - [src/schedule.rs](src/schedule.rs): scheduled plans (`--when` parsing, `schedules.json`, the scheduler)
-- [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation (claims, checks, approvals), and the dependency-ordered plan runner
+- [src/plan.rs](src/plan.rs): squads (`squads.json`), plan parsing and validation (claims, checks, approvals), and the dependency-ordered plan runner (load-aware squad picks, rerouting, timeouts)
+- [src/team.rs](src/team.rs): team steps: team plans, handing work down a level, and the lead's team run with its progress reported upward
 - [src/evidence.rs](src/evidence.rs): signed evidence records, owner-defined checks (run with a timeout, process tree killed) and retry prompts
 - [src/worktree.rs](src/worktree.rs): per-task git worktrees and branches, commits and patches
 - [src/runs.rs](src/runs.rs): evidence runs: verdict per claim, Markdown reports, offline signature re-verification

@@ -862,6 +862,61 @@
         "ui::the_page_follows_the_ux_guidelines"
       ],
       "live": ["worker2 kept the record it signed with its commit, for a pull request from the branch"]
+    },
+    {
+      "id": "LIVE-1",
+      "area": "live status",
+      "claim": "A peer working on a task says what it is doing as it changes: its place in the queue for a task slot, each model attempt (told what failed before it), each check its runtime runs, and committing the work. The requester sees it live (CLI, web UI, and MCP and A2A task status), and each serving agent tells its peers how busy it is (tasks running and queued, and how many of them are theirs). A task says what it is part of on the requester's side (a step of a run, or a task), which the worker's activity and audit log show. Older peers ignore the new messages and fields.",
+      "tests": [
+        "agents::delegated_tasks_report_their_place_in_the_queue_and_the_worker_its_load",
+        "agents::delegated_tasks_report_each_attempt_and_check",
+        "lib::protocol::progress_load_and_origins_keep_older_peers_working"
+      ],
+      "live": ["boss saw live what worker1 was doing on its step"]
+    },
+    {
+      "id": "NET-7",
+      "area": "network",
+      "claim": "A dropped connection doesn't fail tasks at once: they say they are reconnecting, and carry on if the peer comes back within the task grace (60 s by default), their results arriving over the new connection. An agent that stops on purpose tells its peers first: the tasks it runs for them fail at once, saying it stopped, and the tasks it gave them are cancelled.",
+      "tests": [
+        "agents::tasks_survive_a_dropped_connection_when_the_peer_comes_back_in_time",
+        "agents::delegated_task_fails_at_once_when_the_worker_stops"
+      ]
+    },
+    {
+      "id": "SQD-4",
+      "area": "squads",
+      "claim": "A squad step goes to the member least busy with everyone's tasks (as members report them, plus the boss's own tasks waiting on them, counted as they are sent). A step a member turns down (e.g. over the hourly limit) or loses moves to another member, saying why. A step that takes longer than its timeout= is cancelled on its peer and fails with the reason, and the steps that depend on it are skipped.",
+      "tests": [
+        "agents::squad_steps_go_to_the_member_least_busy_with_everyones_tasks",
+        "agents::squad_steps_move_to_another_member_when_theirs_refuses_them",
+        "agents::steps_that_take_longer_than_their_timeout_are_cancelled",
+        "lib::plan::team_steps_and_timeouts_parse_and_are_checked"
+      ]
+    },
+    {
+      "id": "TEAM-1",
+      "area": "squads",
+      "claim": "A plan step can hand its work to a lead's team (team @lead:folder): the lead runs its owner's team plan for that folder, with the task filled in, on its own peers under its own allowlist, reports each team step upward as it goes, and signs its result with the whole team run inside, which its audit log records as a team step. A claim on the boss's step is proven only if that team run passed and every signature in it checks out, all the way down (a team run changed after signing doesn't). Team steps need edit access in a folder that takes them, go no more levels down than levels= allows (at most 3), and never hand work back to an agent it came from.",
+      "tests": [
+        "agents::team_steps_hand_work_down_a_level_and_prove_it_through_the_whole_tree",
+        "lib::team::a_team_plan_is_filled_in_with_the_task_handed_down",
+        "lib::team::team_plans_need_the_task_and_stay_within_the_levels_allowed",
+        "lib::plan::team_steps_and_timeouts_parse_and_are_checked"
+      ],
+      "live": [
+        "a team step went through worker2's team to worker1's real Copilot, signed all the way down",
+        "worker2 led the team run for boss's team step"
+      ]
+    },
+    {
+      "id": "TEAM-2",
+      "area": "web ui",
+      "claim": "The web UI shows a plan as one card (a bar of its steps' states, the steps in the order they can run, Cancel plan and its evidence run), with what each running step's peer is doing now. A team step is labelled as one and shows its lead's team steps live, then the team run it came back with; the lead's page shows the team run as a plan of its own, for the peer whose step it is. The plan editor checks team steps as they are written (team, levels=, timeout=, and the options a team step can't take).",
+      "tests": [
+        "ui::team_runs_show_on_the_bosss_step_and_the_leads_page",
+        "ui::the_plan_editor_keeps_plans_valid"
+      ]
     }
   ]
 }
