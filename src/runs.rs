@@ -81,6 +81,8 @@ pub struct ClaimResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunSummary {
     pub id: String,
+    /// What the run was about, in a line (see [`RunRecord::title`]).
+    pub title: String,
     pub started_unix: u64,
     pub passed: bool,
     pub proven: usize,
@@ -228,6 +230,7 @@ impl RunRecord {
         let results = self.claim_results();
         RunSummary {
             id: self.id.clone(),
+            title: self.title(),
             started_unix: self.started_unix,
             passed: self.passed(),
             proven: results
@@ -242,6 +245,128 @@ impl RunRecord {
                 .filter(|s| matches!(s.state, StepState::Done { .. }))
                 .count(),
         }
+    }
+
+    /// What the run was about, in a line: its first claim, else its first step's task.
+    pub fn title(&self) -> String {
+        let text = self
+            .claims
+            .first()
+            .map(|c| c.text.as_str())
+            .or_else(|| self.steps.first().map(|s| s.step.prompt.as_str()))
+            .unwrap_or_default();
+        clip(&one_line(text), 100)
+    }
+
+    /// The keys that signed this run's evidence, once each in step order, by the name
+    /// the boss's allowlist gives them (else the name the signer announced).
+    pub fn signers(&self) -> Vec<(String, String)> {
+        let mut signers: Vec<(String, String)> = Vec::new();
+        for s in &self.steps {
+            let (StepState::Done {
+                evidence: Some(e), ..
+            }
+            | StepState::Failed {
+                evidence: Some(e), ..
+            }) = &s.state
+            else {
+                continue;
+            };
+            if signers.iter().any(|(_, id)| *id == e.signer_id) {
+                continue;
+            }
+            let name = self
+                .peer_ids
+                .iter()
+                .find(|(_, id)| **id == e.signer_id)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| e.signer.clone());
+            signers.push((name, e.signer_id.clone()));
+        }
+        signers
+    }
+
+    /// A one-step run for a task delegated on its own (outside a plan) whose peer sent
+    /// back something to prove: the checks its runtime ran, or a commit. With checks,
+    /// the run claims they pass after the task.
+    pub fn for_task(
+        boss: &str,
+        boss_id: &str,
+        peer: &str,
+        task: &crate::llm::LlmTask,
+        delivered: crate::agent::Delivered,
+        started_unix: u64,
+    ) -> Self {
+        let prompt = one_line(&task.prompt);
+        let claims = if task.checks.is_empty() {
+            Vec::new()
+        } else {
+            vec![ClaimDef {
+                id: "T-1".into(),
+                text: format!(
+                    "{} pass{} after: {}",
+                    task.checks.join(", "),
+                    if task.checks.len() == 1 { "es" } else { "" },
+                    clip(&prompt, 100)
+                ),
+            }]
+        };
+        let step = Step {
+            id: "task".into(),
+            after: Vec::new(),
+            target: crate::plan::Target::Peer(peer.to_owned()),
+            share: task.share.clone(),
+            provider: task.provider,
+            prompt: task.prompt.clone(),
+            checks: task.checks.clone(),
+            attempts: task.attempts,
+            claims: claims.iter().map(|c| c.id.clone()).collect(),
+            apply: None,
+            approve: false,
+            context: Vec::new(),
+            save: None,
+            skills: Vec::new(),
+            mcp: task.mcp.clone(),
+            agent: None,
+        };
+        // The task as the plan step it amounts to.
+        let mut text: String = claims
+            .iter()
+            .map(|c| format!("claim: {} {}\n", c.id, c.text))
+            .collect();
+        text += &format!(
+            "task @{peer}{} using {}",
+            task.share
+                .as_ref()
+                .map(|s| format!(":{s}"))
+                .unwrap_or_default(),
+            task.provider
+        );
+        if !task.checks.is_empty() {
+            text += &format!(" verify={} claims=T-1", task.checks.join(","));
+        }
+        if let Some(n) = task.attempts {
+            text += &format!(" attempts={n}");
+        }
+        text += &format!(" {prompt}");
+        let plan = Plan {
+            claims,
+            steps: vec![step.clone()],
+        };
+        let state = StepState::from_delivered(peer.to_owned(), &step, delivered);
+        let states = BTreeMap::from([("task".to_owned(), state)]);
+        Self::new(boss, boss_id, &text, &plan, &states, started_unix)
+    }
+
+    /// Whether a task delegated on its own brought back something to keep as an
+    /// evidence run: it asked for checks, or its peer committed work.
+    pub fn worth_keeping(task: &crate::llm::LlmTask, delivered: &crate::agent::Delivered) -> bool {
+        !task.checks.is_empty()
+            || delivered
+                .evidence
+                .as_ref()
+                .and_then(|e| e.git.as_ref())
+                .is_some_and(|g| g.commit.is_some())
     }
 
     pub fn verdict_line(&self) -> String {
@@ -554,6 +679,34 @@ impl RunRecord {
         runs.sort_by(|a, b| b.id.cmp(&a.id));
         Ok(runs)
     }
+
+    /// The newest saved run with a step backed by the evidence record signed
+    /// `signature`, re-verified (its verdicts come from checking the evidence now).
+    pub fn with_evidence(runs_dir: &Path, signature: &str) -> Option<Self> {
+        let mut ids: Vec<String> = std::fs::read_dir(runs_dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        ids.iter()
+            .filter_map(|id| Self::load(runs_dir, id).ok())
+            .find(|run| {
+                run.steps.iter().any(|s| match &s.state {
+                    StepState::Done {
+                        evidence: Some(e), ..
+                    }
+                    | StepState::Failed {
+                        evidence: Some(e), ..
+                    } => e.signature == signature,
+                    _ => false,
+                })
+            })
+            .map(|run| {
+                let dir = runs_dir.join(&run.id);
+                run.reverified(Some(&dir)).0
+            })
+    }
 }
 
 fn verify_step(
@@ -589,6 +742,21 @@ fn verify_step(
 /// The first 10 characters (never splits a character).
 fn short(id: &str) -> String {
     id.chars().take(10).collect()
+}
+
+/// `text` on one line, each run of whitespace a single space.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `text` cut to at most `max` characters, ending with an ellipsis if it was longer.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 #[cfg(test)]
@@ -733,6 +901,68 @@ mod tests {
         later.finished_unix += 3_600;
         let err = later.verify(None)[0].1.as_ref().unwrap_err().to_string();
         assert!(err.contains("outside this run"), "{err}");
+    }
+
+    #[test]
+    fn tasks_on_their_own_keep_what_proves_them_as_one_step_runs() {
+        use crate::agent::Delivered;
+        use crate::llm::{LlmTask, Provider};
+        let key = SecretKey::generate();
+        let task = LlmTask::new(Provider::Copilot, "Fix the\nparser")
+            .in_share("app")
+            .with_checks(vec!["test".into()], Some(2));
+        let delivered = Delivered {
+            ok: true,
+            output: "fixed".into(),
+            evidence: Some(task_evidence(&key, "fixed", true)),
+            patch: None,
+            verified: true,
+        };
+        assert!(RunRecord::worth_keeping(&task, &delivered));
+        let mut run = RunRecord::for_task(
+            "boss",
+            &key.public().to_string(),
+            "worker",
+            &task,
+            delivered,
+            0,
+        );
+        run.peer_ids
+            .insert("worker".into(), key.public().to_string());
+        assert!(run.passed(), "{}", run.verdict_line());
+        assert_eq!(run.title(), "test passes after: Fix the parser");
+        assert_eq!(run.summary().title, run.title());
+        assert_eq!(
+            run.plan_text,
+            "claim: T-1 test passes after: Fix the parser\n\
+             task @worker:app using copilot verify=test claims=T-1 attempts=2 Fix the parser"
+        );
+        assert!(run.verify(None)[0].1.is_ok());
+        // Only keys that signed something are signers, by their allowlist name.
+        run.peer_ids
+            .insert("idle".into(), SecretKey::generate().public().to_string());
+        assert_eq!(
+            run.signers(),
+            [("worker".to_owned(), key.public().to_string())]
+        );
+
+        // A question answered without checks or a commit isn't kept.
+        let question = LlmTask::new(Provider::Copilot, "What does it do?");
+        let answer = Delivered {
+            ok: true,
+            output: "It parses.".into(),
+            evidence: Some(
+                Evidence::new(EvidenceKind::Task, "worker", key.public(), key.public(), 2)
+                    .sign("It parses.", &key),
+            ),
+            patch: None,
+            verified: true,
+        };
+        assert!(!RunRecord::worth_keeping(&question, &answer));
+        // Without checks, a run's title is its task.
+        let plan = Plan::parse("a @worker Summarize   the README").unwrap();
+        let run = RunRecord::new("boss", "x", "", &plan, &BTreeMap::new(), 0);
+        assert_eq!(run.title(), "Summarize the README");
     }
 
     #[test]

@@ -19,6 +19,11 @@ use crate::profile::INHERITED_CREDENTIAL_VARS;
 /// Largest patch sent back with a result (its hash is always signed).
 pub const MAX_PATCH_BYTES: usize = 1 << 20;
 
+/// The git notes ref (`refs/notes/proofkin`) where an agent keeps, on each commit its
+/// tasks made, the evidence it signed for it, so a pull request from the branch can
+/// carry it (see [`crate::github::branch_proof`]).
+pub const NOTES_REF: &str = "proofkin";
+
 /// `git worktree add/remove` on one repository must not run concurrently.
 static GIT_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -206,6 +211,54 @@ impl Worktree {
         record.commit = Some(commit);
         Ok((record, (patch.len() <= MAX_PATCH_BYTES).then_some(patch)))
     }
+
+    /// Attaches `text` to `commit` as a note under [`NOTES_REF`].
+    pub async fn note(&self, commit: &str, text: &str) -> Result<()> {
+        let _lock = GIT_LOCK.lock().await;
+        let file = self.path.with_extension("note");
+        std::fs::write(&file, text)?;
+        let file_arg = file.to_string_lossy().into_owned();
+        let notes_ref = format!("--ref={NOTES_REF}");
+        let result = git(
+            &self.path,
+            &self.hooks,
+            &[
+                "-c",
+                "user.name=proofkin",
+                "-c",
+                "user.email=proofkin@localhost",
+                "notes",
+                &notes_ref,
+                "add",
+                "-f",
+                "-F",
+                &file_arg,
+                commit,
+            ],
+        )
+        .await;
+        let _ = std::fs::remove_file(&file);
+        result.map(drop)
+    }
+}
+
+/// The note under [`NOTES_REF`] on commit `rev` of `repo`, if it has one.
+pub async fn read_note(repo: &Path, rev: &str) -> Result<Option<String>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args(["notes", &format!("--ref={NOTES_REF}"), "show", rev])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    for var in INHERITED_CREDENTIAL_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().await.context("running git")?;
+    Ok(out
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
 impl Drop for Worktree {
@@ -324,5 +377,138 @@ mod tests {
             numstat_paths("0\t0\t\0old.rs\0new.rs\0"),
             ["old.rs", "new.rs"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_commits_signed_record_travels_with_it_into_its_pull_request() {
+        use crate::evidence::{CheckResult, Evidence, EvidenceKind};
+        let repo = repo().await;
+        let root = tempfile::tempdir().unwrap();
+        let runs = tempfile::tempdir().unwrap();
+        let key = iroh::SecretKey::generate();
+        let wt = Worktree::create(repo.path(), root.path(), "p2p/boss/7-1")
+            .await
+            .unwrap();
+        std::fs::write(wt.path.join("a.txt"), "one\nfixed\n").unwrap();
+        let (record, _) = wt.commit("task 7").await.unwrap();
+        let commit = record.commit.clone().unwrap();
+        let mut e = Evidence::new(EvidenceKind::Task, "worker", key.public(), key.public(), 7);
+        e.attempts = 1;
+        e.checks.push(CheckResult {
+            name: "test".into(),
+            command: "cargo test --secret-flag".into(),
+            exit_code: Some(0),
+            passed: true,
+            millis: 2100,
+            output: "ok".into(),
+        });
+        e.git = Some(record);
+        let e = e.sign("fixed", &key);
+        wt.note(&commit, &serde_json::to_string(&e).unwrap())
+            .await
+            .unwrap();
+        drop(wt);
+
+        let proof = crate::github::branch_proof(repo.path(), "p2p/boss/7-1", runs.path())
+            .await
+            .unwrap()
+            .expect("the head commit has its record");
+        assert_eq!(proof.summary, "Signed by worker: ✓ test");
+        let md = &proof.markdown;
+        assert!(
+            md.contains(&format!("Commit `{}` (1 file)", &commit[..12])),
+            "{md}"
+        );
+        assert!(md.contains(&key.public().to_string()), "{md}");
+        assert!(md.contains("- ✅ `test`: exit 0 in 2.1s"), "{md}");
+        assert!(
+            !md.contains("cargo test"),
+            "check commands stay private: {md}"
+        );
+        // The requester's evidence run with the record adds what it proves.
+        let task = crate::llm::LlmTask::new(crate::llm::Provider::Copilot, "Fix it")
+            .with_checks(vec!["test".into()], None);
+        let delivered = crate::agent::Delivered {
+            ok: true,
+            output: "fixed".into(),
+            evidence: Some(e.clone()),
+            patch: None,
+            verified: true,
+        };
+        let mut run = crate::runs::RunRecord::for_task(
+            "boss",
+            &key.public().to_string(),
+            "worker",
+            &task,
+            delivered,
+            0,
+        );
+        run.peer_ids
+            .insert("worker".into(), key.public().to_string());
+        run.save(runs.path()).unwrap();
+        let proof = crate::github::branch_proof(repo.path(), "p2p/boss/7-1", runs.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            proof.summary.ends_with(&format!(
+                "; evidence run {}: PASS: 1/1 claims proven, 1/1 steps done",
+                run.id
+            )),
+            "{}",
+            proof.summary
+        );
+        assert!(
+            proof
+                .markdown
+                .contains("| T-1 | test passes after: Fix it | ✅ proven |"),
+            "{}",
+            proof.markdown
+        );
+
+        // A commit without a record carries no proof.
+        let wt = Worktree::create(repo.path(), root.path(), "p2p/boss/8-1")
+            .await
+            .unwrap();
+        std::fs::write(wt.path.join("c.txt"), "unsigned\n").unwrap();
+        let (other, _) = wt.commit("task 8").await.unwrap();
+        drop(wt);
+        let proof = |branch: &'static str| {
+            let (repo, runs) = (repo.path().to_owned(), runs.path().to_owned());
+            async move { crate::github::branch_proof(&repo, branch, &runs).await }
+        };
+        assert_eq!(proof("p2p/boss/8-1").await.unwrap(), None);
+        // A record copied to another commit doesn't cover it.
+        let hooks = root.path().join(".no-hooks");
+        let head = other.commit.unwrap();
+        let notes = |args: Vec<String>| {
+            let (repo, hooks) = (repo.path().to_owned(), hooks.clone());
+            async move {
+                let mut all = vec![
+                    "-c".to_owned(),
+                    "user.name=t".into(),
+                    "-c".into(),
+                    "user.email=t@t".into(),
+                    "notes".into(),
+                    "--ref=proofkin".into(),
+                ];
+                all.extend(args);
+                let all: Vec<&str> = all.iter().map(String::as_str).collect();
+                git(&repo, &hooks, &all).await.unwrap();
+            }
+        };
+        notes(vec!["copy".into(), commit.clone(), head.clone()]).await;
+        let err = proof("p2p/boss/8-1").await.unwrap_err();
+        assert!(format!("{err:#}").contains("another commit"), "{err:#}");
+        // A record edited to name that commit fails its signature check.
+        let mut forged = e.clone();
+        if let Some(g) = forged.git.as_mut() {
+            g.commit = Some(head.clone());
+        }
+        let forged = serde_json::to_string(&forged).unwrap();
+        notes(vec!["add".into(), "-f".into(), "-m".into(), forged, head]).await;
+        let err = proof("p2p/boss/8-1").await.unwrap_err();
+        assert!(format!("{err:#}").contains("doesn't verify"), "{err:#}");
+        assert!(proof("main").await.is_err(), "only task branches");
     }
 }

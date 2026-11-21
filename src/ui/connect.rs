@@ -769,6 +769,8 @@ fn start_delegation(s: &AppState, ask: &Ask, via: &'static str) -> Result<Work, 
         target: peer.id.to_string(),
         share: ask.folder.clone(),
         mcp: ask.mcp.clone(),
+        checks: Vec::new(),
+        attempts: None,
     };
     let view = start_task(s, body, Some(via)).map_err(api_error)?;
     Ok(Work::Task(view.id))

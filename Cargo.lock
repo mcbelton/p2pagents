@@ -1340,9 +1340,9 @@ dependencies = [
 
 [[package]]
 name = "github-copilot-sdk"
-version = "1.0.34"
+version = "1.0.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ded0f2f58db14874399fbfb422beb40a9746f9c55395374344ec501ecf98be8d"
+checksum = "19fa7ec6eaa151fed103549955d4d09bdb42dc687621b1b0a8cb66971307f015"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3058,7 +3058,7 @@ dependencies = [
 
 [[package]]
 name = "proofkin"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",

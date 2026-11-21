@@ -278,6 +278,24 @@ function providerLabel(p) {
 function clock(ms) {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
+const dayWords = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+/** When something happened: its time, with its day unless it is today ("Yesterday, 9:25 PM",
+ * "Nov 18, 9:25 PM"). Times to come use when(). */
+function stamp(ms) {
+  const d = new Date(ms);
+  const now = new Date();
+  const days = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86_400_000);
+  if (days === 0) return clock(ms);
+  if (Math.abs(days) === 1) {
+    const word = dayWords.format(-days, "day");
+    return `${word.charAt(0).toLocaleUpperCase()}${word.slice(1)}, ${clock(ms)}`;
+  }
+  const date = d.toLocaleDateString([], {
+    month: "short", day: "numeric", ...(d.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+  });
+  return `${date}, ${clock(ms)}`;
+}
 function duration(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
@@ -423,6 +441,12 @@ function renderPeers() {
         onclick: () => removePeer(t),
       }, icon(ICONS.trash))));
   }
+  // The first steps are done once a peer is on the allowlist, online or not.
+  if (state.trusted.length && $("#feed .get-started")) renderFeed();
+  // Refused peers that are allowlisted now need no button to allowlist them.
+  for (const b of document.querySelectorAll("#feed button[data-peer]")) {
+    if (state.trusted.some((t) => t.id === b.dataset.peer)) b.remove();
+  }
   renderTaskOptions();
 }
 
@@ -431,24 +455,37 @@ function feedNode(item) {
     return el("div", { class: `msg${item.self ? " self" : ""}` },
       item.self ? null : avatar(item.from),
       el("div", {},
-        el("div", { class: "meta" }, item.self ? "You" : item.from, " · ", el("time", { text: clock(item.ts) })),
+        el("div", { class: "meta" }, item.self ? "You" : item.from, " · ", el("time", { text: stamp(item.ts) })),
         el("div", { class: "bubble", text: item.text })));
   }
   return el("div", { class: "sys", "data-level": item.level },
-    el("span", { text: item.text }), el("time", { text: clock(item.ts) }));
+    el("span", { text: item.text }), el("time", { text: stamp(item.ts) }),
+    // A refused peer may be a teammate who allowlisted you first.
+    item.peer && !state.trusted.some((t) => t.id === item.peer)
+      ? el("button", {
+        type: "button", class: "btn small", "data-peer": item.peer,
+        title: "Open Add peer with its endpoint id. Only allowlist someone you know: compare it with what they sent you.",
+        onclick: () => openAddDialog(item.peer),
+      }, "Allowlist…")
+      : null);
 }
 
 function renderFeed() {
   const feed = $("#feed");
   feed.replaceChildren();
-  const meaningful = state.feed.some((i) => i.kind === "chat" || i.level !== "info");
-  if (!meaningful) {
+  for (const item of state.feed) feed.append(feedNode(item));
+  // A new agent's first steps (nobody on its allowlist yet, whatever else happened);
+  // else, until something happens beyond this agent's own notices, what will show up
+  // here. Below those notices, never instead of them.
+  const start = getStartedNode();
+  if (start) {
+    feed.append(start);
+  } else if (!state.feed.some((i) => i.kind === "chat" || i.level !== "info")) {
     feed.append(el("div", { class: "feed-empty" },
       icon(ICONS.peers),
-      el("h2", { text: "No activity yet" }),
+      el("h2", { text: "No messages yet" }),
       el("p", { text: "Messages, peers joining and leaving, and tasks from peers show up here." })));
   }
-  for (const item of state.feed) feed.append(feedNode(item));
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -456,12 +493,51 @@ function appendFeed(item) {
   state.feed.push(item);
   const feed = $("#feed");
   const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
-  if (feed.querySelector(".feed-empty") && (item.kind === "chat" || item.level !== "info")) {
+  const placeholder = feed.querySelector(".feed-empty, .get-started");
+  if (placeholder?.classList.contains("feed-empty") && (item.kind === "chat" || item.level !== "info")) {
     renderFeed();
     return;
   }
-  feed.append(feedNode(item));
+  if (placeholder) feed.insertBefore(feedNode(item), placeholder);
+  else feed.append(feedNode(item));
   if (nearBottom || item.self) feed.scrollTop = feed.scrollHeight;
+}
+
+// ---------- first steps ----------
+const GET_STARTED_KEY = "proofkin-get-started";
+
+/** First steps for a new agent (no peer on its allowlist yet): share the ticket, add a
+ * teammate's, or create a digital worker; null once it has a peer or was hidden. */
+function getStartedNode() {
+  if (state.trusted.length || localStorage.getItem(GET_STARTED_KEY) === "hidden") return null;
+  const canOwn = typeof workerState === "undefined" || !workerState.loaded || workerState.canOwn;
+  const copied = localStorage.getItem(`${GET_STARTED_KEY}-ticket`) === "copied";
+  const step = (n, done, title, text, button) => el("li", { "data-done": String(done) },
+    el("span", { class: "step-mark", "aria-hidden": "true", text: done ? "✓" : String(n) }),
+    el("span", { class: "step-text" }, el("strong", { text: title }), el("span", { text })),
+    button);
+  return el("section", { class: "get-started", "aria-labelledby": "get-started-h" },
+    el("h2", { id: "get-started-h", text: "Get started: connect an agent to work with" }),
+    el("ol", {},
+      step(1, copied, "Share your ticket", "Teammates add it to their allowlist to work with you.",
+        el("button", { type: "button", class: "btn small", onclick: copyTicket }, copied ? "Copy again" : "Copy ticket")),
+      step(2, false, "Add a teammate's ticket", "Only peers on your allowlist connect and take your tasks.",
+        el("button", { type: "button", class: "btn small primary", onclick: openAddDialog }, "Add peer")),
+      canOwn ? step(3, false, "No teammate yet? Create a digital worker", "An agent of yours, running on your own Copilot sign-in.",
+        el("button", { type: "button", class: "btn small", onclick: openWorkerDialog }, "New worker")) : null),
+    el("p", { class: "muted small" }, "Then choose ", el("strong", { text: "Run task" }),
+      " and pick the checks its runtime runs: the work is proven only if they pass, with a signed record."),
+    el("button", {
+      type: "button", class: "btn small dismiss",
+      onclick: () => { localStorage.setItem(GET_STARTED_KEY, "hidden"); renderFeed(); },
+    }, "Hide"));
+}
+
+function copyTicket() {
+  if (!state.me) return;
+  copy(state.me.ticket, "Ticket");
+  localStorage.setItem(`${GET_STARTED_KEY}-ticket`, "copied");
+  if ($("#feed .get-started")) renderFeed();
 }
 
 const openResults = new Map();
@@ -478,7 +554,7 @@ function taskNode(t) {
   const via = t.via ? ` · asked by another agent (${t.via})` : "";
   const meta = t.status === "waiting"
     ? el("div", { class: "task-meta", text: (t.after?.length ? `Waits for: ${t.after.join(", ")}` : "Starting…") + via })
-    : el("div", { class: "task-meta" }, `Started ${clock(t.started_ms)} · `,
+    : el("div", { class: "task-meta" }, `Started ${stamp(t.started_ms)} · `,
       el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
         t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`),
       t.after?.length ? ` · after ${t.after.join(", ")}` : null, via || null);
@@ -513,6 +589,15 @@ function taskNode(t) {
       "aria-label": t.plan ? `Cancel the plan of step ${t.step}` : `Cancel task #${t.id}`,
       onclick: (e) => cancelTask(t, e.currentTarget),
     }, icon(ICONS.stop), t.plan ? "Cancel plan" : "Cancel"));
+  }
+  // Its evidence run keeps what proves it (the plan's, or the task's own).
+  if (t.run) {
+    node.append(el("div", { class: "task-actions" },
+      el("button", {
+        type: "button", class: "btn small",
+        "aria-label": `Open the evidence run of ${t.step ? `step ${t.step}` : `task #${t.id}`}`,
+        onclick: () => openRun(t.run),
+      }, "Evidence run")));
   }
   if (t.output !== null && t.output !== undefined && !["cancelled", "skipped"].includes(t.status)) {
     const open = openResults.has(t.id) ? openResults.get(t.id) : true;
@@ -697,10 +782,10 @@ async function loadRuns() {
   for (const r of res.runs.slice(0, 20)) {
     const verdict = r.claims ? (r.passed ? "Pass" : "Fail") : "No claims";
     list.append(el("li", { class: "run-item" },
-      el("button", { type: "button", class: "run-open", onclick: () => openRun(r.id), "aria-label": `Open evidence run ${r.id}` },
-        el("span", { class: "task-title", text: r.id }),
+      el("button", { type: "button", class: "run-open", onclick: () => openRun(r.id), "aria-label": `Open evidence run ${r.id}: ${r.title}`, title: `Evidence run ${r.id}` },
+        el("span", { class: "task-title", text: r.title || r.id }),
         el("span", { class: `status ${r.passed ? "done" : r.claims ? "failed" : "skipped"}`, text: verdict })),
-      el("div", { class: "task-meta", text: `${clock(r.started_unix * 1000)} · ${r.proven}/${r.claims} claims proven · ${r.steps_done}/${r.steps} steps done` })));
+      el("div", { class: "task-meta", text: `${stamp(r.started_unix * 1000)} · ${r.proven}/${r.claims} claims proven · ${r.steps_done}/${r.steps} steps done` })));
   }
 }
 
@@ -1008,6 +1093,8 @@ async function openRun(id) {
   try {
     const run = await api(`/api/runs/${encodeURIComponent(id)}`);
     $("#run-h").textContent = `Evidence run ${id}`;
+    $("#run-download").hidden = false;
+    $("#run-download").onclick = (e) => downloadRun(id, e.currentTarget);
     $("#run-verdict").textContent = run.verdict;
     $("#run-verdict").dataset.pass = String(run.summary.passed);
     $("#run-signatures").replaceChildren(...run.signatures.map((s) => el("li", { class: s.ok ? "ok" : "bad" },
@@ -1020,6 +1107,31 @@ async function openRun(id) {
     $("#run-close").focus();
   } catch (err) {
     toast(err.message, "error");
+  }
+}
+
+/** Saves run `id`'s run.json: anyone can re-check its signatures with
+ * `proofkin runs verify --file`, without trusting this agent. */
+async function downloadRun(id, button) {
+  button.disabled = true;
+  try {
+    const res = await fetch(`/api/runs/${encodeURIComponent(id)}/file`, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 401) {
+      showAuthError();
+      throw new Error("Session ended: open the new link printed by Proofkin");
+    }
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `${res.status} ${res.statusText}`);
+    const url = URL.createObjectURL(await res.blob());
+    const link = el("a", { href: url, download: `${id}.json`, hidden: true });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    toast(`Saved ${id}.json; anyone can check it with: proofkin runs verify --file ${id}.json`);
+  } catch (err) {
+    toast(err.message, "error");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1479,7 +1591,7 @@ async function loadOps() {
   if (ops.incidents.length) {
     health.append(el("details", {}, el("summary", { text: `Incident log (${ops.incidents.length})` }),
       el("ol", { class: "incident-log" }, ...ops.incidents.map((e) => el("li", { class: `incident ${e.kind}` },
-        el("strong", { text: `${clock(e.ts * 1000)} ${e.monitor} · ${INCIDENT_TEXT[e.kind] ?? e.kind}: ` }),
+        el("strong", { text: `${stamp(e.ts * 1000)} ${e.monitor} · ${INCIDENT_TEXT[e.kind] ?? e.kind}: ` }),
         e.text.split("\n")[0])))));
   }
   const kb = $("#kb-list");
@@ -1505,12 +1617,19 @@ async function loadSkills() {
     el("div", { class: "muted small", text: s.description }))));
 }
 
+/** The run dialog showing other content (a skill or a topic): nothing of a run stays. */
+function runDialogFor(title) {
+  $("#run-h").textContent = title;
+  $("#run-verdict").textContent = "";
+  $("#run-signatures").replaceChildren();
+  $("#run-prototypes").replaceChildren();
+  $("#run-download").hidden = true;
+}
+
 async function openSkill(name) {
   try {
     const res = await api(`/api/skills/${encodeURIComponent(name)}`);
-    $("#run-h").textContent = `Skill: ${name}`;
-    $("#run-verdict").textContent = "";
-    $("#run-signatures").replaceChildren();
+    runDialogFor(`Skill: ${name}`);
     $("#run-report").replaceChildren(renderMarkdown(res.text.replace(/^---[\s\S]*?\n---\n/, "")));
     $("#run-dialog").showModal();
     $("#run-close").focus();
@@ -1522,9 +1641,7 @@ async function openSkill(name) {
 async function openTopic(topic) {
   try {
     const res = await api(`/api/kb/${encodeURIComponent(topic)}`);
-    $("#run-h").textContent = `Knowledge: ${topic}`;
-    $("#run-verdict").textContent = "";
-    $("#run-signatures").replaceChildren();
+    runDialogFor(`Knowledge: ${topic}`);
     $("#run-report").replaceChildren(renderMarkdown(res.text.replace(/^<!--.*-->\n/, "")));
     $("#run-dialog").showModal();
     $("#run-close").focus();
@@ -1554,7 +1671,7 @@ async function loadGithub() {
   for (const r of github.repos) {
     const branches = r.branches.slice(0, 5).map((b) => el("li", { class: "branch" },
       el("span", { class: "mono small", text: b.name }),
-      el("span", { class: "muted small", text: ` ${clock(b.unix * 1000)} · ${b.subject}` }),
+      el("span", { class: "muted small", text: ` ${stamp(b.unix * 1000)} · ${b.subject}` }),
       el("button", { type: "button", class: "btn small", onclick: () => openPr(r, b) }, "Open PR")));
     box.append(el("div", { class: "repo" },
       el("div", { class: "task-top" },
@@ -1660,14 +1777,27 @@ async function unlinkRepo(r) {
 }
 
 let prTarget = null;
-function openPr(r, b) {
+async function openPr(r, b) {
   prTarget = { repo: r, branch: b.name };
   $("#pr-desc").textContent = `${b.name} → ${r.branch} in ${r.slug}`;
   $("#pr-title").value = b.subject.replace(/^(proofkin|p2pagents): /, "");
-  $("#pr-body").value = `Made by Proofkin (branch ${b.name}). See the evidence run for checks and sign-offs.`;
+  $("#pr-body").value = "Made with Proofkin.";
   $("#pr-error").textContent = "";
+  // The proof comes from the commit's signed record, checked by the server.
+  $("#pr-proof").checked = false;
+  $("#pr-proof").disabled = true;
+  $("#pr-proof-status").textContent = "Checking the commit's signed record…";
   $("#pr-dialog").showModal();
   $("#pr-title").focus();
+  try {
+    const res = await api(`/api/repos/${encodeURIComponent(r.name)}/proof?branch=${encodeURIComponent(b.name)}`);
+    if (prTarget?.branch !== b.name) return;
+    $("#pr-proof").disabled = !res.proof;
+    $("#pr-proof").checked = Boolean(res.proof);
+    $("#pr-proof-status").textContent = res.proof ? res.proof.summary : `No proof to add: ${res.reason}`;
+  } catch (err) {
+    $("#pr-proof-status").textContent = `No proof to add: ${err.message}`;
+  }
 }
 
 async function submitPr(e) {
@@ -1679,10 +1809,12 @@ async function submitPr(e) {
   try {
     const res = await api(`/api/repos/${encodeURIComponent(prTarget.repo.name)}/pr`, {
       method: "POST",
-      body: JSON.stringify({ branch: prTarget.branch, title: $("#pr-title").value, body: $("#pr-body").value }),
+      body: JSON.stringify({
+        branch: prTarget.branch, title: $("#pr-title").value, body: $("#pr-body").value, proof: $("#pr-proof").checked,
+      }),
     });
     $("#pr-dialog").close();
-    toast(`Pull request opened: ${res.url}`);
+    toast(`Pull request opened${res.proof ? " with its proof" : ""}: ${res.url}`);
     window.open(res.url, "_blank", "noopener");
   } catch (err) {
     $("#pr-error").textContent = err.message;
@@ -1712,7 +1844,7 @@ async function loadAudit() {
       el("div", { class: "task-top" },
         el("span", { class: "task-title", text: `${e.peer} · #${e.task_id} · ${providerLabel(e.provider)}` }),
         el("span", { class: `status ${OUTCOME_CLASS[e.outcome] ?? ""}`, text: OUTCOME_TEXT[e.outcome] ?? e.outcome })),
-      el("div", { class: "task-meta", text: `${clock(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
+      el("div", { class: "task-meta", text: `${stamp(e.ts_ms)} · ${access} · ${duration(e.duration_ms)} · ${e.prompt_chars} chars, sha256 ${e.prompt_sha256.slice(0, 10)}` }),
       e.error ? el("div", { class: e.outcome === "cancelled" ? "audit-note" : "audit-error", text: e.error }) : null));
   }
 }
@@ -1756,6 +1888,31 @@ function renderShareOptions() {
     el("option", { value: s.name, text: `${s.name} (${(ACCESS_SHORT[s.access] ?? s.access).toLowerCase()})` })));
   if (shares.some((s) => s.name === prev)) sel.value = prev;
   renderMcpOptions();
+  renderCheckOptions();
+}
+
+/** Checks of the chosen folder its peer's runtime runs after the model, as evidence.
+ * A folder's own checks run its code, so they are offered only with full access. */
+function renderCheckOptions() {
+  const peer = state.peers.find((p) => p.id === $("#target").value);
+  const share = (peer?.shares ?? []).find((s) => s.name === $("#share").value);
+  const checks = $("#share-field").hidden || share?.access !== "full" ? [] : share?.checks ?? [];
+  const checked = new Set(selectedChecks());
+  $("#checks-field").hidden = !checks.length;
+  $("#check-options").replaceChildren(...checks.map((name) =>
+    el("label", { class: "mcp-chip", title: `${peer.name}'s runtime runs ${name} after the model: the task is proven only if it passes` },
+      el("input", { type: "checkbox", value: name, checked: checked.has(name), onchange: syncAttempts }),
+      el("span", { class: "mono", text: name }))));
+  syncAttempts();
+}
+
+function selectedChecks() {
+  if ($("#checks-field").hidden) return [];
+  return [...$("#check-options").querySelectorAll("input:checked")].map((i) => i.value);
+}
+
+function syncAttempts() {
+  $("#attempts-field").hidden = !selectedChecks().length;
 }
 
 /** MCP servers the chosen folder offers (Copilot and Claude tasks only), with what
@@ -1798,7 +1955,7 @@ function updateComposer() {
     ? `Start from a playbook, or write a plan: claim lines, then one step per line, e.g.\nclaim: C-1 The parser handles empty input\n${PLAN_EXAMPLE}`
     : task
       ? noProviders
-        ? "No provider available: enable one with --providers, or connect a peer that serves one"
+        ? "No provider here yet: connect a peer that runs one, or create a digital worker (it runs on your own sign-ins)"
         : "Describe the task, e.g. “Add unit tests for the parser module”"
       : "Message all connected peers…";
   $("#composer-label").textContent = plan ? "Plan" : task ? "Task prompt" : "Message";
@@ -1825,10 +1982,12 @@ async function submitComposer(e) {
         return;
       }
       const res = await api("/api/plans", { method: "POST", body: JSON.stringify({ text }) });
-      toast(`Plan started: ${Object.keys(res.steps).length} steps`);
+      const n = Object.keys(res.steps).length;
+      toast(`Plan started: ${n} step${n === 1 ? "" : "s"}`);
       $("#plan-problems").hidden = true;
       state.playbook = null;
     } else {
+      const checks = selectedChecks();
       const task = await api("/api/tasks", {
         method: "POST",
         body: JSON.stringify({
@@ -1836,11 +1995,15 @@ async function submitComposer(e) {
           target: $("#target").value,
           share: $("#share-field").hidden ? null : $("#share").value,
           mcp: selectedMcp(),
+          checks,
+          attempts: checks.length ? Number($("#attempts").value) : null,
           prompt: text,
         }),
       });
       upsertTask(task);
-      toast(`Task #${task.id} started on ${task.target}`);
+      toast(checks.length
+        ? `Task #${task.id} started on ${task.target}; it is proven only if ${checks.join(", ")} pass${checks.length === 1 ? "es" : ""}`
+        : `Task #${task.id} started on ${task.target}`);
     }
     input.value = "";
   } catch (err) {
@@ -1877,13 +2040,19 @@ function renderShareChecks() {
         el("span", { class: "mono", text: s.path })))));
 }
 
-function openAddDialog() {
+/** `endpoint`: a peer's endpoint id to start from (one that tried to connect). */
+function openAddDialog(endpoint) {
   $("#add-form").reset();
   renderShareChecks();
   syncDelegateFields();
   $("#add-error").textContent = "";
   $("#add-dialog").showModal();
-  $("#add-ticket").focus();
+  if (typeof endpoint === "string") {
+    $("#add-ticket").value = endpoint;
+    $("#add-name").focus();
+  } else {
+    $("#add-ticket").focus();
+  }
 }
 
 async function submitAdd(e) {
@@ -2092,9 +2261,9 @@ function init() {
     "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
-  $("#share").addEventListener("change", renderMcpOptions);
+  $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });
   $("#me-id").addEventListener("click", () => state.me && copy(state.me.id, "Endpoint id"));
-  $("#copy-ticket").addEventListener("click", () => state.me && copy(state.me.ticket, "Ticket"));
+  $("#copy-ticket").addEventListener("click", copyTicket);
   $("#add-peer-btn").addEventListener("click", openAddDialog);
   $("#add-cancel").addEventListener("click", () => $("#add-dialog").close());
   $("#add-dialog").addEventListener("close", () => $("#add-peer-btn").focus());

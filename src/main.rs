@@ -358,7 +358,10 @@ pull request with repo pr.")]
         #[command(flatten)]
         profile: ProfileArg,
     },
-    /// Push a task branch and open a pull request into the repository's branch.
+    /// Push a task branch and open a pull request into the repository's branch. Its
+    /// description ends with the proof the branch's commit carries: the record its agent
+    /// signed (who made it, the checks that ran on it) and the claims of your evidence
+    /// run that has it.
     Pr {
         name: String,
         branch: String,
@@ -366,6 +369,9 @@ pull request with repo pr.")]
         title: Option<String>,
         #[arg(long, default_value = "")]
         body: String,
+        /// Leave the proof out of the description.
+        #[arg(long)]
+        no_proof: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -724,16 +730,22 @@ enum RunsCommand {
     },
     /// Re-check every signature in a run, from its run.json alone; exits 1 if any fails.
     #[command(after_help = "\
-Works on a run folder copied from someone else too:  proofkin runs verify --dir <folder>")]
+Works on a run from someone else too: a run folder they copied
+  proofkin runs verify --dir <folder>
+or a run downloaded from the web UI (its patches aren't checked then)
+  proofkin runs verify --file <run-id>.json")]
     Verify {
         /// Run id (in the profile's runs folder).
-        #[arg(required_unless_present = "dir")]
+        #[arg(required_unless_present_any = ["dir", "file"])]
         id: Option<String>,
         /// A run folder (with run.json) from anywhere.
-        #[arg(long, conflicts_with = "id")]
+        #[arg(long, conflicts_with_all = ["id", "file"])]
         dir: Option<PathBuf>,
+        /// A run's run.json file from anywhere, under any name.
+        #[arg(long, conflicts_with = "id")]
+        file: Option<PathBuf>,
         /// Profile whose runs folder holds the run (with a run id).
-        #[arg(long = "profile", required_unless_present = "dir")]
+        #[arg(long = "profile", required_unless_present_any = ["dir", "file"])]
         profile: Option<String>,
     },
 }
@@ -1751,7 +1763,8 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
             name,
             branch,
             title,
-            body,
+            mut body,
+            no_proof,
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
@@ -1768,6 +1781,17 @@ async fn run_repo(command: RepoCommand) -> Result<()> {
                         format!("{name} has no branch {branch} (see repo branches)")
                     })?,
             };
+            if !no_proof {
+                match proofkin::github::branch_proof(&repo.path, &branch, &profile.runs_dir()).await
+                {
+                    Ok(Some(proof)) => {
+                        println!("with its proof: {}", proof.summary);
+                        body += &proof.markdown;
+                    }
+                    Ok(None) => println!("without proof: its commit has no signed record"),
+                    Err(e) => println!("without proof: {e:#}"),
+                }
+            }
             creds.push(&repo, &branch).await?;
             println!("{}", creds.create_pr(&repo, &branch, &title, &body).await?);
         }
@@ -2404,20 +2428,29 @@ fn run_runs(command: RunsCommand) -> Result<()> {
                 RunRecord::load(&profile.runs_dir(), &id)?.render_markdown()
             );
         }
-        RunsCommand::Verify { id, dir, profile } => {
-            let dir = match (dir, id, profile) {
-                (Some(dir), _, _) => dir,
-                (None, Some(id), Some(profile)) => Profile::open(&profile)?.runs_dir().join(id),
-                _ => unreachable!("clap requires a run id with --profile, or --dir"),
+        RunsCommand::Verify {
+            id,
+            dir,
+            file,
+            profile,
+        } => {
+            // A single file has no patches next to it: only signatures and outputs count.
+            let (path, dir) = match (file, dir, id, profile) {
+                (Some(file), _, _, _) => (file, None),
+                (None, Some(dir), _, _) => (dir.join("run.json"), Some(dir)),
+                (None, None, Some(id), Some(profile)) => {
+                    let dir = Profile::open(&profile)?.runs_dir().join(id);
+                    (dir.join("run.json"), Some(dir))
+                }
+                _ => unreachable!("clap requires a run id with --profile, --dir or --file"),
             };
-            let path = dir.join("run.json");
             let run: RunRecord = serde_json::from_str(
                 &std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?,
             )
             .with_context(|| format!("parsing {}", path.display()))?;
             let mut failed = false;
-            let (run, checks) = run.reverified(Some(&dir));
+            let (run, checks) = run.reverified(dir.as_deref());
             for (step, result) in &checks {
                 match result {
                     Ok(text) => println!("  ok      {step}: {text}"),
@@ -2432,8 +2465,15 @@ fn run_runs(command: RunsCommand) -> Result<()> {
                 bail!("some evidence doesn't verify");
             }
             println!("all {} signed records verify", checks.len());
-            println!("signers (check these keys are the people you expect):");
-            for (name, id) in &run.peer_ids {
+            println!(
+                "requested by {} ({}); signed by (check these keys are the people you expect):",
+                run.boss, run.boss_id
+            );
+            let signers = run.signers();
+            if signers.is_empty() {
+                println!("  nobody: no step has signed evidence");
+            }
+            for (name, id) in signers {
                 println!("  {name:<12} {id}");
             }
         }
@@ -3004,7 +3044,14 @@ fn run_peers(command: PeersCommand) -> Result<()> {
     match command {
         PeersCommand::Id { profile } => {
             let profile = Profile::open(&profile.name)?;
+            let new = !profile.exists()?;
             let key = profile.identity()?;
+            if new {
+                eprintln!(
+                    "note: '{0}' is a new profile; it got its identity just now (a typo? remove it with: proofkin profile delete {0})",
+                    profile.name
+                );
+            }
             let ticket = Ticket {
                 name: profile.name.clone(),
                 addr: key.public().into(),

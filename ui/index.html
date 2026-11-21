@@ -153,6 +153,19 @@
               <span id="mcp-label">MCP</span>
               <span id="mcp-options" class="mcp-options"></span>
             </div>
+            <div class="field-inline" id="checks-field" role="group" aria-labelledby="checks-label" hidden
+                 title="Checks the peer's runtime runs after the model: the task is proven only if they pass, and it is kept under Evidence runs">
+              <span id="checks-label">Verify with</span>
+              <span id="check-options" class="mcp-options"></span>
+              <label class="field-inline" id="attempts-field" hidden
+                     title="Model attempts while the checks fail: each retry gets the failures">
+                <span>Attempts</span>
+                <select id="attempts">
+                  <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+                  <option value="4">4</option><option value="5">5</option>
+                </select>
+              </label>
+            </div>
           </div>
           <div class="task-opts" id="playbook-opts" hidden>
             <button type="button" class="btn small" id="playbook-pick" aria-haspopup="dialog"
@@ -225,7 +238,7 @@
           <h2 id="runs-h">Evidence runs</h2>
           <span class="count" id="runs-count">0</span>
         </div>
-        <p class="muted small">Every plan run is saved with a verdict per claim. A claim is proven only by checks the peers' runtimes ran (or a sign-off), signed with their keys.</p>
+        <p class="muted small">Every plan run is saved with a verdict per claim, and so is every task that asked for checks or committed work. A claim is proven only by checks the peers' runtimes ran (or a sign-off), signed with their keys.</p>
         <ol class="task-list" id="runs-list"></ol>
       </section>
       <section id="audit-panel" class="audit-panel" aria-labelledby="audit-h" hidden>
@@ -458,7 +471,11 @@
     <div class="dialog-body">
       <div class="card-head">
         <h2 id="run-h">Evidence run</h2>
-        <button type="button" class="btn small" id="run-close">Close</button>
+        <span class="head-actions">
+          <button type="button" class="btn small" id="run-download" hidden
+                  title="Save its run.json: anyone can check its signatures with proofkin runs verify --file">Download</button>
+          <button type="button" class="btn small" id="run-close">Close</button>
+        </span>
       </div>
       <p id="run-verdict" class="run-verdict"></p>
       <ul id="run-signatures" class="signature-list"></ul>
@@ -535,6 +552,11 @@
       <p class="muted small" id="pr-desc"></p>
       <label class="field"><span>Title</span><input id="pr-title" type="text" maxlength="200" required></label>
       <label class="field"><span>Description</span><textarea id="pr-body" rows="4"></textarea></label>
+      <label class="check" id="pr-proof-field">
+        <input type="checkbox" id="pr-proof" checked>
+        <span>Add the proof: who made the commit and the checks that ran on it, signed</span>
+      </label>
+      <p class="muted small" id="pr-proof-status" role="status"></p>
       <p class="form-error" id="pr-error" role="alert"></p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="pr-cancel">Cancel</button>

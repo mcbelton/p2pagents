@@ -67,7 +67,7 @@ run `.\install.ps1 -Version v0.1.2` (Linux/macOS: `PROOFKIN_VERSION=v0.1.2 sh in
 **3. Check, sign in, connect**
 
 ```powershell
-proofkin doctor                                         # checks CLIs, bridge, internet relay, profiles
+proofkin doctor                                         # checks CLIs (Copilot's protocol too), bridge, internet relay, profiles
 proofkin auth login copilot --profile me --gh-user <github-login>
 proofkin peers id --profile me                          # send your ticket to your peers
 proofkin peers allow <their-ticket> --profile me [--delegate]
@@ -676,14 +676,22 @@ option that takes a list adds to it: `skill=adr skill=api-contract` is
 A run **passes** only if every claim is proven. Runs are saved in the boss's profile under
 `runs/<id>/`: `run.json`, a Markdown `report.md`, and `<step>.patch` for each commit.
 
+A task you run on its own (not in a plan) is saved as a one-step run too when there is
+something to prove: it asked for checks (**Verify with** in the web UI's **Run task**), or
+its peer committed work. With checks, the run claims they pass after the task (`T-1`), so
+it passes only if they did.
+
 ```powershell
 proofkin runs list --profile boss
 proofkin runs show <id> --profile boss       # the report
 proofkin runs verify <id> --profile boss     # re-check every signature and patch hash
 proofkin runs verify --dir \\share\runs\<id> # ... from a run folder anyone sent you
+proofkin runs verify --file <id>.json        # ... from a run.json saved from the web UI
 ```
 
-Share a run folder with your team as the evidence for a change. `runs verify` doesn't take
+Share a run folder with your team as the evidence for a change (or just its `run.json`:
+**Download** in the web UI's evidence run; without the patch files next to it, only
+signatures and outputs are checked). `runs verify` doesn't take
 the boss's word for anything. It recomputes the verdict from the evidence and checks that
 each record:
 
@@ -693,7 +701,8 @@ each record:
 - was produced during the run;
 - isn't reused by another step.
 
-It prints the signers' endpoint ids: check them against the keys you know for those people. The
+It prints who requested the run and the endpoint ids of the agents that signed its
+evidence: check them against the keys you know for those people. The
 web UI lists runs under **Evidence runs** and opens each report with a fresh signature check.
 
 Checks run your folder's code (tests, builds) with **your** rights and without the OS
@@ -836,6 +845,17 @@ the repository's default branch with the profile's account. In the web UI the **
 card does the same: **Sign in to GitHub** (pick a GitHub CLI account), **Link repo**
 (with checks, and which peers to share it with), **Sync**, and **Open PR** on each task
 branch. Digital workers use their owner's GitHub account.
+
+**Pull requests carry their proof.** When an agent's runtime commits a task's work, it
+keeps the evidence record it signed for the commit with the commit itself, as a git note
+(`refs/notes/proofkin`; `git notes --ref=proofkin show <branch>`). Opening a pull request
+from that branch checks the record (its signature, and that it is for the branch's
+head commit) and ends the description with a **Proof** section: which agent made the
+commit and for whom, its key, and the checks its runtime ran on the change with their
+results (never their commands). If your profile has the evidence run that holds the
+record (a plan or task you ran), its verdict and claims are added. The web UI's pull
+request form shows the proof before you open it (**Add the proof**, on by default);
+`repo pr ... --no-proof` leaves it out. Notes stay in your clone: they aren't pushed.
 
 **Knowledge base.** Each profile has a private knowledge base of Markdown topics.
 
@@ -1133,13 +1153,18 @@ proofkin --name me --providers copilot --serve --ui
   stopped on its own, and delete them (they leave your allowlist and squads).
 - **Your ticket** with a copy button, plus this agent's profile, network, providers, accounts,
   access level and workspace.
-- **Activity feed**: chat with all connected peers, joins and leaves, refused connections,
-  tasks peers delegate to you.
+- **Activity feed**: chat with all connected peers, joins and leaves, refused connections
+  (with **Allowlist…** for a teammate who allowlisted you first: their endpoint id is
+  filled in; only add people you know), tasks peers delegate to you.
 - **Run task**: pick a provider and where to run it (*This agent*, a named peer, or *Any peer*
   when several serve it), and the peer's folder. If that folder offers MCP servers, tick
-  the ones the task may use (each shows what its owner says it is for).
+  the ones the task may use (each shows what its owner says it is for). Where you have
+  full access to the folder, tick the checks its runtime runs after the model
+  (**Verify with**, and how many attempts it gets while they fail): the task is proven
+  only if they pass, and it is kept under **Evidence runs**.
   The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
-  results and errors, and has a **Cancel** button on running tasks.
+  results and errors, has a **Cancel** button on running tasks, and links each plan step,
+  and each task kept as evidence, to its **Evidence run**.
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
   Ctrl+Enter runs it), or press **Open editor** for a full-size editor with two views of
   the same plan:
@@ -1178,15 +1203,21 @@ proofkin --name me --providers copilot --serve --ui
   Digital workers show their owner and role in the peer list.
 - **Waiting for your approval**: approval requests from plans (yours or teammates'), with
   what you're approving and Approve / Reject (a rejection needs a reason).
-- **Evidence runs**: every plan run with its verdict. Open one to read its report (claims,
-  checks, commits, signatures) and a fresh signature check. Results that carry valid
-  signed evidence show **Signed ✓**.
+- **Evidence runs**: every plan run, and every task kept as evidence, with what it was
+  about and its verdict. Open one to read its report (claims, checks, commits, signatures)
+  and a fresh signature check, or **Download** its `run.json` for anyone to verify
+  (`proofkin runs verify --file`). Results that carry valid signed evidence show
+  **Signed ✓**.
 - **Peer task log** (agents with `--serve`): the [audit log](#audit-log), updated live.
+- **Get started**: a new agent (nobody on its allowlist yet) shows its first steps in
+  place of the empty conversation: share your ticket, add a teammate's, or create a
+  digital worker.
+- Times show their day when it isn't today ("Yesterday, 9:25 PM", "Nov 18, 9:25 PM").
 - **Light, dark or System** theme (follows the OS live; the choice is remembered). Keyboard
   accessible, screen-reader labelled, WCAG AA contrast in both themes, works on phone-sized
   windows, honours reduced motion. From 1180 px wide down the page scrolls instead of
-  squeezing the composer. Anything that deletes or withdraws something asks first, in the
-  page, saying what stays.
+  squeezing the composer, while the conversation and its composer stay in view. Anything
+  that deletes or withdraws something asks first, in the page, saying what stays.
 
 The UI follows the written [UX design guidelines](docs/ux-guidelines.md) (principles,
 layout, tokens, components, states, forms, microcopy, accessibility and a definition of
@@ -1332,7 +1363,8 @@ Always enforced, at every level and for local tasks too:
   instructions found inside it (prompt-injection *spotlighting*). The envelope can't be
   closed or reopened from inside: forged tags are escaped.
 - **Secrets are redacted before results leave the machine.** Results, failing check
-  output and check commands, error messages, knowledge topics and incident alerts are
+  output and check commands, error messages, knowledge topics, incident alerts and the
+  proof added to pull requests are
   scanned for known secret formats before they are sent or saved, and each match is
   replaced with `[REDACTED:<kind>]`, with a note saying how many. The formats: private keys
   (also PGP key blocks), GitHub, AWS (access and secret keys), Slack, OpenAI, Anthropic,
@@ -1544,6 +1576,7 @@ Workflow for a change:
 | `linker 'link.exe' not found` | MSVC toolchain without Build Tools: do Option B step 1, or switch with `rustup default stable-x86_64-pc-windows-gnu` and use Option A. |
 | `github-copilot-sdk` requires rustc 1.94 | `rustup update stable` |
 | `Copilot CLI not found` | Install the Copilot CLI and open a new terminal, or set `COPILOT_CLI_PATH`. |
+| `the Copilot CLI at ... speaks protocol v4, but this proofkin speaks v3` | The Copilot CLI updated itself past the protocol this proofkin's Copilot SDK speaks. If it kept an earlier version that matches, agents use that one by themselves (`proofkin doctor` says which). Otherwise set `COPILOT_CLI_PATH` to a Copilot CLI that matches (e.g. `npm install -g @github/copilot@<version>`), or update proofkin when a release supports the new protocol. |
 | `bridge script ... not found` / `Cannot find package '@anthropic-ai/claude-agent-sdk'` | Run `npm install` in `bridge\`, or pass `--bridge`. |
 | `npm install` fails with `ERR_SSL_..._HANDSHAKE_FAILURE` | Your network blocks the public npm registry. Use your internal feed, e.g. `npm install --registry <feed-url>`. |
 | `Not logged in · Please run /login` (claude) | Sign the agent's profile in: `proofkin auth login claude --profile <profile>`. |

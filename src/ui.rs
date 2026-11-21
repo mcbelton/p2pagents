@@ -50,6 +50,8 @@ const FEED_LIMIT: usize = 500;
 /// Most tasks kept for the page (and for other agents' lookups), besides running ones:
 /// the oldest finished ones go first, a plan's steps together once the plan has ended.
 const TASK_LIMIT: usize = 500;
+/// How long a refused key that keeps dialing goes unreported after it was reported.
+const REFUSED_AGAIN_AFTER: Duration = Duration::from_secs(600);
 
 /// What the UI shows about this agent besides live state.
 pub struct UiInfo {
@@ -97,6 +99,10 @@ struct TaskView {
     /// Started by another agent ("MCP" or "A2A"), not in this UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<&'static str>,
+    /// The evidence run that keeps what proves it: its plan's run, or, for a task on
+    /// its own, the run made of it when it asked for checks or its peer committed work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<String>,
 }
 
 impl TaskView {
@@ -409,6 +415,9 @@ pub async fn start(
 
     let pump = shared.clone();
     tokio::spawn(async move {
+        // When each key was last reported refused: one that keeps dialing (a teammate who
+        // allowlisted this agent first) is reported again only after a while.
+        let mut refused: HashMap<iroh::EndpointId, std::time::Instant> = HashMap::new();
         while let Some(event) = events.recv().await {
             match event {
                 Event::PeerConnected { name, .. } => {
@@ -419,13 +428,26 @@ pub async fn start(
                     pump.system("leave", format!("{name} disconnected"));
                     pump.broadcast_peers();
                 }
-                Event::PeerRejected { id } => pump.system(
-                    "warn",
-                    format!(
-                        "Refused a connection from {} (not on the allowlist)",
-                        id.fmt_short()
-                    ),
-                ),
+                Event::PeerRejected { id }
+                    if refused
+                        .get(&id)
+                        .is_some_and(|at| at.elapsed() < REFUSED_AGAIN_AFTER) => {}
+                Event::PeerRejected { id } => {
+                    if refused.len() >= 1024 {
+                        refused.retain(|_, at| at.elapsed() < REFUSED_AGAIN_AFTER);
+                    }
+                    refused.insert(id, std::time::Instant::now());
+                    pump.push_feed(json!({
+                        "kind": "system",
+                        "level": "warn",
+                        "text": format!(
+                            "Refused a connection from {} (not on the allowlist)",
+                            id.fmt_short()
+                        ),
+                        // So the page can offer to allowlist it (its endpoint id is enough).
+                        "peer": id.to_string(),
+                    }));
+                }
                 Event::Chat { from, text } => pump.push_feed(
                     json!({ "kind": "chat", "from": from, "text": text, "self": false }),
                 ),
@@ -494,6 +516,7 @@ pub async fn start(
         .route("/api/schedule-preview", post(preview_when))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
+        .route("/api/runs/{id}/file", get(run_file))
         .route("/api/previews", post(create_preview))
         .route("/api/approvals/{id}", post(answer_approval))
         .route("/api/ops", get(ops_state))
@@ -507,6 +530,7 @@ pub async fn start(
         .route("/api/repos/{name}", delete(unlink_repo))
         .route("/api/repos/{name}/sync", post(sync_repo))
         .route("/api/repos/{name}/pr", post(open_pr))
+        .route("/api/repos/{name}/proof", get(branch_proof))
         .route("/api/skills", get(list_skills).post(tools::add_skill))
         .route(
             "/api/skills/{name}",
@@ -880,6 +904,12 @@ struct TaskBody {
     /// For peers: MCP servers of that folder the model may use.
     #[serde(default)]
     mcp: Vec<String>,
+    /// For peers: the folder's checks their runtime runs after the model, as evidence.
+    #[serde(default)]
+    checks: Vec<String>,
+    /// Model attempts while the checks fail (default 1).
+    #[serde(default)]
+    attempts: Option<u32>,
 }
 
 async fn create_task(
@@ -903,6 +933,23 @@ fn start_task(
     let mut task = LlmTask::new(body.provider, prompt.clone());
     if body.target != "local" {
         task.mcp = body.mcp;
+    }
+    if !body.checks.is_empty() || body.attempts.is_some() {
+        if body.target == "local" {
+            return Err(bad_request(
+                "checks run on a peer's runtime: pick a peer to run the task on",
+            ));
+        }
+        if body
+            .attempts
+            .is_some_and(|n| !(1..=crate::evidence::MAX_ATTEMPTS).contains(&n))
+        {
+            return Err(bad_request(format!(
+                "attempts must be 1 to {}",
+                crate::evidence::MAX_ATTEMPTS
+            )));
+        }
+        task = task.with_checks(body.checks, body.attempts);
     }
     if let Some(share) = body
         .share
@@ -962,6 +1009,7 @@ fn start_task(
         preview: None,
         preview_label: None,
         via,
+        run: None,
     };
     s.add_task(view.clone());
     s.send(json!({ "type": "task", "task": view }));
@@ -969,29 +1017,37 @@ fn start_task(
     let shared = s.clone();
     let handle = tokio::spawn(async move {
         let mut evidence = None;
+        let mut run = None;
+        let started = crate::runs::unix_now();
         let result = match route {
             Route::Local(executor) => {
                 let ctx = TaskContext::new(shared.info.access, shared.info.workspace.clone());
                 executor.execute(&task, &ctx).await
             }
-            Route::Peer(peer, _) => match shared.agent.delegate_verified(peer, task).await {
-                Ok(d) => {
-                    if d.evidence.is_some() {
-                        evidence = Some(if d.verified { "verified" } else { "unverified" });
+            Route::Peer(peer, name) => {
+                match shared.agent.delegate_verified(peer, task.clone()).await {
+                    Ok(d) => {
+                        if d.evidence.is_some() {
+                            evidence = Some(if d.verified { "verified" } else { "unverified" });
+                        }
+                        if RunRecord::worth_keeping(&task, &d) {
+                            run = save_task_run(&shared, &name, &task, d.clone(), started);
+                        }
+                        if d.ok {
+                            Ok(d.output)
+                        } else {
+                            Err(anyhow::anyhow!("{}", d.output))
+                        }
                     }
-                    if d.ok {
-                        Ok(d.output)
-                    } else {
-                        Err(anyhow::anyhow!("{}", d.output))
-                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
         };
         shared.running.lock().unwrap().remove(&id);
         shared.update_task(id, |t| {
             t.finished_ms = Some(now_ms());
             t.evidence = evidence;
+            t.run = run;
             match result {
                 Ok(out) => {
                     t.status = "done";
@@ -1012,6 +1068,48 @@ fn start_task(
         }
     }
     Ok(view)
+}
+
+/// Saves a task delegated on its own as a one-step evidence run (see
+/// [`RunRecord::for_task`]); the run's id, if it was saved.
+fn save_task_run(
+    shared: &Shared,
+    peer: &str,
+    task: &LlmTask,
+    delivered: crate::agent::Delivered,
+    started: u64,
+) -> Option<String> {
+    let mut run = RunRecord::for_task(
+        shared.agent.name(),
+        &shared.agent.id().to_string(),
+        peer,
+        task,
+        delivered,
+        started,
+    );
+    run.peer_ids = crate::runs::peer_ids(&shared.agent);
+    match run.save(&shared.info.profile.runs_dir()) {
+        Ok(_) => {
+            let (level, text) = if run.claims.is_empty() {
+                ("info", format!("{peer}'s signed commit is saved"))
+            } else if run.passed() {
+                ("info", run.verdict_line())
+            } else {
+                ("warn", run.verdict_line())
+            };
+            shared.system(level, format!("Evidence run {}: {text}", run.id));
+            shared.send(json!({ "type": "runs" }));
+            shared.send(json!({ "type": "ops" }));
+            Some(run.id)
+        }
+        Err(e) => {
+            shared.system(
+                "warn",
+                format!("Could not save the task's evidence run: {e:#}"),
+            );
+            None
+        }
+    }
 }
 
 /// Cancels a running task, or the whole plan a step belongs to. Dropping a
@@ -1139,6 +1237,7 @@ fn start_plan(
             preview: None,
             preview_label: None,
             via,
+            run: None,
         };
         s.add_task(view.clone());
         s.send(json!({ "type": "task", "task": view }));
@@ -1226,6 +1325,11 @@ fn start_plan(
                 None
             }
         };
+        if let Some(run_id) = &saved_run {
+            for id in step_ids.values() {
+                shared.update_task(*id, |t| t.run = Some(run_id.clone()));
+            }
+        }
         let saved = crate::plan::save_knowledge(&kb, &plan, &states, &run.id);
         if !saved.is_empty() {
             shared.system("info", format!("Knowledge saved: {}", saved.join(", ")));
@@ -1246,7 +1350,14 @@ fn start_plan(
             }
         }
     }
-    s.system("task", format!("Plan started: {} steps", ids.len()));
+    s.system(
+        "task",
+        format!(
+            "Plan started: {} step{}",
+            ids.len(),
+            if ids.len() == 1 { "" } else { "s" }
+        ),
+    );
     Ok(StartedPlan {
         plan: plan_id,
         steps: ids,
@@ -1571,7 +1682,11 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         .into_iter()
         .filter(|e| e.ts_ms >= since * 1000)
         .collect();
-    let runs = RunRecord::list(&profile.runs_dir()).unwrap_or_default();
+    let runs: Vec<_> = RunRecord::list(&profile.runs_dir())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.started_unix >= since)
+        .collect();
     let recent: Vec<_> = incidents.iter().rev().take(30).cloned().collect();
     Ok(Json(json!({
         // Monitors with an open incident (one ongoing problem each).
@@ -1779,6 +1894,13 @@ struct PrBody {
     title: String,
     #[serde(default)]
     body: String,
+    /// Append the proof the branch's commit carries, if it has one (default: yes).
+    #[serde(default = "yes")]
+    proof: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 async fn open_pr(
@@ -1790,16 +1912,57 @@ async fn open_pr(
     if body.title.trim().is_empty() {
         return Err(bad_request("the pull request needs a title"));
     }
+    let mut text = body.body;
+    let mut proven = false;
+    if body.proof
+        && let Ok(Some(proof)) =
+            crate::github::branch_proof(&repo.path, &body.branch, &s.info.profile.runs_dir()).await
+    {
+        text += &proof.markdown;
+        proven = true;
+    }
     creds
         .push(&repo, &body.branch)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?;
     let url = creds
-        .create_pr(&repo, &body.branch, body.title.trim(), &body.body)
+        .create_pr(&repo, &body.branch, body.title.trim(), &text)
         .await
         .map_err(|e| bad_request(format!("{e:#}")))?;
-    s.system("info", format!("Opened pull request {url}"));
-    Ok(Json(json!({ "url": url })))
+    s.system(
+        "info",
+        format!(
+            "Opened pull request {url}{}",
+            if proven { " with its proof" } else { "" }
+        ),
+    );
+    Ok(Json(json!({ "url": url, "proof": proven })))
+}
+
+#[derive(Deserialize)]
+struct ProofQuery {
+    branch: String,
+}
+
+/// The proof a pull request from task branch `branch` would carry (see
+/// [`crate::github::branch_proof`]), for the pull request form.
+async fn branch_proof(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ProofQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (repo, _) = linked(&s, &name)?;
+    let runs = s.info.profile.runs_dir();
+    Ok(Json(
+        match crate::github::branch_proof(&repo.path, &q.branch, &runs).await {
+            Ok(Some(proof)) => json!({ "proof": proof }),
+            Ok(None) => json!({
+                "proof": null,
+                "reason": "Its commit has no signed record (not made by a task of this version).",
+            }),
+            Err(e) => json!({ "proof": null, "reason": format!("{e:#}") }),
+        },
+    ))
 }
 
 async fn list_skills(State(s): State<AppState>) -> Json<Value> {
@@ -1934,6 +2097,33 @@ async fn get_run(
             Json(json!({ "error": format!("{e:#}") })),
         )
     })
+}
+
+/// Saved run `id`'s run.json as it is, to download: anyone can re-check its
+/// signatures with `proofkin runs verify --file`.
+async fn run_file(State(s): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+    let missing = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("there is no run {id}") })),
+        )
+    };
+    crate::profile::validate_name(&id).map_err(|_| missing())?;
+    let path = s.info.profile.runs_dir().join(&id).join("run.json");
+    let bytes = tokio::fs::read(&path).await.map_err(|_| missing())?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{id}.json\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Saved run `id`: its summary, verdict, Markdown report, re-checked signatures and
@@ -2150,6 +2340,7 @@ mod tests {
             preview: None,
             preview_label: None,
             via: None,
+            run: None,
         }
     }
 

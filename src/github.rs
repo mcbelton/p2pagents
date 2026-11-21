@@ -407,6 +407,139 @@ pub fn default_host() -> &'static str {
     DEFAULT_GITHUB_HOST
 }
 
+/// What a pull request from a task's branch carries as proof (see [`branch_proof`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Proof {
+    /// In a line, for the web UI: who signed it and how its checks went.
+    pub summary: String,
+    /// The section appended to the pull request's description.
+    pub markdown: String,
+}
+
+/// The proof for a pull request from task branch `branch` of the clone at `repo`:
+/// the record the agent that made its head commit signed for it (kept as a git note
+/// on the commit, see [`crate::worktree::NOTES_REF`]), checked here, with the claims
+/// of this profile's evidence run that has the record (in `runs_dir`), if any. None
+/// if the head commit has no record (a task of an older version, or someone else's).
+pub async fn branch_proof(repo: &Path, branch: &str, runs_dir: &Path) -> Result<Option<Proof>> {
+    use crate::evidence::Evidence;
+    if !branch.starts_with("p2p/") {
+        bail!("only branches agents' tasks made (p2p/...) carry proof");
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}^{{commit}}"))
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running git")?;
+    if !out.status.success() {
+        bail!("there is no branch {branch}");
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let Some(note) = crate::worktree::read_note(repo, &head).await? else {
+        return Ok(None);
+    };
+    let evidence: Evidence =
+        serde_json::from_str(&note).context("reading the commit's signed record")?;
+    evidence
+        .verify_record()
+        .context("the commit's signed record doesn't verify")?;
+    let git = evidence
+        .git
+        .as_ref()
+        .filter(|g| g.commit.as_deref() == Some(head.as_str()))
+        .with_context(|| format!("the signed record is for another commit than {branch}'s"))?;
+    let run = crate::runs::RunRecord::with_evidence(runs_dir, &evidence.signature);
+    let checks = if evidence.checks.is_empty() {
+        "no checks ran".to_owned()
+    } else {
+        evidence
+            .checks
+            .iter()
+            .map(|c| format!("{} {}", if c.passed { "✓" } else { "✗" }, c.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Ok(Some(Proof {
+        summary: format!(
+            "Signed by {}: {checks}{}",
+            evidence.signer,
+            run.as_ref()
+                .map(|r| format!("; evidence run {}: {}", r.id, r.verdict_line()))
+                .unwrap_or_default()
+        ),
+        markdown: crate::redact::redact(&proof_markdown(&evidence, git, run.as_ref())).0,
+    }))
+}
+
+/// The pull request section for commit record `e` and the evidence run that has it.
+fn proof_markdown(
+    e: &crate::evidence::Evidence,
+    git: &crate::evidence::GitCommit,
+    run: Option<&crate::runs::RunRecord>,
+) -> String {
+    let code = |text: &str| text.replace('`', "'");
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let commit = git.commit.as_deref().unwrap_or_default();
+    let mut md = format!(
+        "\n\n---\n\n### Proof\n\nCommit `{}` ({} file{}) was made by the agent **{}**{} for agent `{}`, \
+         and signed with its key `{}`.\n\n",
+        commit.chars().take(12).collect::<String>(),
+        git.files.len(),
+        plural(git.files.len()),
+        code(&e.signer),
+        e.provider.map(|p| format!(" ({p})")).unwrap_or_default(),
+        e.requester_id.chars().take(10).collect::<String>(),
+        e.signer_id
+    );
+    if e.checks.is_empty() {
+        md += "No checks ran after the model: the change rests on the model's word and your review.\n";
+    } else {
+        md += &format!(
+            "Checks its runtime ran on the change after the model finished ({} attempt{}):\n\n",
+            e.attempts,
+            plural(e.attempts as usize)
+        );
+        for c in &e.checks {
+            md += &format!(
+                "- {} `{}`: {} in {:.1}s\n",
+                if c.passed { "✅" } else { "❌" },
+                code(&c.name),
+                c.exit_code
+                    .map(|code| format!("exit {code}"))
+                    .unwrap_or_else(|| "no exit code".into()),
+                c.millis as f64 / 1000.0
+            );
+        }
+    }
+    if let Some(run) = run {
+        md += &format!(
+            "\nEvidence run `{}` of {}: **{}**\n",
+            run.id,
+            code(&run.boss),
+            run.verdict_line()
+        );
+        let results = run.claim_results();
+        if !results.is_empty() {
+            md += "\n| Claim | Statement | Verdict |\n| --- | --- | --- |\n";
+            for r in &results {
+                md += &format!(
+                    "| {} | {} | {} |\n",
+                    r.claim.id,
+                    r.claim.text.replace('|', "\\|").replace(['\r', '\n'], " "),
+                    r.verdict.label()
+                );
+            }
+        }
+    }
+    md += "\n<sub>Proofkin checked the record's Ed25519 signature before attaching it. The record is the git note \
+           `refs/notes/proofkin` on the commit.</sub>\n";
+    md
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

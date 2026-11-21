@@ -652,7 +652,7 @@ impl StepState {
 
     /// The step's state from what `peer` sent back. Evidence that isn't signed by
     /// `peer`, or missing evidence for requested checks, fails the step.
-    fn from_delivered(peer: String, step: &Step, d: Delivered) -> Self {
+    pub(crate) fn from_delivered(peer: String, step: &Step, d: Delivered) -> Self {
         let problem = match &d.evidence {
             Some(_) if !d.verified => Some(format!("the evidence isn't validly signed by {peer}")),
             None if !step.checks.is_empty() || step.approve => {
@@ -865,14 +865,15 @@ fn unable(step: &Step, peer: &PeerInfo) -> Option<String> {
         .collect();
     if !missing.is_empty() {
         return Some(format!(
-            "folder '{folder}' on {} has no check {} (it has: {}); its owner adds checks with share add --check NAME=COMMAND",
+            "folder '{folder}' on {} has no check {} (it has: {}); its owner adds checks with share add --check NAME=COMMAND{}",
             peer.name,
             missing.join(", "),
             if share.checks.is_empty() {
                 "none".into()
             } else {
                 share.checks.join(", ")
-            }
+            },
+            crate::spec::group_hint(&missing)
         ));
     }
     if step.checks.iter().any(|c| !crate::spec::is_built_in(c)) && share.access < Access::Full {
@@ -1821,6 +1822,14 @@ mod tests {
             check(spec_on_bob).iter().all(|p| !p.starts_with("E ")),
             "built-in checks need no owner check or full access: {:?}",
             check(spec_on_bob)
+        );
+        // A group's name where its checks are meant says what they are called.
+        let group = check("s @alice:app verify=spec Check the spec");
+        assert!(
+            group[0].ends_with(
+                "; the built-in spec checks are spec:spec, spec:api, spec:ux, spec:trace (verify=spec:spec,spec:api,spec:ux,spec:trace)"
+            ),
+            "{group:?}"
         );
 
         let bad = check(

@@ -123,11 +123,17 @@ pub async fn doctor(bridge: &Path) -> Result<bool> {
     let mut ready = true;
 
     ready &= match find_copilot_cli() {
-        Ok(cli) => report(
-            true,
-            "copilot CLI",
-            tool_version(&cli, "--version").unwrap_or_else(|| cli.display().to_string()),
-        ),
+        Ok(cli) => {
+            let version =
+                tool_version(&cli, "--version").unwrap_or_else(|| cli.display().to_string());
+            let version = version.trim_end_matches('.');
+            // It updates itself: a version ahead of this build's protocol can't be used.
+            match crate::llm::copilot::check_cli().await {
+                Ok((_, None)) => report(true, "copilot CLI", version),
+                Ok((_, Some(note))) => report(true, "copilot CLI", format!("{version}: {note}")),
+                Err(e) => report(false, "copilot CLI", format!("{version}: {e:#}")),
+            }
+        }
         Err(_) => report(
             false,
             "copilot CLI",
@@ -190,7 +196,7 @@ pub async fn doctor(bridge: &Path) -> Result<bool> {
         crate::profile::SecretStore::current().describe()
     );
     if profiles.is_empty() {
-        println!("  no profiles yet");
+        println!("  no profiles yet; start your agent with: proofkin --name <you> --ui");
     }
     for name in profiles {
         let profile = Profile::open(&name)?;

@@ -109,7 +109,6 @@ pub struct CopilotBackend {
 
 impl CopilotBackend {
     pub async fn start(creds: CopilotCredentials) -> Result<Self> {
-        let cli = find_copilot_cli()?;
         let mut env = vec![("COPILOT_HOME".to_owned(), creds.home.into_os_string())];
         if creds.host != DEFAULT_GITHUB_HOST {
             env.push(("COPILOT_GH_HOST".to_owned(), creds.host.clone().into()));
@@ -119,15 +118,18 @@ impl CopilotBackend {
             .copied()
             .filter(|var| !env.iter().any(|(set, _)| set == var))
             .collect();
-        let options = ClientOptions::default()
-            .with_program(cli.clone())
-            .with_env_remove(remove)
-            .with_env(env)
-            .with_github_token(creds.token.clone())
-            .with_use_logged_in_user(false);
-        let client = Client::start(options)
-            .await
-            .with_context(|| format!("starting Copilot CLI {}", cli.display()))?;
+        let (client, _, note) = start_client(|program| {
+            ClientOptions::default()
+                .with_program(program.to_path_buf())
+                .with_env_remove(remove.clone())
+                .with_env(env.clone())
+                .with_github_token(creds.token.clone())
+                .with_use_logged_in_user(false)
+        })
+        .await?;
+        if let Some(note) = note {
+            eprintln!("  copilot: {note}");
+        }
         let login = github_login(&creds.token, &creds.host);
         let sandbox = match client.rpc().sandbox().get_host_support().await {
             Ok(support) if support.supported => SandboxSupport::Supported {
@@ -281,6 +283,171 @@ pub fn find_copilot_cli() -> Result<PathBuf> {
         .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
         .find(|p| p.is_file())
         .ok_or_else(|| anyhow!("Copilot CLI not found; install it or set COPILOT_CLI_PATH"))
+}
+
+/// Why the Copilot CLI at `cli` didn't start, and what to do. The CLI updates itself,
+/// so it can get ahead of the protocol this build's SDK speaks; then nothing works
+/// until a matching CLI is used.
+fn start_error(cli: &Path, e: github_copilot_sdk::Error) -> anyhow::Error {
+    match mismatch(&e) {
+        Some((server, min, max)) => anyhow!(
+            "the Copilot CLI at {} speaks protocol v{server}, but this proofkin speaks {}: \
+             set COPILOT_CLI_PATH to a Copilot CLI that speaks it (e.g. one installed with \
+             npm install -g @github/copilot@<version>), or update proofkin",
+            cli.display(),
+            supported(min, max)
+        ),
+        None => anyhow::Error::new(e).context(format!("starting Copilot CLI {}", cli.display())),
+    }
+}
+
+/// The CLI's protocol version and the range this build speaks, if that's why it failed.
+fn mismatch(e: &github_copilot_sdk::Error) -> Option<(u32, u32, u32)> {
+    use github_copilot_sdk::{ErrorKind, ProtocolErrorKind};
+    match e.kind() {
+        ErrorKind::Protocol(ProtocolErrorKind::VersionMismatch { server, min, max }) => {
+            Some((*server, *min, *max))
+        }
+        _ => None,
+    }
+}
+
+fn supported(min: u32, max: u32) -> String {
+    if min == max {
+        format!("v{min}")
+    } else {
+        format!("v{min} to v{max}")
+    }
+}
+
+/// Starts a client of the Copilot CLI, with `options` for the CLI program used. When
+/// the CLI found ([`find_copilot_cli`]) speaks a newer protocol than this build (it
+/// updates itself) and `COPILOT_CLI_PATH` doesn't name one, the newest earlier version
+/// it keeps in its package cache that speaks this build's protocol is used, with a note
+/// saying so.
+async fn start_client(
+    options: impl Fn(&Path) -> ClientOptions,
+) -> Result<(Client, PathBuf, Option<String>)> {
+    let cli = find_copilot_cli()?;
+    let error = match Client::start(options(&cli)).await {
+        Ok(client) => return Ok((client, cli, None)),
+        Err(e) => e,
+    };
+    if let Some((server, min, max)) = mismatch(&error)
+        && std::env::var_os("COPILOT_CLI_PATH").is_none()
+    {
+        for runtime in cached_runtimes() {
+            if let Ok(client) = Client::start(options(&runtime)).await {
+                let note = format!(
+                    "the Copilot CLI at {} speaks protocol v{server} and this proofkin {}, so it uses \
+                     the earlier version the CLI keeps at {} (set COPILOT_CLI_PATH to choose one)",
+                    cli.display(),
+                    supported(min, max),
+                    runtime.display()
+                );
+                return Ok((client, runtime, Some(note)));
+            }
+        }
+    }
+    Err(start_error(&cli, error))
+}
+
+/// The `copilot-runtime` of each version the Copilot CLI keeps in its package cache
+/// (it updates itself and keeps earlier versions a while), newest first.
+fn cached_runtimes() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("copilot").join("pkg"));
+    }
+    if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".copilot").join("pkg"));
+        roots.push(
+            home.join(".local")
+                .join("share")
+                .join("copilot")
+                .join("pkg"),
+        );
+        roots.push(
+            home.join("Library")
+                .join("Caches")
+                .join("copilot")
+                .join("pkg"),
+        );
+    }
+    runtimes_in(&roots)
+}
+
+/// [`cached_runtimes`] under the package caches `roots` (`<root>/<platform>/<version>/
+/// prebuilds/<platform>/copilot-runtime`).
+fn runtimes_in(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let exe = if cfg!(windows) {
+        "copilot-runtime.exe"
+    } else {
+        "copilot-runtime"
+    };
+    let entries = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    let mut found = Vec::new();
+    for root in roots {
+        for platform in entries(root) {
+            for version in entries(&platform.path()) {
+                let runtime = version
+                    .path()
+                    .join("prebuilds")
+                    .join(platform.file_name())
+                    .join(exe);
+                if runtime.is_file() {
+                    found.push((version_key(&version.file_name().to_string_lossy()), runtime));
+                }
+            }
+        }
+    }
+    // Newest first; a release before the pre-releases of its version.
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, runtime)| runtime).collect()
+}
+
+/// How package versions like `1.0.112` and `1.0.102-0.unstable.r4.g5a1` sort: by their
+/// numbers, then releases after the pre-releases of the same numbers.
+fn version_key(version: &str) -> (Vec<u64>, bool) {
+    let (numbers, release) = match version.split_once('-') {
+        Some((numbers, _)) => (numbers, false),
+        None => (version, true),
+    };
+    (
+        numbers.split('.').map(|n| n.parse().unwrap_or(0)).collect(),
+        release,
+    )
+}
+
+/// Starts the Copilot CLI (signed in as nobody, in a throwaway home) to check that it,
+/// or an earlier version it keeps, speaks this build's protocol: the program agents
+/// use, and why it isn't the one found, if it isn't.
+pub async fn check_cli() -> Result<(PathBuf, Option<String>)> {
+    let home = std::env::temp_dir().join(format!("proofkin-cli-check-{}", std::process::id()));
+    std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+    let started = start_client(|program| {
+        ClientOptions::default()
+            .with_program(program.to_path_buf())
+            .with_env_remove(INHERITED_CREDENTIAL_VARS.to_vec())
+            .with_env(vec![(
+                "COPILOT_HOME".to_owned(),
+                home.clone().into_os_string(),
+            )])
+            .with_use_logged_in_user(false)
+    })
+    .await;
+    if let Ok((client, ..)) = &started {
+        let _ = client.stop().await;
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    started.map(|(_, program, note)| (program, note))
 }
 
 /// Puts the results of the task's MCP tools in the external-content envelope (see
@@ -599,6 +766,54 @@ mod tests {
                 assert!(!available_tools(access).contains(&tool));
             }
         }
+    }
+
+    #[test]
+    fn earlier_cli_versions_kept_after_an_update_are_found_newest_first() {
+        let cache = tempfile::tempdir().unwrap();
+        let exe = if cfg!(windows) {
+            "copilot-runtime.exe"
+        } else {
+            "copilot-runtime"
+        };
+        let runtime = |platform: &str, version: &str| {
+            cache
+                .path()
+                .join(platform)
+                .join(version)
+                .join("prebuilds")
+                .join(platform)
+                .join(exe)
+        };
+        let versions = [
+            "1.0.99-2",
+            "1.0.112",
+            "1.0.102-0.unstable.r4.g5a1",
+            "1.0.114",
+            "1.0.102",
+        ];
+        for v in versions {
+            let path = runtime("win32-arm64", v);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+        }
+        // Being extracted (no runtime yet), or another platform's runtime folder: skipped.
+        std::fs::create_dir_all(cache.path().join("win32-arm64/1.0.120")).unwrap();
+        let x64 = cache.path().join("win32-x64/1.0.90/prebuilds/win32-arm64");
+        std::fs::create_dir_all(&x64).unwrap();
+        std::fs::write(x64.join(exe), "").unwrap();
+        let found = runtimes_in(&[cache.path().to_owned(), cache.path().join("missing")]);
+        let expected: Vec<PathBuf> = [
+            "1.0.114",
+            "1.0.112",
+            "1.0.102",
+            "1.0.102-0.unstable.r4.g5a1",
+            "1.0.99-2",
+        ]
+        .into_iter()
+        .map(|v| runtime("win32-arm64", v))
+        .collect();
+        assert_eq!(found, expected);
     }
 
     #[test]

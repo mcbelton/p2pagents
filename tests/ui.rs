@@ -201,6 +201,47 @@ async fn delegate_only_agents_allowlist_chat_peers_from_the_ui() {
     let host = format!("127.0.0.1:{port}");
     let peer = SecretKey::generate().public();
 
+    // A peer that isn't on the allowlist is refused, and the page learns its endpoint
+    // id, to offer to allowlist it (a teammate who allowlisted this agent first).
+    let mut stranger = AgentConfig::new("stranger", SecretKey::generate());
+    stranger.network = Network::Local;
+    stranger.bind = Some("127.0.0.1:0".parse().unwrap());
+    // It allowlisted this agent (it only dials keys it allowlisted); not the other way.
+    stranger.trust.allow(TrustedPeer {
+        name: "boss".into(),
+        id: agent.id(),
+        addrs: Default::default(),
+        can_delegate: false,
+        tasks_per_hour: 0,
+        access: Access::ReadOnly,
+        shares: Vec::new(),
+    });
+    let (stranger, _stranger_events) = Agent::bind(stranger).await.unwrap();
+    let _ = stranger.connect(agent.addr()).await;
+    let refused = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            let item = state["feed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["peer"].is_string())
+                .cloned();
+            if let Some(item) = item {
+                return item;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the refused connection is reported");
+    assert_eq!(refused["peer"], stranger.id().to_string());
+    assert_eq!(refused["level"], "warn");
+    assert!(agent.peers().is_empty());
+    stranger.shutdown().await;
+
     let chat = format!(r#"{{"ticket":"{peer}","name":"pal"}}"#);
     let added = request(port, "POST", "/api/trust", &host, Some(token), Some(&chat)).await;
     assert_eq!(added.status, 200, "{}", added.body);
@@ -630,6 +671,88 @@ async fn ui_runs_plans_and_shows_squads() {
     .json();
     assert_eq!(deleted["schedules"], serde_json::json!([]));
 
+    // A task on its own that asks for checks is kept as a one-step evidence run: its
+    // card links to it, and it downloads as the run.json anyone can verify.
+    proofkin::spec::init(&home.path().join("data"), "Demo", true).unwrap();
+    let worker_id = worker.id().to_string();
+    let task = |target: &str, attempts: u32| {
+        serde_json::json!({
+            "provider": "copilot", "target": target, "prompt": "check the spec",
+            "checks": ["spec:spec"], "attempts": attempts,
+        })
+        .to_string()
+    };
+    let local = post("/api/tasks", task("local", 1)).await;
+    assert!(local.body.contains("peer's runtime"), "{}", local.body);
+    assert_eq!(post("/api/tasks", task(&worker_id, 9)).await.status, 400);
+    let started = post("/api/tasks", task(&worker_id, 2)).await;
+    assert_eq!(started.status, 200, "{}", started.body);
+    let id = started.json()["id"].clone();
+    let done = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = request(port, "GET", "/api/state", &host, Some(token), None)
+                .await
+                .json();
+            let task = state["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id && t["run"].is_string())
+                .cloned();
+            if let Some(task) = task {
+                return (task, state);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the task's run was saved");
+    let (done, state) = done;
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(done["evidence"], "verified");
+    assert!(
+        state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["step"].is_string())
+            .all(|t| t["run"].is_string()),
+        "plan steps link to their run too"
+    );
+    let run_id = done["run"].as_str().unwrap().to_owned();
+    let run = runs()
+        .await
+        .into_iter()
+        .find(|r| r["id"] == run_id.as_str())
+        .unwrap();
+    assert_eq!(run["passed"], true, "{run}");
+    assert_eq!(run["title"], "spec:spec passes after: check the spec");
+    let path = format!("/api/runs/{run_id}/file");
+    assert_eq!(
+        request(port, "GET", &path, &host, None, None).await.status,
+        401
+    );
+    let file = request(port, "GET", &path, &host, Some(token), None).await;
+    assert_eq!(file.status, 200);
+    assert!(
+        file.headers.contains(&format!(
+            "content-disposition: attachment; filename=\"{run_id}.json\""
+        )),
+        "{}",
+        file.headers
+    );
+    let saved =
+        std::fs::read_to_string(home.path().join("boss/runs").join(&run_id).join("run.json"))
+            .unwrap();
+    assert_eq!(file.body, saved, "as saved, so its signatures still verify");
+    let traversal = "/api/runs/..%2Fboss/file";
+    assert_eq!(
+        request(port, "GET", traversal, &host, Some(token), None)
+            .await
+            .status,
+        404
+    );
+
     let removed = request(port, "DELETE", "/api/squads/qa", &host, Some(token), None).await;
     assert_eq!(removed.status, 200);
     boss.shutdown().await;
@@ -708,6 +831,20 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         .knowledge()
         .write("architecture", "Two services.", "test")
         .unwrap();
+    // Like the rest of the card, evidence runs count for the last 24 hours only.
+    let plan = proofkin::plan::Plan::parse("a @x Do it").unwrap();
+    for (id, started) in [("old-run", now - 3 * 86_400), ("new-run", now - 60)] {
+        let mut run = proofkin::runs::RunRecord::new(
+            "solo",
+            "id",
+            "a @x Do it",
+            &plan,
+            &Default::default(),
+            started,
+        );
+        run.id = id.into();
+        run.save(&profile.runs_dir()).unwrap();
+    }
 
     let mut config = AgentConfig::new("solo", SecretKey::generate());
     config.network = Network::Local;
@@ -762,6 +899,11 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
         "folder 'app' has no check 'ping' any more"
     );
     assert_eq!(ops["incidents"][0]["kind"], "opened");
+    assert_eq!(
+        ops["runs"]["total"], 1,
+        "only the last 24 hours' runs: {}",
+        ops["runs"]
+    );
     assert_eq!(ops["knowledge"][0]["name"], "architecture");
     let topic = get("/api/kb/architecture").await.json();
     assert!(topic["text"].as_str().unwrap().contains("Two services."));
@@ -1663,6 +1805,10 @@ async fn the_page_follows_the_ux_guidelines() {
         "worker-dialog",
         "connect",
         "connect-toggle",
+        "check-options",
+        "attempts",
+        "run-download",
+        "pr-proof",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }
@@ -1689,6 +1835,10 @@ async fn the_page_follows_the_ux_guidelines() {
             &d[1]
         );
     }
+    // One name, one meaning: the page's scripts share one scope, where a second
+    // declaration of a function silently replaces the first.
+    let declared = regex::Regex::new(r"(?m)^(?:async )?function (\w+)\(").unwrap();
+    let mut declarations = std::collections::HashMap::new();
     for script in [
         "/app.js",
         "/tools.js",
@@ -1711,12 +1861,46 @@ async fn the_page_follows_the_ux_guidelines() {
             !html.is_match(&js.body),
             "{script} builds HTML from strings"
         );
+        for name in declared.captures_iter(&js.body).map(|c| c[1].to_owned()) {
+            if let Some(first) = declarations.insert(name.clone(), script) {
+                panic!("{name} is declared in {first} and again in {script}");
+            }
+        }
     }
     let guide = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/ux-guidelines.md"),
     )
     .unwrap();
     assert!(guide.contains("## Definition of done"));
+    // Below 1180 px the conversation keeps the window's height and stays in view, so
+    // its composer never scrolls off; empty states read as sentences.
+    let css = request(port, "GET", "/app.css", &host, None, None)
+        .await
+        .body;
+    let narrow = css
+        .split("@media (max-width: 1180px)")
+        .nth(1)
+        .and_then(|rest| rest.split("@media").next())
+        .unwrap();
+    assert!(
+        narrow.contains(".main { position: sticky;") && narrow.contains("height: calc(100vh"),
+        "{narrow}"
+    );
+    assert!(css.contains(".list li.empty { display: block; }"));
+    // Times show their day unless it's today (lists span days); counts agree.
+    let stamp = app
+        .split("function stamp(ms) {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("app.js formats times with stamp()");
+    assert_eq!(
+        app.matches("clock(").count(),
+        1 + stamp.matches("clock(").count(),
+        "only stamp() shows a time on its own (it adds the day when it isn't today)"
+    );
+    assert!(!app.contains("length} steps`"), "\"1 steps\"");
+    // A new agent shows its first steps in place of the empty conversation.
+    assert!(app.contains("function getStartedNode()"));
     agent.shutdown().await;
 }
 

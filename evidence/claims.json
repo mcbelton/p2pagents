@@ -192,7 +192,7 @@
     {
       "id": "UI-2",
       "area": "web ui",
-      "claim": "Any agent, including a boss that only delegates, can allowlist peers from the web UI; folder grants are checked only for peers that may delegate.",
+      "claim": "Any agent, including a boss that only delegates, can allowlist peers from the web UI; folder grants are checked only for peers that may delegate. A refused connection shows in the activity feed with the peer's endpoint id, so the page offers to allowlist it (a teammate who allowlisted this agent first), and a new agent with nobody on its allowlist shows its first steps there.",
       "tests": ["ui::delegate_only_agents_allowlist_chat_peers_from_the_ui"]
     },
     {
@@ -421,7 +421,7 @@
     {
       "id": "OPS-3",
       "area": "web ui",
-      "claim": "The web UI shows health (monitors against SLOs, open incidents counted once per monitor however often they were opened, monitors that can't run with how to fix them, the incident log, task statistics), the knowledge base with its TSGs, and fills in playbooks into the plan editor.",
+      "claim": "The web UI shows health (monitors against SLOs, open incidents counted once per monitor however often they were opened, monitors that can't run with how to fix them, the incident log, the last 24 hours' task statistics and evidence runs), the knowledge base with its TSGs, and fills in playbooks into the plan editor.",
       "tests": ["ui::ui_shows_health_knowledge_and_fills_in_playbooks"]
     },
     {
@@ -739,7 +739,7 @@
     {
       "id": "UX-1",
       "area": "ui",
-      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size, with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills, agents and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; a plan builder edits the same plan as forms (claims, then a card per task or sign-off) that can't express the usual mistakes: tasks prove claims only with a check, no step can wait for one that waits for it, renames and removals carry through, what a field still needs is said on it, and Run goes to the first; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme.",
+      "claim": "The web UI follows written UX guidelines (docs/ux-guidelines.md): the plan box and its main button stay usable at every window size (below 1180 px the conversation keeps the window's height and stays in view while the page scrolls), with a full-size plan editor whose palette adds peers, folders, squads, checks, MCP servers, skills, agents and knowledge to the step at the cursor in the place the plan syntax expects (repeated skills add up) or starts a new step with them, never pasting raw text; the plan check's fixes are buttons that change the plan; a plan builder edits the same plan as forms (claims, then a card per task or sign-off) that can't express the usual mistakes: tasks prove claims only with a check, no step can wait for one that waits for it, renames and removals carry through, what a field still needs is said on it, and Run goes to the first; playbooks are picked from cards that say what each does, proves and needs, not from a dropdown; every dialog closes with Escape; destructive actions ask in the page; secrets never reach the page; the theme color follows the theme; times show their day unless it is today, and counts agree; a new agent shows its first steps (share the ticket, add a teammate's, or create a digital worker).",
       "tests": [
         "ui::the_page_follows_the_ux_guidelines",
         "ui::the_plan_editor_keeps_plans_valid",
@@ -755,6 +755,12 @@
         "bridge::multiplexes_concurrent_requests",
         "bridge::surfaces_provider_errors_and_bridge_exit"
       ]
+    },
+    {
+      "id": "COP-1",
+      "area": "providers",
+      "claim": "A Copilot CLI that updated itself past the protocol this build's Copilot SDK speaks doesn't take Copilot down: agents use the newest earlier version the CLI keeps in its package cache that speaks it, and say so; with none (or when COPILOT_CLI_PATH names the CLI), the error says which protocols differ and how to fix it, and doctor checks the protocol rather than trusting the version.",
+      "tests": ["lib::llm::copilot::earlier_cli_versions_kept_after_an_update_are_found_newest_first"]
     },
     {
       "id": "CLI-1",
@@ -812,6 +818,35 @@
       "live": [
         "an A2A agent's task ran on a peer with real Copilot"
       ]
+    },
+    {
+      "id": "EDD-7",
+      "area": "evidence",
+      "claim": "A task run on its own (outside a plan) proves its work like a plan step: the web UI's Run task asks for the folder's checks (offered only where the user has full access, with attempts while they fail), and a task that asked for checks or got a commit back is kept as a one-step evidence run that claims its checks pass (T-1), titled with what it was about; its card, and every plan step's, links to its run. Checks are refused for this agent's own tasks, which no peer's runtime checks.",
+      "tests": [
+        "lib::runs::tasks_on_their_own_keep_what_proves_them_as_one_step_runs",
+        "ui::ui_runs_plans_and_shows_squads"
+      ]
+    },
+    {
+      "id": "EDD-8",
+      "area": "evidence",
+      "claim": "Anyone can verify a run without trusting the agent that ran it: the web UI downloads its run.json exactly as saved (nothing outside the runs folder), proofkin runs verify --file re-checks one from anywhere under any name (signatures and outputs; patches need the run folder), and verification names who requested the run and only the keys that signed its evidence.",
+      "tests": [
+        "lib::runs::tasks_on_their_own_keep_what_proves_them_as_one_step_runs",
+        "ui::ui_runs_plans_and_shows_squads"
+      ],
+      "live": ["a run downloaded as one file re-verifies offline, naming only who signed"]
+    },
+    {
+      "id": "PR-1",
+      "area": "github",
+      "claim": "Pull requests carry their proof: the runtime that commits a task's work keeps the evidence record it signed as a git note on the commit (refs/notes/proofkin), and opening a pull request from the branch (repo pr, or the web UI, on by default) checks the record's signature and that it covers the branch's head, then adds who made the commit, for whom, its key and the checks run on the change with their results (never their commands), plus the verdict and claims of this profile's evidence run that holds the record. A missing, moved or forged record adds nothing, and the text is redacted before it leaves the machine.",
+      "tests": [
+        "lib::worktree::a_commits_signed_record_travels_with_it_into_its_pull_request",
+        "ui::the_page_follows_the_ux_guidelines"
+      ],
+      "live": ["worker2 kept the record it signed with its commit, for a pull request from the branch"]
     }
   ]
 }

@@ -25,9 +25,10 @@ its definition of done.
 ## Layout
 
 - Three columns on wide screens (sidebar, conversation, panels). From 1180 px down,
-  the panels move below and **the page scrolls**; no region gets a fixed share of
-  the viewport that can squeeze another. On phones (760 px and less) one column:
-  conversation, panels, then sidebar.
+  the panels move below and **the page scrolls**, while the conversation keeps the
+  window's height beside the sidebar and stays in view (sticky), so its composer is
+  always on screen; no region gets a fixed share of the viewport that can squeeze
+  another. On phones (760 px and less) one column: conversation, panels, then sidebar.
 - The composer never hides its text box or its main button: long helper content
   (the plan explainer) is collapsed by default, remembers whether its owner opened
   it, and the composer scrolls inside itself rather than overflowing.
@@ -123,6 +124,8 @@ Every list and panel defines three states:
 - Format with `Intl` in the browser's locale: `toLocaleTimeString`,
   `toLocaleDateString`, and `Intl.RelativeTimeFormat` for "in 3 hours" or
   "5 minutes ago". Show the absolute time next to (or as the title of) a relative one.
+- A time alone means today; anything older shows its day too ("Yesterday, 9:25 PM",
+  "Nov 18, 9:25 PM"), so lists that span days read in order (`stamp()` in `app.js`).
 - Schedules are in the agent's local time; say so once in the dialog.
 
 ## Accessibility (WCAG 2.2 AA)

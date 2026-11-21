@@ -149,6 +149,21 @@ impl Evidence {
         if self.output_sha256 != sha256_hex(output.as_bytes()) {
             bail!("the output doesn't match the signed hash");
         }
+        self.verify_signature(signer)
+    }
+
+    /// Checks the signature alone, with the signer taken from the record: the record
+    /// is as its signer made it (without the output it vouches for, which is checked
+    /// by [`Evidence::verify`]).
+    pub fn verify_record(&self) -> Result<()> {
+        let id: EndpointId = self
+            .signer_id
+            .parse()
+            .map_err(|_| anyhow!("malformed signer id"))?;
+        self.verify_signature(&id)
+    }
+
+    fn verify_signature(&self, signer: &EndpointId) -> Result<()> {
         let bytes: [u8; 64] = data_encoding::HEXLOWER
             .decode(self.signature.as_bytes())
             .ok()

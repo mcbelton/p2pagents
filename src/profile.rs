@@ -452,6 +452,13 @@ impl Profile {
         self.secret_delete("identity")
     }
 
+    /// Whether the profile exists: it has settings, an allowlist or an identity.
+    pub fn exists(&self) -> Result<bool> {
+        Ok(self.dir.join("profile.json").is_file()
+            || self.dir.join("peers.json").is_file()
+            || self.secret_get("identity")?.is_some())
+    }
+
     /// The token other agents use to connect to this profile's agent over MCP and A2A
     /// (`proofkin connect`), if connecting is on.
     pub fn integration_token(&self) -> Result<Option<String>> {

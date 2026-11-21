@@ -393,6 +393,24 @@ try:
     print(f"  {out.strip()}")
     check("the saved run's signatures re-verify offline",
           code == 0 and "all 2 signed records verify" in out and os.path.exists(os.path.join(run_dir, "make.patch")))
+    # The run downloaded from the web UI is one file under any name; only its signers sign.
+    downloaded = os.path.join(HOME, "downloaded-run.json")
+    if run_dir and os.path.exists(os.path.join(run_dir, "run.json")):
+        shutil.copyfile(os.path.join(run_dir, "run.json"), downloaded)
+    code, out = cli("runs", "verify", "--file", downloaded) if os.path.exists(downloaded) else (1, "no run.json")
+    signed = out.split("signed by", 1)[-1]
+    check("a run downloaded as one file re-verifies offline, naming only who signed",
+          code == 0 and "all 2 signed records verify" in out and "worker2" in signed and "worker1" in signed
+          and "helper" not in signed, out)
+    made = re.search(r"\*\*Commit\*\* `([0-9a-f]+)` on branch `(p2p/boss/[^`]+)`", text)
+    note = subprocess.run(["git", "-C", app, "notes", "--ref=proofkin", "show", made.group(2)],
+                          capture_output=True, text=True) if made else None
+    record = json.loads(note.stdout) if note and note.returncode == 0 else {}
+    check("worker2 kept the record it signed with its commit, for a pull request from the branch",
+          made and record.get("signer") == "worker2" and record.get("signature")
+          and (record.get("git") or {}).get("commit", "").startswith(made.group(1))
+          and record.get("checks", [{}])[0].get("name") == "has-file",
+          note.stdout[:300] if note else "no commit")
     check("boss saved the verified result as knowledge",
           boss.wait_for(r"knowledge saved: evidence-notes", 5)
           and "evidence.txt" in cli("kb", "show", "evidence-notes", "--profile", "boss")[1])

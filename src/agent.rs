@@ -1139,7 +1139,7 @@ impl Inner {
         for check in &owner_checks {
             if !share.checks.contains_key(*check) {
                 bail!(
-                    "folder '{}' on {} has no check named '{check}' (it has: {}; built in: {})",
+                    "folder '{}' on {} has no check named '{check}' (it has: {}; built in: {}){}",
                     share.name,
                     self.name,
                     if share.checks.is_empty() {
@@ -1147,7 +1147,8 @@ impl Inner {
                     } else {
                         share.checks.keys().cloned().collect::<Vec<_>>().join(", ")
                     },
-                    crate::spec::BUILT_IN_CHECKS.join(", ")
+                    crate::spec::BUILT_IN_CHECKS.join(", "),
+                    crate::spec::group_hint(&[check.as_str()])
                 );
             }
         }
@@ -1413,6 +1414,15 @@ impl Inner {
             output = format!("{}\n\n---\n{summary}", output.trim_end());
         }
         let evidence = evidence.sign(&output, self.endpoint.secret_key());
+        // The signed record stays with the commit, so a pull request from the branch
+        // can carry it. Best effort: the requester has the record either way.
+        if let (Some(wt), Some(commit)) = (
+            &worktree,
+            evidence.git.as_ref().and_then(|g| g.commit.as_deref()),
+        ) && let Ok(record) = serde_json::to_string(&evidence)
+        {
+            let _ = wt.note(commit, &record).await;
+        }
         Ok(Served {
             output,
             evidence,

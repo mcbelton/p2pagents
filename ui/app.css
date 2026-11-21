@@ -148,7 +148,9 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .list li { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: var(--radius-sm); }
 .list li:hover { background: var(--surface-2); }
 .empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
+.list li.empty { display: block; }
 .empty strong { color: var(--text); font-weight: 600; }
+.head-actions { display: inline-flex; align-items: center; gap: 6px; }
 
 .avatar {
   width: 30px; height: 30px; border-radius: 50%; flex: none;
@@ -237,6 +239,23 @@ textarea { resize: vertical; }
 .feed-empty { margin: auto; text-align: center; color: var(--muted); max-width: 380px; }
 .feed-empty svg { width: 40px; height: 40px; stroke: var(--accent); margin-bottom: 8px; }
 .feed-empty h2 { font-size: 15px; color: var(--text); margin-bottom: 4px; }
+/* First steps for a new agent, in place of the empty conversation. */
+.get-started { margin: auto; width: min(480px, 100%); display: flex; flex-direction: column; gap: 10px; }
+.get-started h2 { font-size: 15px; }
+.get-started ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.get-started li {
+  display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 10px; align-items: center;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
+}
+.get-started .step-mark {
+  width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 12px; font-weight: 700; background: var(--surface-3); color: var(--muted);
+}
+.get-started li[data-done="true"] .step-mark { background: var(--success-soft); color: var(--success); }
+.get-started .step-text { display: flex; flex-direction: column; min-width: 0; }
+.get-started .step-text strong { font-weight: 600; }
+.get-started .step-text span { color: var(--muted); font-size: 12.5px; }
+.get-started .dismiss { align-self: flex-end; }
 
 .composer { border-top: 1px solid var(--border); padding: 12px 14px 10px; display: flex; flex-direction: column; gap: 8px; flex: none; max-height: 72%; overflow-y: auto; overscroll-behavior: contain; }
 .composer-top { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -466,14 +485,15 @@ dialog form > .dialog-footer {
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
 
 /* Responsive: from 1180 px down the panels move below and the page scrolls, so no
-   region is squeezed (the composer and its text box always stay in view). */
+   region is squeezed. The conversation keeps the window's height and stays in view
+   while the panels beside and below it scroll (its composer never leaves the screen). */
 @media (max-width: 1180px) {
   html, body { height: auto; }
   body { min-height: 100vh; }
   .layout { grid-template-columns: 280px minmax(0, 1fr); flex: none; }
   .sidebar { overflow: visible; }
-  .main { min-height: calc(100vh - 92px); }
-  .feed { min-height: 220px; }
+  .main { position: sticky; top: 16px; align-self: start; height: calc(100vh - 92px); min-height: 420px; }
+  .feed { min-height: 160px; }
   .tasks-panel { grid-column: 1 / -1; max-height: none; overflow: visible; }
 }
 @media (max-width: 760px) {
@@ -483,7 +503,7 @@ dialog form > .dialog-footer {
   .theme-switch span { display: none; }
   .layout { grid-template-columns: 1fr; padding: 12px; }
   /* Phones: the conversation first, then tasks, then peers and identity. */
-  .main { min-height: 75vh; order: 1; }
+  .main { position: static; height: auto; min-height: 75vh; order: 1; }
   .tasks-panel { order: 2; }
   .sidebar { order: 3; }
   .msg { max-width: 92%; }

@@ -46,6 +46,34 @@ pub fn is_built_in(check: &str) -> bool {
     BUILT_IN_CHECKS.contains(&check)
 }
 
+/// The built-in checks of group `name` (`spec` -> `spec:spec`, `spec:api`, ...), none
+/// if it isn't a group.
+pub fn group(name: &str) -> Vec<&'static str> {
+    BUILT_IN_CHECKS
+        .iter()
+        .copied()
+        .filter(|c| c.split_once(':').is_some_and(|(g, _)| g == name))
+        .collect()
+}
+
+/// A hint for checks named like a group of built-in ones (`verify=spec`), which no
+/// folder has: what the built-in checks are called.
+pub fn group_hint(missing: &[&str]) -> String {
+    missing
+        .iter()
+        .filter_map(|m| {
+            let checks = group(m);
+            (!checks.is_empty()).then(|| {
+                format!(
+                    "; the built-in {m} checks are {} (verify={})",
+                    checks.join(", "),
+                    checks.join(",")
+                )
+            })
+        })
+        .collect()
+}
+
 /// What built-in check `check` proves, in a line (for the plan builder).
 pub fn about(check: &str) -> &'static str {
     match check {
