@@ -512,6 +512,11 @@ impl Profile {
         self.dir.join("runs")
     }
 
+    /// The web UI's latest tasks, kept across restarts.
+    pub fn tasks_path(&self) -> PathBuf {
+        self.dir.join("tasks.json")
+    }
+
     /// The knowledge base (private to this profile).
     pub fn knowledge(&self) -> crate::knowledge::KnowledgeBase {
         crate::knowledge::KnowledgeBase::new(self.dir.join("knowledge"))

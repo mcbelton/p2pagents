@@ -924,7 +924,8 @@ fn job_json(s: &Shared, job: &Job) -> Value {
 }
 
 /// Whether `job`'s work is still kept: the oldest finished tasks are let go (see
-/// [`super::TASK_LIMIT`]), and then other agents can no longer look it up.
+/// [`super::TASK_LIMIT`]), and cleared ones, and then other agents can no longer look
+/// it up.
 fn kept(s: &Shared, job: &Job) -> bool {
     matches!(job.work, Work::Rejected(_)) || !views(s, job).is_empty()
 }

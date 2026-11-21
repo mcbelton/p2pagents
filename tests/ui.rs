@@ -364,6 +364,140 @@ async fn ui_cancels_running_tasks_and_shows_the_audit_log() {
     agent.shutdown().await;
 }
 
+/// Starts the web UI of profile `solo` in `home`, running its tasks with [`Echo`]:
+/// its agent, port and access token.
+async fn solo_ui(home: &std::path::Path) -> (Agent, u16, String) {
+    let mut config = AgentConfig::new("solo", SecretKey::generate());
+    config.network = Network::Local;
+    config.bind = Some("127.0.0.1:0".parse().unwrap());
+    let (agent, events) = Agent::bind(config).await.unwrap();
+    let info = UiInfo {
+        profile: Profile::open_in(home, "solo").unwrap(),
+        network: Network::Local,
+        serving: true,
+        access: Access::ReadOnly,
+        workspace: home.to_path_buf(),
+        providers: vec![Provider::Copilot],
+        accounts: Vec::new(),
+        workers: None,
+    };
+    let server = ui::start(
+        agent.clone(),
+        events,
+        info,
+        Some(Arc::new(Echo)),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let rest = server.url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#t=").unwrap();
+    (agent, port.parse().unwrap(), token.to_owned())
+}
+
+/// Waits until the profile's `tasks.json` keeps `want` (each task's "id:status").
+async fn wait_kept(path: &std::path::Path, want: &str) {
+    let kept = || {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|file| file["tasks"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|t| format!("{}:{}", t["id"], t["status"].as_str().unwrap()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for _ in 0..200 {
+        if kept() == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("tasks.json keeps {:?}, not {want:?}", kept());
+}
+
+/// The task list outlives a restart: finished tasks come back as they were (long
+/// outputs cut), one the agent stopped in the middle comes back cancelled saying
+/// why, ids go on, and the finished ones can be cleared.
+#[tokio::test]
+async fn tasks_outlive_a_restart_and_finished_ones_can_be_cleared() {
+    let home = tempfile::tempdir().unwrap();
+    let kept = Profile::open_in(home.path(), "solo").unwrap().tasks_path();
+    let (agent, port, token) = solo_ui(home.path()).await;
+    let host = format!("127.0.0.1:{port}");
+    let long = serde_json::json!({
+        "provider": "copilot", "prompt": "é".repeat(33_000), "target": "local",
+    })
+    .to_string();
+    let hang = r#"{"provider":"copilot","prompt":"hang","target":"local"}"#;
+    let first = request(port, "POST", "/api/tasks", &host, Some(&token), Some(&long)).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let second = request(port, "POST", "/api/tasks", &host, Some(&token), Some(hang)).await;
+    assert_eq!(second.json()["id"], 2);
+    wait_kept(&kept, "1:done 2:running").await;
+    agent.shutdown().await;
+    // Two agents of one profile never run at once: let this one's last save land.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let (agent, port, token) = solo_ui(home.path()).await;
+    let host = format!("127.0.0.1:{port}");
+    let state = request(port, "GET", "/api/state", &host, Some(&token), None)
+        .await
+        .json();
+    let tasks = state["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0]["status"], "done");
+    let output = tasks[0]["output"].as_str().unwrap();
+    assert!(output.starts_with("echo: éé"));
+    assert!(output.ends_with("characters are kept after a restart)"));
+    assert_eq!(
+        output.chars().filter(|c| *c == 'é').count(),
+        32_000 - "echo: ".len()
+    );
+    assert_eq!(tasks[1]["status"], "cancelled");
+    assert_eq!(
+        tasks[1]["output"],
+        "The agent stopped before this finished."
+    );
+    assert!(tasks[1]["finished_ms"].is_null(), "{}", tasks[1]);
+    assert!(
+        state["feed"].as_array().unwrap().iter().any(|f| f["text"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("1 task was cancelled because the agent stopped"))),
+        "{}",
+        state["feed"]
+    );
+    // Kept as cancelled from now on, so the next restart doesn't report it again.
+    wait_kept(&kept, "1:done 2:cancelled").await;
+
+    let again = r#"{"provider":"copilot","prompt":"again","target":"local"}"#;
+    let third = request(port, "POST", "/api/tasks", &host, Some(&token), Some(again)).await;
+    assert_eq!(third.json()["id"], 3, "ids go on");
+    wait_kept(&kept, "1:done 2:cancelled 3:done").await;
+    let fourth = request(port, "POST", "/api/tasks", &host, Some(&token), Some(hang)).await;
+    assert_eq!(fourth.json()["id"], 4);
+
+    // Clearing lets the finished tasks go; the running one stays.
+    assert_eq!(
+        request(port, "DELETE", "/api/tasks", &host, None, None)
+            .await
+            .status,
+        401
+    );
+    let cleared = request(port, "DELETE", "/api/tasks", &host, Some(&token), None).await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert_eq!(cleared.json()["cleared"], 3);
+    assert_eq!(cleared.json()["tasks"][0]["id"], 4, "what is left");
+    let state = request(port, "GET", "/api/state", &host, Some(&token), None)
+        .await
+        .json();
+    assert_eq!(state["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(state["tasks"][0]["id"], 4);
+    wait_kept(&kept, "4:running").await;
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn ui_runs_plans_and_shows_squads() {
     let home = tempfile::tempdir().unwrap();
@@ -1059,6 +1193,97 @@ async fn ui_shows_health_knowledge_and_fills_in_playbooks() {
             .contains("# Security review")
     );
     assert_eq!(get("/api/skills/nope").await.status, 404);
+
+    // Monitors are managed in the Health card: each says what it checks, the card
+    // offers the folders' checks a new one can run, and monitors are added and
+    // removed there (a removed one's open incidents close; the agent follows both).
+    assert_eq!(ops["monitors"][0]["share"], "app");
+    assert_eq!(ops["monitors"][0]["check"], "health");
+    assert_eq!(ops["monitors"][0]["every_secs"], 60);
+    assert_eq!(
+        ops["checks"],
+        serde_json::json!([{ "folder": "app", "checks": { "health": "exit 0" } }])
+    );
+    let unknown = post(
+        "/api/monitors",
+        r#"{"name":"db","share":"app","check":"nope","every_secs":60}"#,
+    )
+    .await;
+    assert_eq!(unknown.status, 400);
+    assert!(unknown.body.contains("no check 'nope'"), "{}", unknown.body);
+    let taken = post(
+        "/api/monitors",
+        r#"{"name":"api","share":"app","check":"health","every_secs":60}"#,
+    )
+    .await;
+    assert_eq!(taken.status, 400);
+    assert!(
+        taken.body.contains("already a monitor 'api'"),
+        "{}",
+        taken.body
+    );
+    let added = post(
+        "/api/monitors",
+        r#"{"name":"db","share":"app","check":"health","every_secs":300}"#,
+    )
+    .await;
+    assert_eq!(added.status, 200, "{}", added.body);
+    let ops = get("/api/ops").await.json();
+    let db = ops["monitors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "db")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            db["every_secs"].as_u64(),
+            db["fail_after"].as_u64(),
+            db["slo"].as_f64()
+        ),
+        (Some(300), Some(3), Some(99.0)),
+        "{db}"
+    );
+    assert_eq!(
+        request(port, "DELETE", "/api/monitors/api", &host, None, None)
+            .await
+            .status,
+        401
+    );
+    let removed = request(
+        port,
+        "DELETE",
+        "/api/monitors/api",
+        &host,
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    let again = request(
+        port,
+        "DELETE",
+        "/api/monitors/api",
+        &host,
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(again.status, 404);
+    let ops = get("/api/ops").await.json();
+    let names: Vec<&str> = ops["monitors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["db", "web"]);
+    assert_eq!(ops["open_incidents"], 0);
+    assert!(
+        proofkin::ops::open_incidents(&store.incidents(0)).is_empty(),
+        "the removed monitor's incidents are closed"
+    );
 
     // GitHub: not signed in yet, so repositories can't be linked.
     let github = get("/api/github").await.json();
@@ -1809,6 +2034,9 @@ async fn the_page_follows_the_ux_guidelines() {
         "attempts",
         "run-download",
         "pr-proof",
+        "clear-tasks-btn",
+        "add-monitor-btn",
+        "monitor-dialog",
     ] {
         assert!(page.contains(&format!(r#"id="{id}""#)), "{id}");
     }

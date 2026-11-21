@@ -259,6 +259,7 @@ profile is a private identity:
   copilot\       COPILOT_HOME for this agent's own Copilot CLI instance
   claude\        CLAUDE_CONFIG_DIR for this agent's own Claude instance (+ its login)
   codex\         CODEX_HOME for this agent's own Codex instance (+ auth.json)
+  tasks.json     the web UI's latest 200 tasks, kept across restarts
 ```
 
 Tokens and API keys are stored in the OS credential store (Windows Credential Manager,
@@ -869,8 +870,11 @@ So reverse-engineered architecture, risks, designs and insights build up across 
 proofkin kb list | show <topic> | add <topic> <file.md> | remove <topic> | search <words> --profile boss
 ```
 
-**Operations.** On the machine where a service runs, its owner adds monitors. A monitor
-runs one of the folder's checks on a schedule, while that profile's agent runs:
+**Operations.** On the machine where a service runs, its owner adds monitors: in the web
+UI (**Health → Add monitor**, which offers the folders' checks) or in a terminal. A monitor
+runs one of the folder's checks on a schedule, while that profile's agent runs. A running
+agent starts, restarts or stops monitors added, changed or removed within seconds; no
+restart needed.
 
 ```powershell
 proofkin share add svc D:\svc --access full --check health="curl -fsS http://localhost:8080/health" `
@@ -885,8 +889,10 @@ proofkin monitor add api --share svc --check health --every 60 --fail-after 3 --
   the agent runs). An incident stays open until the monitor passes again, also across
   agent restarts, so the same failure never alerts or runs the debugging agent twice.
 - A monitor whose folder or check no longer exists **can't run**: it is skipped (no
-  samples, no incidents) and the report and **Health** panel say what to fix, or to
-  `proofkin monitor remove` it. Monitors use the folder's checks as they are now.
+  samples, no incidents) and the report and **Health** panel say what to fix, or to remove
+  it (its trash button in **Health**, or `proofkin monitor remove`). Removing a monitor
+  closes its open incidents; its history stays. Monitors use the folder's checks as they
+  are now.
 - **Auto-fix with TSGs.** A troubleshooting guide is a knowledge topic with front matter
   (`tsg`, `monitor`, `match`, `fix`, `verify`, `status`). The fix check of every active
   guide whose monitor matches, and whose `match` text appears in the failure, is run, then
@@ -910,8 +916,9 @@ proofkin kb learn --profile alice                 # ops report -> knowledge topi
 **Learning.** Agents with monitors refresh `ops-summary` in the knowledge base every hour.
 TSGs learned from incidents accumulate, and the `learn` playbook analyzes it all
 (`context=all`) into insights and new TSG drafts. In the web UI, the **Health** panel shows
-monitors against their SLOs, open incidents, the incident log and task statistics, and
-**Knowledge** lists the topics and TSGs.
+monitors against their SLOs (with what each checks, how often), open incidents, the
+incident log and task statistics; **Add monitor** and each monitor's trash button add and
+remove monitors. **Knowledge** lists the topics and TSGs.
 
 ### Spec-driven development
 
@@ -1164,7 +1171,10 @@ proofkin --name me --providers copilot --serve --ui
   only if they pass, and it is kept under **Evidence runs**.
   The **Tasks** panel shows status and elapsed time, renders results as Markdown, can copy
   results and errors, has a **Cancel** button on running tasks, and links each plan step,
-  and each task kept as evidence, to its **Evidence run**.
+  and each task kept as evidence, to its **Evidence run**. The latest 200 tasks are kept
+  in the profile (`tasks.json`, long results cut at 32,000 characters) and come back
+  after a restart; one the agent stopped in the middle comes back cancelled, saying so.
+  **Clear finished** lets the finished ones go (running ones stay).
 - **Plan** mode: write a [plan](#squads-and-plans) in the composer (Enter adds a line,
   Ctrl+Enter runs it), or press **Open editor** for a full-size editor with two views of
   the same plan:

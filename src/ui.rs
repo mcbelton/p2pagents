@@ -50,6 +50,11 @@ const FEED_LIMIT: usize = 500;
 /// Most tasks kept for the page (and for other agents' lookups), besides running ones:
 /// the oldest finished ones go first, a plan's steps together once the plan has ended.
 const TASK_LIMIT: usize = 500;
+/// The latest tasks kept in `tasks.json` across restarts, and how much of each output.
+const KEPT_TASKS: usize = 200;
+const KEPT_OUTPUT: usize = 32_000;
+/// Why a task that was running when the agent stopped shows as cancelled.
+const STOPPED: &str = "The agent stopped before this finished.";
 /// How long a refused key that keeps dialing goes unreported after it was reported.
 const REFUSED_AGAIN_AFTER: Duration = Duration::from_secs(600);
 
@@ -111,6 +116,132 @@ impl TaskView {
     }
 }
 
+/// A task as `tasks.json` keeps it (its preview isn't kept: it lives in memory).
+#[derive(Serialize, Deserialize)]
+struct StoredTask {
+    id: u64,
+    provider: Provider,
+    prompt: String,
+    target: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    started_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finished_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    after: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    approval: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct TaskFile {
+    #[serde(default)]
+    tasks: Vec<StoredTask>,
+}
+
+impl From<&TaskView> for StoredTask {
+    fn from(t: &TaskView) -> Self {
+        Self {
+            id: t.id,
+            provider: t.provider,
+            prompt: t.prompt.clone(),
+            target: t.target.clone(),
+            status: t.status.to_owned(),
+            output: t.output.as_deref().map(|out| match out.char_indices().nth(KEPT_OUTPUT) {
+                None => out.to_owned(),
+                Some((at, _)) => format!(
+                    "{}\n\n… (cut: only the first {KEPT_OUTPUT} characters are kept after a restart)",
+                    &out[..at]
+                ),
+            }),
+            started_ms: t.started_ms,
+            finished_ms: t.finished_ms,
+            plan: t.plan,
+            step: t.step.clone(),
+            after: t.after.clone(),
+            approval: t.approval,
+            evidence: t.evidence.map(str::to_owned),
+            via: t.via.map(str::to_owned),
+            run: t.run.clone(),
+        }
+    }
+}
+
+impl StoredTask {
+    /// The task as the page shows it. One that was running or waiting when the agent
+    /// stopped is cancelled: its work stopped with the agent.
+    fn into_view(self) -> TaskView {
+        fn known(value: Option<&str>, all: &[&'static str]) -> Option<&'static str> {
+            value.and_then(|v| all.iter().copied().find(|known| *known == v))
+        }
+        let finished = known(
+            Some(self.status.as_str()),
+            &["done", "failed", "cancelled", "skipped"],
+        );
+        TaskView {
+            id: self.id,
+            provider: self.provider,
+            prompt: self.prompt,
+            target: self.target,
+            status: finished.unwrap_or("cancelled"),
+            output: if finished.is_some() {
+                self.output
+            } else {
+                Some(STOPPED.to_owned())
+            },
+            started_ms: self.started_ms,
+            finished_ms: self.finished_ms,
+            plan: self.plan,
+            step: self.step,
+            after: self.after,
+            approval: self.approval,
+            evidence: known(self.evidence.as_deref(), &["verified", "unverified"]),
+            preview: None,
+            preview_label: None,
+            via: known(self.via.as_deref(), &["MCP", "A2A"]),
+            run: self.run,
+        }
+    }
+}
+
+/// The tasks kept from before the agent last stopped (none if there are none or the
+/// file can't be read), and how many of them it stopped.
+fn load_tasks(path: &std::path::Path) -> (Vec<TaskView>, usize) {
+    let file = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<TaskFile>(&bytes)
+            .with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TaskFile::default()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    match file {
+        Ok(file) => {
+            let stopped = file
+                .tasks
+                .iter()
+                .filter(|t| matches!(t.status.as_str(), "running" | "waiting"))
+                .count();
+            let tasks = file.tasks.into_iter().map(StoredTask::into_view).collect();
+            (tasks, stopped)
+        }
+        Err(e) => {
+            eprintln!("the tasks from before are not shown: {e:#}");
+            (Vec::new(), 0)
+        }
+    }
+}
+
 struct Shared {
     agent: Agent,
     info: UiInfo,
@@ -130,6 +261,8 @@ struct Shared {
     staging: tools::Staging,
     /// Fires whenever a task changes (for waiting on one to finish).
     changed: tokio::sync::Notify,
+    /// Fires whenever the tasks change, for saving them (see [`keep_tasks`]).
+    unsaved: tokio::sync::Notify,
     /// Other agents connected over MCP and A2A: their token and the work they started.
     connect: connect::Connect,
     /// Started with --ui-port: the address other agents use stays the same.
@@ -308,6 +441,7 @@ impl Shared {
         let mut tasks = self.tasks.lock().unwrap();
         tasks.push(view);
         prune_tasks(&mut tasks, TASK_LIMIT);
+        self.unsaved.notify_one();
     }
 
     fn update_task(&self, id: u64, f: impl FnOnce(&mut TaskView)) {
@@ -319,6 +453,7 @@ impl Shared {
             f(task);
             task.clone()
         };
+        self.unsaved.notify_one();
         self.send(json!({ "type": "task", "task": task }));
         self.changed.notify_waiters();
     }
@@ -374,6 +509,34 @@ fn prune_tasks(tasks: &mut Vec<TaskView>, limit: usize) {
     tasks.retain(|t| !gone.contains(&t.id));
 }
 
+/// Saves the latest tasks whenever they change (at most once a second), so the list
+/// is still there after the agent restarts.
+fn keep_tasks(shared: &AppState) {
+    let s = shared.clone();
+    let path = s.info.profile.tasks_path();
+    tokio::spawn(async move {
+        loop {
+            s.unsaved.notified().await;
+            let file = {
+                let mut kept = s.tasks.lock().unwrap().clone();
+                prune_tasks(&mut kept, KEPT_TASKS);
+                TaskFile {
+                    tasks: kept.iter().map(StoredTask::from).collect(),
+                }
+            };
+            let path = path.clone();
+            let saved = tokio::task::spawn_blocking(move || {
+                crate::store::write_atomic(&path, &serde_json::to_vec(&file)?)
+            })
+            .await;
+            if let Ok(Err(e)) = saved {
+                eprintln!("could not keep the tasks for after a restart: {e:#}");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
 /// A running UI server.
 pub struct UiServer {
     pub url: String,
@@ -390,6 +553,15 @@ pub async fn start(
     let token = data_encoding::HEXLOWER.encode(&iroh::SecretKey::generate().to_bytes()[..16]);
     let (tx, _) = broadcast::channel(256);
     let squads = SquadStore::load(&info.profile.squads_path()).unwrap_or_default();
+    let (tasks, stopped) = load_tasks(&info.profile.tasks_path());
+    // Ids go on from the kept tasks' (a plan's id is one too).
+    let next_task_id = tasks
+        .iter()
+        .flat_map(|t| [Some(t.id), t.plan])
+        .flatten()
+        .max()
+        .unwrap_or(0)
+        + 1;
     let shared = Arc::new(Shared {
         agent,
         info,
@@ -398,18 +570,35 @@ pub async fn start(
         port: AtomicU16::new(0),
         feed: Mutex::new(VecDeque::new()),
         next_feed_id: AtomicU64::new(1),
-        tasks: Mutex::new(Vec::new()),
+        tasks: Mutex::new(tasks),
         squads: Mutex::new(squads),
         running: Mutex::new(HashMap::new()),
-        next_task_id: AtomicU64::new(1),
+        next_task_id: AtomicU64::new(next_task_id),
         tx,
         previews: crate::preview::Previews::default(),
         scheduler: std::sync::OnceLock::new(),
         staging: tools::Staging::default(),
         changed: tokio::sync::Notify::new(),
+        unsaved: tokio::sync::Notify::new(),
         connect: connect::Connect::default(),
         fixed_port: bind.port() != 0,
     });
+    if stopped > 0 {
+        let (were, they, them) = if stopped == 1 {
+            ("task was", "it", "it")
+        } else {
+            ("tasks were", "they", "them")
+        };
+        shared.system(
+            "warn",
+            format!(
+                "{stopped} {were} cancelled because the agent stopped before {they} finished; run {them} again if you still need {them}"
+            ),
+        );
+        // Kept as cancelled from now on.
+        shared.unsaved.notify_one();
+    }
+    keep_tasks(&shared);
     start_scheduler(&shared);
     watch_workers(&shared);
 
@@ -501,7 +690,7 @@ pub async fn start(
         .route("/api/state", get(state))
         .route("/api/events", get(events_stream))
         .route("/api/chat", post(chat))
-        .route("/api/tasks", post(create_task))
+        .route("/api/tasks", post(create_task).delete(clear_tasks))
         .route("/api/tasks/{id}", delete(cancel_task))
         .route("/api/audit", get(audit))
         .route("/api/plans", post(create_plan))
@@ -520,6 +709,8 @@ pub async fn start(
         .route("/api/previews", post(create_preview))
         .route("/api/approvals/{id}", post(answer_approval))
         .route("/api/ops", get(ops_state))
+        .route("/api/monitors", post(add_monitor))
+        .route("/api/monitors/{name}", delete(delete_monitor))
         .route("/api/playbooks", get(list_playbooks))
         .route("/api/playbooks/{name}", post(render_playbook))
         .route("/api/kb/{topic}", get(kb_topic))
@@ -1122,6 +1313,25 @@ async fn cancel_task(
     Ok(Json(json!({ "cancelled": id })))
 }
 
+/// Lets every finished task go (a plan's steps once the whole plan has ended); running
+/// ones stay. Other agents can no longer look up work of theirs that is let go.
+async fn clear_tasks(State(s): State<AppState>) -> Json<Value> {
+    let (cleared, tasks) = {
+        let mut tasks = s.tasks.lock().unwrap();
+        let before = tasks.len();
+        let running: std::collections::HashSet<u64> = tasks
+            .iter()
+            .filter(|t| !t.finished())
+            .filter_map(|t| t.plan)
+            .collect();
+        tasks.retain(|t| !t.finished() || t.plan.is_some_and(|p| running.contains(&p)));
+        (before - tasks.len(), tasks.clone())
+    };
+    s.unsaved.notify_one();
+    s.send(json!({ "type": "tasks", "tasks": tasks }));
+    Json(json!({ "cleared": cleared, "tasks": tasks }))
+}
+
 /// Cancels running task `id` (its whole plan, for a step), saying `why`.
 fn cancel_running(s: &Shared, id: u64, why: &str) -> Result<(), ApiError> {
     let handle = s.running.lock().unwrap().remove(&id).ok_or_else(|| {
@@ -1688,15 +1898,99 @@ async fn ops_state(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         .filter(|r| r.started_unix >= since)
         .collect();
     let recent: Vec<_> = incidents.iter().rev().take(30).cloned().collect();
+    // Folders with checks: what a new monitor can run.
+    let checks: Vec<Value> = s
+        .agent
+        .shares()
+        .shares
+        .iter()
+        .filter(|share| !share.checks.is_empty())
+        .map(|share| json!({ "folder": share.name, "checks": share.checks }))
+        .collect();
+    // Each monitor's health, and what it checks how often.
+    let listed: Vec<Value> = stats
+        .iter()
+        .map(|stat| {
+            let mut v = json!(stat);
+            if let Some(m) = monitors.iter().find(|m| m.name == stat.name) {
+                v["share"] = json!(m.share);
+                v["check"] = json!(m.check);
+                v["every_secs"] = json!(m.every_secs);
+                v["fail_after"] = json!(m.fail_after);
+            }
+            v
+        })
+        .collect();
     Ok(Json(json!({
         // Monitors with an open incident (one ongoing problem each).
         "open_incidents": stats.iter().filter(|m| m.open_incident).count(),
-        "monitors": stats,
+        "monitors": listed,
+        "checks": checks,
         "incidents": recent,
         "tasks": task_stats(&audit),
         "runs": { "total": runs.len(), "passed": runs.iter().filter(|r| r.passed).count() },
         "knowledge": profile.knowledge().list(),
     })))
+}
+
+/// Adds a monitor of one of this agent's folders' checks; the agent starts checking it
+/// within seconds.
+async fn add_monitor(
+    State(s): State<AppState>,
+    Json(monitor): Json<crate::ops::Monitor>,
+) -> Result<Json<Value>, ApiError> {
+    let name = monitor.name.clone();
+    let every = monitor.every_secs;
+    let shares = s.agent.shares();
+    crate::ops::MonitorStore::update(&s.info.profile.monitors_path(), |store| {
+        if store.monitors.iter().any(|m| m.name == monitor.name) {
+            bail!(
+                "there is already a monitor '{}': pick another name, or remove that one first",
+                monitor.name
+            );
+        }
+        store.set(monitor, &shares)
+    })
+    .map_err(|e| bad_request(format!("{e:#}")))?;
+    s.system(
+        "info",
+        format!(
+            "Monitor {name} added: checked every {} while this agent runs",
+            interval(every)
+        ),
+    );
+    s.send(json!({ "type": "ops" }));
+    Ok(Json(json!({ "added": name })))
+}
+
+/// How often, in words ("minute", "5 minutes").
+fn interval(secs: u64) -> String {
+    match secs {
+        60 => "minute".to_owned(),
+        3600 => "hour".to_owned(),
+        s if s % 3600 == 0 => format!("{} hours", s / 3600),
+        s if s % 60 == 0 => format!("{} minutes", s / 60),
+        s => format!("{s} seconds"),
+    }
+}
+
+/// Removes a monitor (its history stays; its open incidents are closed).
+async fn delete_monitor(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = &s.info.profile;
+    let removed = crate::ops::remove_monitor(&profile.monitors_path(), &profile.ops_store(), &name)
+        .map_err(|e| internal(format!("{e:#}")))?;
+    if !removed {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("there is no monitor '{name}'") })),
+        ));
+    }
+    s.system("info", format!("Monitor {name} removed"));
+    s.send(json!({ "type": "ops" }));
+    Ok(Json(json!({ "removed": name })))
 }
 
 /// Parses a plan and checks it against the connected peers, their folders and

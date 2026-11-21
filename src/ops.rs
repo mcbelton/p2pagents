@@ -75,11 +75,20 @@ impl MonitorStore {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+        crate::store::write_atomic(path, &serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Loads the store at `path`, changes it with `change` and saves it, holding its
+    /// lock, so changes from the web UI and the CLI never overwrite each other.
+    pub fn update<T>(
+        path: &Path,
+        change: impl FnOnce(&mut MonitorStore) -> Result<T>,
+    ) -> Result<T> {
+        let _lock = crate::store::FileLock::acquire(path)?;
+        let mut store = Self::load(path)?;
+        let out = change(&mut store)?;
+        store.save(path)?;
+        Ok(out)
     }
 
     /// Adds or replaces a monitor; its folder and check must exist in `shares`.
@@ -203,6 +212,37 @@ impl OpsStore {
             e.incident >= since || e.ts >= since
         })
     }
+
+    /// Closes `monitor`'s open incidents saying `why` (nothing watches them any more);
+    /// how many it closed.
+    pub fn close_incidents(&self, monitor: &str, why: &str) -> Result<usize> {
+        let open: Vec<u64> = open_incidents(&self.incidents(0))
+            .into_iter()
+            .filter(|(_, m)| m == monitor)
+            .map(|(incident, _)| incident)
+            .collect();
+        for incident in &open {
+            self.record_incident(&IncidentEvent {
+                ts: unix_now(),
+                incident: *incident,
+                monitor: monitor.to_owned(),
+                kind: IncidentKind::Resolved,
+                text: why.to_owned(),
+                checks: vec![],
+            })?;
+        }
+        Ok(open.len())
+    }
+}
+
+/// Removes monitor `name` from the profile's `monitors` file and closes its open
+/// incidents; false if there is no such monitor.
+pub fn remove_monitor(monitors: &Path, store: &OpsStore, name: &str) -> Result<bool> {
+    if !MonitorStore::update(monitors, |list| Ok(list.remove(name)))? {
+        return Ok(false);
+    }
+    store.close_incidents(name, "Closed: the monitor was removed")?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -492,10 +532,16 @@ fn signature(output: &str) -> Option<String> {
         .map(|l| l.chars().take(80).collect())
 }
 
+/// The monitors as they are now (they can change while the agent runs).
+pub type MonitorList = Arc<dyn Fn() -> Vec<Monitor> + Send + Sync>;
+
 /// Everything a monitor's agent needs to watch and heal.
 pub struct Ops {
     pub agent_name: String,
-    pub monitors: Vec<Monitor>,
+    pub monitors: MonitorList,
+    /// How often the monitors are read again: added, removed or changed ones are
+    /// followed without restarting the agent.
+    pub reload: Duration,
     /// The agent's shared folders as they are now (they can change while it runs).
     pub shares: Arc<dyn Fn() -> ShareStore + Send + Sync>,
     pub store: OpsStore,
@@ -798,19 +844,36 @@ impl Ops {
         }
     }
 
-    /// Watches every monitor until the future is dropped.
+    /// Watches every monitor until the future is dropped, following the monitors as
+    /// they change: a new one starts, a removed one stops, a changed one starts over.
     pub async fn run(self: Arc<Self>) {
         let mut tasks = tokio::task::JoinSet::new();
-        for m in self.monitors.clone() {
-            let ops = self.clone();
-            tasks.spawn(async move { ops.watch(m).await });
+        let mut watching: Vec<(Monitor, tokio::task::AbortHandle)> = Vec::new();
+        loop {
+            let now = (self.monitors)();
+            watching.retain(|(m, watch)| {
+                let current = now.contains(m) && !watch.is_finished();
+                if !current {
+                    watch.abort();
+                }
+                current
+            });
+            for m in now {
+                if !watching.iter().any(|(w, _)| *w == m) {
+                    let ops = self.clone();
+                    let watched = m.clone();
+                    watching.push((m, tasks.spawn(async move { ops.watch(watched).await })));
+                }
+            }
+            while tasks.try_join_next().is_some() {}
+            tokio::time::sleep(self.reload).await;
         }
-        while tasks.join_next().await.is_some() {}
     }
 
     async fn watch(&self, m: Monitor) {
         let mut state = self.resume(&m);
-        loop {
+        // Until it is removed or changed (then `run` starts the new one).
+        while (self.monitors)().contains(&m) {
             self.tick(&m, &mut state).await;
             tokio::time::sleep(Duration::from_secs(m.every_secs)).await;
         }
@@ -837,7 +900,7 @@ impl Ops {
         if let Some(why) = problem(m, &(self.shares)()) {
             if !state.cant_run {
                 eprintln!(
-                    "monitor {} can't run: {why}; fix it, or remove the monitor (proofkin monitor remove {})",
+                    "monitor {} can't run: {why}; fix it, or remove the monitor (under Health in the web UI, or: proofkin monitor remove {})",
                     m.name, m.name
                 );
             }
@@ -1051,7 +1114,8 @@ mod tests {
         let log = seen.clone();
         let ops = Ops {
             agent_name: "worker".into(),
-            monitors: vec![],
+            monitors: Arc::new(Vec::new),
+            reload: Duration::from_millis(50),
             shares: Arc::new(move || shares.clone()),
             store,
             kb,
@@ -1235,6 +1299,60 @@ mod tests {
         };
         assert!(store.set(fast, &shares).is_err());
         assert!(store.remove("api") && store.monitors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitors_added_or_removed_while_the_agent_runs_are_followed() {
+        let (_dir, shares) = service(true);
+        let home = tempfile::tempdir().unwrap();
+        let store = OpsStore::new(home.path().join("ops"));
+        let (mut ops, _seen) = ops(
+            shares,
+            KnowledgeBase::new(home.path().join("kb")),
+            store.clone(),
+            None,
+        );
+        let up = |name: &str| Monitor {
+            name: name.into(),
+            check: "unbreak".into(),
+            every_secs: 1,
+            ..monitor()
+        };
+        let list = Arc::new(Mutex::new(vec![up("api")]));
+        let now = list.clone();
+        ops.monitors = Arc::new(move || now.lock().unwrap().clone());
+        let running = tokio::spawn(Arc::new(ops).run());
+        let samples = |name: &str| {
+            store
+                .samples(0)
+                .iter()
+                .filter(|s| s.monitor == name)
+                .count()
+        };
+        let until = |name: &'static str, n: usize| {
+            let samples = &samples;
+            async move {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while samples(name) < n {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{name} wasn't checked {n} times"))
+            }
+        };
+        until("api", 1).await;
+        // Removed while the agent runs: it stops. Added: it starts.
+        *list.lock().unwrap() = vec![up("web")];
+        until("web", 1).await;
+        let api = samples("api");
+        until("web", 3).await;
+        assert_eq!(
+            samples("api"),
+            api,
+            "a removed monitor isn't checked any more"
+        );
+        running.abort();
     }
 
     #[tokio::test]

@@ -1482,31 +1482,31 @@ fn start_schedules(profile: &Profile, agent: &Agent) -> Result<()> {
     Ok(())
 }
 
-/// Runs the profile's monitors in the background (if any). Incidents are printed and
-/// sent to connected peers as chat, so the team sees alerts.
+/// Runs the profile's monitors in the background. Incidents are printed and sent to
+/// connected peers as chat, so the team sees alerts. Monitors added, removed or
+/// changed while the agent runs (in the web UI or with `monitor add`) are followed.
 fn start_monitors(
     profile: &Profile,
     agent: &Agent,
     executor: Option<Arc<dyn Executor>>,
 ) -> Result<()> {
-    use proofkin::ops::{IncidentEvent, IncidentKind, MonitorStore, Ops};
+    use proofkin::ops::{IncidentEvent, IncidentKind, MonitorList, MonitorStore, Ops};
     let monitors = MonitorStore::load(&profile.monitors_path())?.monitors;
-    if monitors.is_empty() {
-        return Ok(());
+    if !monitors.is_empty() {
+        println!(
+            "monitors: {} (incidents try troubleshooting guides, then {})",
+            monitors
+                .iter()
+                .map(|m| format!("{} every {}s", m.name, m.every_secs))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if executor.is_some() {
+                "the debugging agent"
+            } else {
+                "a person (no --providers for a debugging agent)"
+            }
+        );
     }
-    println!(
-        "monitors: {} (incidents try troubleshooting guides, then {})",
-        monitors
-            .iter()
-            .map(|m| format!("{} every {}s", m.name, m.every_secs))
-            .collect::<Vec<_>>()
-            .join(", "),
-        if executor.is_some() {
-            "the debugging agent"
-        } else {
-            "a person (no --providers for a debugging agent)"
-        }
-    );
     let alerts = agent.clone();
     let name = agent.name().to_owned();
     let notify = move |e: &IncidentEvent| {
@@ -1528,9 +1528,20 @@ fn start_monitors(
         }
     };
     let current = agent.clone();
+    // The file as it is now; while it can't be read (being written), the last list.
+    let path = profile.monitors_path();
+    let last = std::sync::Mutex::new(monitors);
+    let monitors: MonitorList = Arc::new(move || match MonitorStore::load(&path) {
+        Ok(store) => {
+            *last.lock().unwrap() = store.monitors.clone();
+            store.monitors
+        }
+        Err(_) => last.lock().unwrap().clone(),
+    });
     let ops = Arc::new(Ops {
         agent_name: agent.name().to_owned(),
         monitors,
+        reload: Duration::from_secs(5),
         // As they are now: shares changed while the agent runs apply to its monitors.
         shares: Arc::new(move || current.shares()),
         store: profile.ops_store(),
@@ -1540,12 +1551,15 @@ fn start_monitors(
         notify: Arc::new(notify),
     });
     tokio::spawn(ops.run());
-    // Keep learning: refresh the ops summary in the knowledge base every hour.
+    // Keep learning: refresh the ops summary in the knowledge base every hour (while
+    // there are monitors).
     let profile = profile.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            if let Ok(report) = ops_report(&profile, 168) {
+            let watched = MonitorStore::load(&profile.monitors_path())
+                .is_ok_and(|store| !store.monitors.is_empty());
+            if watched && let Ok(report) = ops_report(&profile, 168) {
                 let _ = profile.knowledge().write(
                     "ops-summary",
                     &report,
@@ -2337,21 +2351,22 @@ fn run_monitor(command: MonitorCommand) -> Result<()> {
             profile,
         } => {
             let profile = Profile::open(&profile.name)?;
-            let mut store = MonitorStore::load(&profile.monitors_path())?;
-            store.set(
-                Monitor {
-                    name: name.clone(),
-                    share,
-                    check,
-                    every_secs: every,
-                    fail_after,
-                    slo,
-                },
-                &profile.shares()?,
-            )?;
-            store.save(&profile.monitors_path())?;
+            let shares = profile.shares()?;
+            MonitorStore::update(&profile.monitors_path(), |store| {
+                store.set(
+                    Monitor {
+                        name: name.clone(),
+                        share,
+                        check,
+                        every_secs: every,
+                        fail_after,
+                        slo,
+                    },
+                    &shares,
+                )
+            })?;
             println!(
-                "profile '{}': monitor {name} every {every}s (SLO {slo}%); it runs while the profile's agent runs",
+                "profile '{}': monitor {name} every {every}s (SLO {slo}%); it runs while the profile's agent runs (a running agent starts it within seconds)",
                 profile.name
             );
         }
@@ -2365,11 +2380,13 @@ fn run_monitor(command: MonitorCommand) -> Result<()> {
         }
         MonitorCommand::Remove { name, profile } => {
             let profile = Profile::open(&profile.name)?;
-            let mut store = MonitorStore::load(&profile.monitors_path())?;
-            if !store.remove(&name) {
+            if !proofkin::ops::remove_monitor(
+                &profile.monitors_path(),
+                &profile.ops_store(),
+                &name,
+            )? {
                 bail!("there is no monitor '{name}'");
             }
-            store.save(&profile.monitors_path())?;
         }
     }
     Ok(())

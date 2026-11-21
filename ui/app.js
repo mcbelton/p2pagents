@@ -552,11 +552,13 @@ function taskNode(t) {
     : `#${t.id} · ${providerLabel(t.provider)} → ${t.target}`;
   // Started by another agent (over MCP or A2A), not in this UI.
   const via = t.via ? ` · asked by another agent (${t.via})` : "";
+  // A task the agent stopped in the middle (it restarted since) has no end time.
+  const ran = t.status === "running" ? `running ${duration(elapsed)}` : t.finished_ms ? `took ${duration(elapsed)}` : null;
   const meta = t.status === "waiting"
     ? el("div", { class: "task-meta", text: (t.after?.length ? `Waits for: ${t.after.join(", ")}` : "Starting…") + via })
-    : el("div", { class: "task-meta" }, `Started ${stamp(t.started_ms)} · `,
-      el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null },
-        t.status === "running" ? `running ${duration(elapsed)}` : `took ${duration(elapsed)}`),
+    : el("div", { class: "task-meta" }, `Started ${stamp(t.started_ms)}`,
+      ran ? " · " : null,
+      ran ? el("span", { class: "elapsed", "data-start": t.status === "running" ? t.started_ms : null }, ran) : null,
       t.after?.length ? ` · after ${t.after.join(", ")}` : null, via || null);
   const node = el("li", { class: `task ${t.status}`, "data-task": t.id },
     el("div", { class: "task-top" },
@@ -572,6 +574,10 @@ function taskNode(t) {
         t.status === "running" ? el("span", { class: "spinner", "aria-hidden": "true" }) : null, statusText)),
     el("p", { class: "task-prompt", text: t.prompt }),
     meta);
+  // Why it was cancelled or skipped (by you, a failed step, or the agent stopping).
+  if (t.output && ["cancelled", "skipped"].includes(t.status)) {
+    node.append(el("p", { class: "task-meta task-why", text: t.output }));
+  }
   if (t.preview) {
     const pack = t.preview_label === "review pack";
     node.append(el("div", { class: "task-actions" },
@@ -617,12 +623,33 @@ function renderTasks() {
   const list = $("#task-list");
   list.replaceChildren();
   $("#task-count").textContent = state.tasks.length;
+  $("#clear-tasks-btn").hidden = !state.tasks.some((t) => !["running", "waiting"].includes(t.status));
   if (!state.tasks.length) {
     list.append(el("li", { class: "empty" }, "No tasks yet. Choose ", el("strong", { text: "Run task" }),
       " below to run a prompt on this agent or a peer."));
   }
   for (const t of [...state.tasks].reverse()) list.append(taskNode(t));
   renderSquads();
+}
+
+async function clearTasks() {
+  const ok = await confirmDialog({
+    title: "Clear finished tasks?",
+    body: "Done, failed, cancelled and skipped tasks leave this list (a plan's steps once the whole plan has ended). Running tasks stay, and so do evidence runs.",
+    confirm: "Clear finished",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const res = await api("/api/tasks", { method: "DELETE" });
+    state.tasks = res.tasks;
+    renderTasks();
+    // The button is gone once nothing is left to clear: focus stays in the panel.
+    if ($("#clear-tasks-btn").hidden) $("#tasks-h").focus();
+    toast(`${res.cleared} task${res.cleared === 1 ? "" : "s"} cleared`);
+  } catch (err) {
+    toast(err.message, "error");
+  }
 }
 
 // ---------- squads ----------
@@ -1563,27 +1590,35 @@ const INCIDENT_TEXT = { opened: "Incident opened", tsg: "TSG", assessed: "Debugg
 
 async function loadOps() {
   const ops = await api("/api/ops");
+  state.ops = ops;
   $("#incident-count").textContent = ops.open_incidents;
   $("#incident-count").classList.toggle("alert", ops.open_incidents > 0);
   const health = $("#health");
   health.replaceChildren();
   if (!ops.monitors.length) {
-    health.append(el("p", { class: "muted small" }, "No monitors. Add one with ", el("span", { class: "mono", text: "proofkin monitor add" }), " to track availability and heal incidents."));
+    health.append(el("p", { class: "muted small" }, "No monitors yet. ", el("strong", { text: "Add monitor" }),
+      " runs a check of one of this agent's folders again and again, measures its availability and heals incidents with troubleshooting guides."));
   }
   const list = el("ul", { class: "monitor-list" });
   for (const m of ops.monitors) {
-    const state = m.problem ? "misconfigured" : m.open_incident ? "incident" : m.last_ok === false ? "failing" : m.last_ok ? "up" : "unknown";
+    const look = m.problem ? "misconfigured" : m.open_incident ? "incident" : m.last_ok === false ? "failing" : m.last_ok ? "up" : "unknown";
     const [cls, label] = {
       up: ["done", "Up"], failing: ["failed", "Failing"], incident: ["failed", "Incident"],
       unknown: ["skipped", "Unknown"], misconfigured: ["cancelled", "Can't run"],
-    }[state];
-    list.append(el("li", { class: `monitor ${state}` },
+    }[look];
+    const what = m.check ? `${m.share}:${m.check} ${everyText(m.every_secs)}` : null;
+    const numbers = m.problem ? "not checked"
+      : `${m.availability == null ? "no data yet" : `${m.availability.toFixed(2)}%`} · SLO ${m.slo}%${m.meets_slo === false ? " missed" : ""}${m.p95_ms != null ? ` · p95 ${m.p95_ms} ms` : ""}`;
+    list.append(el("li", { class: `monitor ${look}` },
       el("span", { class: "dot", "aria-hidden": "true" }),
       el("span", { class: "name", text: m.name }),
-      el("span", { class: "muted small", text: m.problem ? "not checked" : `${m.availability == null ? "no data" : `${m.availability.toFixed(2)}%`} · SLO ${m.slo}%${m.meets_slo === false ? " missed" : ""}${m.p95_ms != null ? ` · p95 ${m.p95_ms} ms` : ""}` }),
+      el("span", { class: "muted small", text: [what, numbers].filter(Boolean).join(" · ") }),
       el("span", { class: `status ${cls}`, text: label }),
-      m.problem ? el("span", { class: "problem" }, `${m.problem[0].toUpperCase()}${m.problem.slice(1)}. Fix the folder or its check, or remove the monitor: `,
-        el("span", { class: "mono", text: `proofkin monitor remove ${m.name}` })) : null));
+      el("button", {
+        type: "button", class: "icon-btn", title: `Remove monitor ${m.name}`, "aria-label": `Remove monitor ${m.name}`,
+        onclick: () => removeMonitor(m.name),
+      }, icon(ICONS.trash)),
+      m.problem ? el("span", { class: "problem", text: `${m.problem[0].toUpperCase()}${m.problem.slice(1)}. Give the folder its check back, or remove the monitor.` }) : null));
   }
   health.append(list);
   const t = ops.tasks;
@@ -1603,6 +1638,113 @@ async function loadOps() {
       k.tsg ? el("span", { class: `badge ${k.tsg.status === "active" ? "ok" : "neutral"}`, text: `TSG · ${k.tsg.status}` })
         : el("span", { class: "muted small", text: `${k.chars} chars` })))) :
     [el("li", { class: "empty" }, "Nothing yet. Try the ", el("strong", { text: "discover" }), " playbook on an existing project.")]));
+}
+
+/** How often a monitor runs its check ("every minute", "every 5 min"). */
+function everyText(secs) {
+  if (secs % 3600 === 0) return secs === 3600 ? "every hour" : `every ${secs / 3600} h`;
+  if (secs % 60 === 0) return secs === 60 ? "every minute" : `every ${secs / 60} min`;
+  return `every ${secs} s`;
+}
+
+async function removeMonitor(name) {
+  const ok = await confirmDialog({
+    title: `Remove monitor ${name}?`,
+    body: "This agent stops running its check, and closes its open incidents. Its history stays in the incident log and ops reports.",
+    confirm: "Remove monitor",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/monitors/${encodeURIComponent(name)}`, { method: "DELETE" });
+    await loadOps();
+    // Its row (and the button that removed it) is gone: focus stays in the panel.
+    $("#add-monitor-btn").focus();
+    toast(`Monitor ${name} removed`);
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+/** The folder picked in the monitor dialog, with its checks (name → command). */
+function monitorFolder() {
+  return (state.ops?.checks ?? []).find((f) => f.folder === $("#monitor-share").value);
+}
+
+async function openMonitorDialog() {
+  // Fresh: a check may have been added in a terminal since.
+  await loadOps().catch(() => {});
+  $("#monitor-form").reset();
+  $("#monitor-error").textContent = "";
+  $("#monitor-name").removeAttribute("aria-invalid");
+  $("#monitor-slo").removeAttribute("aria-invalid");
+  delete $("#monitor-name").dataset.typed;
+  const folders = state.ops?.checks ?? [];
+  // Monitors run a folder's check: without one there is nothing to pick yet.
+  $("#monitor-none").hidden = folders.length > 0;
+  $("#monitor-fields").hidden = !folders.length;
+  $("#monitor-submit").hidden = !folders.length;
+  $("#monitor-cancel").textContent = folders.length ? "Cancel" : "Close";
+  $("#monitor-share").replaceChildren(...folders.map((f) => el("option", { value: f.folder, text: f.folder })));
+  renderMonitorChecks();
+  $("#monitor-dialog").showModal();
+  (folders.length ? $("#monitor-name") : $("#monitor-cancel")).focus();
+}
+
+function renderMonitorChecks() {
+  const names = Object.keys(monitorFolder()?.checks ?? {});
+  $("#monitor-check").replaceChildren(...names.map((n) => el("option", { value: n, text: n })));
+  // A health check is the usual thing to watch.
+  const health = names.find((n) => /health|ping|smoke|status/i.test(n));
+  if (health) $("#monitor-check").value = health;
+  renderMonitorCommand();
+}
+
+function renderMonitorCommand() {
+  const command = monitorFolder()?.checks?.[$("#monitor-check").value];
+  $("#monitor-command").textContent = command ? `Runs: ${command}` : "";
+  // Until a name is typed, it follows what is checked.
+  const name = $("#monitor-name");
+  if (!name.dataset.typed && command) name.value = `${$("#monitor-share").value}-${$("#monitor-check").value}`.slice(0, 64);
+}
+
+async function submitMonitor(e) {
+  e.preventDefault();
+  const nameInput = $("#monitor-name");
+  const sloInput = $("#monitor-slo");
+  nameInput.removeAttribute("aria-invalid");
+  sloInput.removeAttribute("aria-invalid");
+  const name = nameInput.value.trim();
+  const slo = Number(sloInput.value);
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/.test(name)) {
+    nameInput.setAttribute("aria-invalid", "true");
+    $("#monitor-error").textContent = "Name the monitor with letters, digits, '-', '_' and '.' (not starting with '.').";
+    nameInput.focus();
+    return;
+  }
+  if (sloInput.value === "" || !(slo >= 0 && slo <= 100)) {
+    sloInput.setAttribute("aria-invalid", "true");
+    $("#monitor-error").textContent = "The availability objective is a percentage from 0 to 100, e.g. 99.5.";
+    sloInput.focus();
+    return;
+  }
+  const submit = $("#monitor-submit");
+  submit.disabled = true;
+  try {
+    await api("/api/monitors", {
+      method: "POST",
+      body: JSON.stringify({
+        name, share: $("#monitor-share").value, check: $("#monitor-check").value,
+        every_secs: Number($("#monitor-every").value), fail_after: Number($("#monitor-fail-after").value), slo,
+      }),
+    });
+    $("#monitor-dialog").close();
+    toast(`Monitor ${name} added: its first check runs within seconds`);
+  } catch (err) {
+    $("#monitor-error").textContent = err.message;
+  } finally {
+    submit.disabled = false;
+  }
 }
 
 async function loadSkills() {
@@ -2124,6 +2266,10 @@ function connectEvents() {
     const msg = JSON.parse(e.data);
     if (msg.type === "feed") appendFeed(msg.item);
     else if (msg.type === "task") upsertTask(msg.task);
+    else if (msg.type === "tasks") {
+      state.tasks = msg.tasks;
+      renderTasks();
+    }
     else if (msg.type === "audit") loadAudit().catch((err) => toast(err.message, "error"));
     else if (msg.type === "runs") loadRuns().catch((err) => toast(err.message, "error"));
     else if (msg.type === "schedules") loadSchedules().catch((err) => toast(err.message, "error"));
@@ -2220,6 +2366,17 @@ function init() {
   $("#squad-cancel").addEventListener("click", () => $("#squad-dialog").close());
   $("#squad-dialog").addEventListener("close", () => $("#add-squad-btn").focus());
   $("#squad-form").addEventListener("submit", submitSquad);
+  $("#clear-tasks-btn").addEventListener("click", clearTasks);
+  $("#add-monitor-btn").addEventListener("click", openMonitorDialog);
+  $("#monitor-cancel").addEventListener("click", () => $("#monitor-dialog").close());
+  $("#monitor-dialog").addEventListener("close", () => $("#add-monitor-btn").focus());
+  $("#monitor-form").addEventListener("submit", submitMonitor);
+  $("#monitor-share").addEventListener("change", renderMonitorChecks);
+  $("#monitor-check").addEventListener("change", renderMonitorCommand);
+  $("#monitor-name").addEventListener("input", (e) => {
+    e.target.dataset.typed = "1";
+    e.target.removeAttribute("aria-invalid");
+  });
   $("#schedule-open").addEventListener("click", () => openScheduleDialog());
   $("#schedule-cancel").addEventListener("click", () => $("#schedule-dialog").close());
   $("#schedule-form").addEventListener("submit", submitSchedule);
@@ -2258,7 +2415,8 @@ function init() {
     openScheduleDialog();
   });
   for (const id of ["#add-dialog", "#squad-dialog", "#schedule-dialog", "#run-dialog", "#playbook-dialog",
-    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog"]) guardDialog($(id));
+    "#github-dialog", "#repo-dialog", "#pr-dialog", "#plan-editor", "#tools-dialog", "#confirm-dialog", "#worker-dialog",
+    "#monitor-dialog"]) guardDialog($(id));
   $("#provider").addEventListener("change", renderTaskOptions);
   $("#target").addEventListener("change", () => { renderShareOptions(); updateComposer(); });
   $("#share").addEventListener("change", () => { renderMcpOptions(); renderCheckOptions(); });

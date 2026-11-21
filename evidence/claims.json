@@ -431,6 +431,21 @@
       "tests": ["lib::ops::incidents_stay_open_across_restarts_and_monitors_without_their_check_wait"]
     },
     {
+      "id": "OPS-5",
+      "area": "operations",
+      "claim": "Monitors are managed in the web UI's Health panel: it says what each monitor checks and how often, offers the folders' checks a new one can run, adds monitors (an unknown check or a taken name is refused) and removes them, closing their open incidents. A running agent follows monitors added, changed or removed, in the web UI or the CLI, within seconds and without a restart.",
+      "tests": [
+        "ui::ui_shows_health_knowledge_and_fills_in_playbooks",
+        "lib::ops::monitors_added_or_removed_while_the_agent_runs_are_followed"
+      ]
+    },
+    {
+      "id": "UI-3",
+      "area": "web ui",
+      "claim": "The web UI's task list outlives a restart: the latest 200 tasks are kept in the profile with long outputs cut, a task the agent stopped in the middle comes back cancelled saying why (reported once), task ids go on from the kept ones, and Clear finished lets the finished tasks go while running ones stay.",
+      "tests": ["ui::tasks_outlive_a_restart_and_finished_ones_can_be_cleared"]
+    },
+    {
       "id": "LRN-1",
       "area": "knowledge",
       "claim": "The system keeps learning: the ops summary (health, incidents, usage) is written into the knowledge base (kb learn, and hourly by agents with monitors) for context=all and the learn playbook, and learned TSGs fix repeats without the model.",

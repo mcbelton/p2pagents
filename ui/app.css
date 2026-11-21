@@ -137,6 +137,9 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
   gap: 16px; padding: 16px 20px;
 }
 .sidebar, .tasks-panel { display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; }
+/* The sidebar and the conversation: cells of the layout's grid, except on mid-size
+   screens, where they are a grid of their own (see below). */
+.layout-top { display: contents; }
 .card, .tasks-panel {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -416,13 +419,16 @@ dialog .dialog-body { padding: 20px; display: flex; flex-direction: column; gap:
   .playbook-detail { max-height: none; border-left: 0; border-top: 1px solid var(--border); padding: 10px 0 0; }
 }
 .monitor-list, .kb-list, .incident-log { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.monitor { display: grid; grid-template-columns: auto auto 1fr auto; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; background: var(--surface); }
+.monitor { display: grid; grid-template-columns: auto auto 1fr auto auto; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; background: var(--surface); }
 .monitor .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
 .monitor.up .dot { background: var(--success); }
 .monitor.failing .dot, .monitor.incident .dot { background: var(--danger); }
 .monitor.misconfigured .dot { background: var(--warn); }
 .monitor .problem { grid-column: 2 / -1; font-size: 12px; color: var(--warn); overflow-wrap: anywhere; }
 .monitor .name { font-weight: 600; }
+.monitor .icon-btn { padding: 4px; }
+.monitor-fields { display: flex; flex-direction: column; gap: 12px; }
+.task-why { margin: 0 0 4px; overflow-wrap: anywhere; }
 .kb-list li { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px; background: var(--surface); }
 .incident-log { margin-top: 6px; font-size: 12.5px; }
 .incident-log .incident.resolved strong, .incident-log .incident.learned strong { color: var(--success); }
@@ -486,11 +492,14 @@ dialog form > .dialog-footer {
 
 /* Responsive: from 1180 px down the panels move below and the page scrolls, so no
    region is squeezed. The conversation keeps the window's height and stays in view
-   while the panels beside and below it scroll (its composer never leaves the screen). */
+   while the panels beside it scroll (its composer never leaves the screen). A sticky
+   element sticks within its parent, so the sidebar and the conversation get their own
+   grid: the conversation never slides over the panels below. */
 @media (max-width: 1180px) {
   html, body { height: auto; }
   body { min-height: 100vh; }
-  .layout { grid-template-columns: 280px minmax(0, 1fr); flex: none; }
+  .layout { grid-template-columns: minmax(0, 1fr); flex: none; }
+  .layout-top { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; }
   .sidebar { overflow: visible; }
   .main { position: sticky; top: 16px; align-self: start; height: calc(100vh - 92px); min-height: 420px; }
   .feed { min-height: 160px; }
@@ -502,6 +511,7 @@ dialog form > .dialog-footer {
   .theme-switch { margin-left: auto; }
   .theme-switch span { display: none; }
   .layout { grid-template-columns: 1fr; padding: 12px; }
+  .layout-top { display: contents; }
   /* Phones: the conversation first, then tasks, then peers and identity. */
   .main { position: static; height: auto; min-height: 75vh; order: 1; }
   .tasks-panel { order: 2; }

@@ -132,7 +132,9 @@ Every list and panel defines three states:
 
 - Every control is reachable and usable by keyboard, in a logical order; focus is
   visible (`:focus-visible` outline) and moves into a dialog when it opens and
-  back to its opener when it closes.
+  back to its opener when it closes. When the opener is gone (it removed its own
+  row, or cleared the last item), focus goes to its panel's main action or heading,
+  never back to the page.
 - Targets are at least 24 × 24 px (WCAG 2.5.8), including checkbox chips.
 - Text and icons meet contrast (4.5:1 for text, 3:1 for large text and UI parts) in
   both themes.
